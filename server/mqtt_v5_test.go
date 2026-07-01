@@ -691,6 +691,413 @@ func TestMQTTv5DisconnectWithWill(t *testing.T) {
 	})
 }
 
+// mqttV5WillDelayProps returns a Will properties body (no length prefix, as
+// expected by mqttV5ConnInfo.willProps) carrying only the Will Delay Interval.
+func mqttV5WillDelayProps(delaySecs uint32) []byte {
+	body := newMQTTWriter(0)
+	body.WriteByte(mqttPropWillDelay)
+	body.WriteUint32(delaySecs)
+	return body.Bytes()
+}
+
+// mqttV5ConnPropsSessionExpiry returns a CONNECT properties body carrying only
+// the Session Expiry Interval. A non-zero interval makes the session (and thus a
+// delayed Will) survive the connection.
+func mqttV5ConnPropsSessionExpiry(secs uint32) []byte {
+	body := newMQTTWriter(0)
+	body.WriteByte(mqttPropSessionExpiry)
+	body.WriteUint32(secs)
+	return body.Bytes()
+}
+
+// testMQTTNumPendingWills returns the number of delayed Wills currently pending
+// on the account session manager, reached via a live client sharing the account.
+func testMQTTNumPendingWills(t testing.TB, s *Server, liveClientID string) int {
+	t.Helper()
+	c := testMQTTGetClient(t, s, liveClientID)
+	asm := c.mqtt.asm
+	asm.mu.Lock()
+	defer asm.mu.Unlock()
+	return len(asm.pendingWills)
+}
+
+// The MQTT 5.0 Will Delay Interval defers publication of a client's Will until
+// the delay elapses or the session ends. A reconnect to the same session before
+// the delay cancels it; a clean session or a zero delay publishes immediately.
+// Spec5 [3.1.3.2.2], [MQTT-3.1.2-8].
+func TestMQTTv5WillDelay(t *testing.T) {
+	o := testMQTTDefaultOptionsV5()
+	s := testMQTTRunServer(t, o)
+	defer testMQTTShutdownServer(s)
+
+	subscribe := func(t *testing.T, id string, qos byte) (net.Conn, *mqttReader) {
+		t.Helper()
+		c, r := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: id, cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
+		testMQTTReadConnAckV5(t, r)
+		testMQTTSubV5(t, c, r, 1, []mqttV5SubFilter{{topic: "will/topic", opts: qos}})
+		return c, r
+	}
+
+	t.Run("delay fires and publishes qos0", func(t *testing.T) {
+		cs, rs := subscribe(t, "wdsub1", 0)
+		defer cs.Close()
+
+		will := &mqttWill{topic: []byte("will/topic"), message: []byte("bye"), qos: 0}
+		// Clean start with a non-zero Session Expiry Interval: the session (and
+		// the delayed Will) survives the disconnect even though the session object
+		// is removed. Mirrors the conformance client.
+		cw, rw := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "wder1", cleanStart: true, will: will,
+			willProps: mqttV5WillDelayProps(1), props: mqttV5ConnPropsSessionExpiry(30)}, o.MQTT.Host, o.MQTT.Port)
+		testMQTTReadConnAckV5(t, rw)
+
+		// Abruptly drop the connection: the will is deferred, not published now.
+		cw.Close()
+		checkFor(t, 2*time.Second, 15*time.Millisecond, func() error {
+			if n := testMQTTNumPendingWills(t, s, "wdsub1"); n != 1 {
+				return fmt.Errorf("expected 1 pending will, got %d", n)
+			}
+			return nil
+		})
+		testMQTTExpectNothing(t, rs)
+
+		// After the delay elapses, the will is delivered.
+		testMQTTReadPublishV5(t, rs, "will/topic", []byte("bye"))
+	})
+
+	t.Run("delay fires and publishes qos1", func(t *testing.T) {
+		cs, rs := subscribe(t, "wdsub1b", 1)
+		defer cs.Close()
+
+		will := &mqttWill{topic: []byte("will/topic"), message: []byte("bye1"), qos: 1}
+		cw, rw := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "wder1b", will: will,
+			willProps: mqttV5WillDelayProps(1), props: mqttV5ConnPropsSessionExpiry(30)}, o.MQTT.Host, o.MQTT.Port)
+		testMQTTReadConnAckV5(t, rw)
+
+		cw.Close()
+		testMQTTExpectNothing(t, rs)
+		// Exercises the QoS1 store path through the account JSA.
+		testMQTTReadPublishV5(t, rs, "will/topic", []byte("bye1"))
+	})
+
+	t.Run("reconnect before delay cancels", func(t *testing.T) {
+		cs, rs := subscribe(t, "wdsub2", 0)
+		defer cs.Close()
+
+		will := &mqttWill{topic: []byte("will/topic"), message: []byte("bye"), qos: 0}
+		cw, rw := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "wder2", cleanStart: true, will: will,
+			willProps: mqttV5WillDelayProps(2), props: mqttV5ConnPropsSessionExpiry(30)}, o.MQTT.Host, o.MQTT.Port)
+		testMQTTReadConnAckV5(t, rw)
+
+		cw.Close()
+		checkFor(t, 2*time.Second, 15*time.Millisecond, func() error {
+			if n := testMQTTNumPendingWills(t, s, "wdsub2"); n != 1 {
+				return fmt.Errorf("expected 1 pending will, got %d", n)
+			}
+			return nil
+		})
+
+		// Reconnect with the same client ID before the delay elapses: the will
+		// MUST be cancelled, even though the clean-start session was removed on
+		// disconnect. Spec5 [MQTT-3.1.2-8].
+		cw2, rw2 := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "wder2", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
+		defer cw2.Close()
+		testMQTTReadConnAckV5(t, rw2)
+		checkFor(t, 2*time.Second, 15*time.Millisecond, func() error {
+			if n := testMQTTNumPendingWills(t, s, "wdsub2"); n != 0 {
+				return fmt.Errorf("expected pending will cancelled, got %d", n)
+			}
+			return nil
+		})
+		// Even past the original delay, nothing is delivered.
+		testMQTTExpectNothing(t, rs)
+	})
+
+	t.Run("zero delay publishes immediately", func(t *testing.T) {
+		cs, rs := subscribe(t, "wdsub3", 0)
+		defer cs.Close()
+
+		will := &mqttWill{topic: []byte("will/topic"), message: []byte("bye"), qos: 0}
+		// No willProps => Will Delay Interval 0 => immediate.
+		cw, rw := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "wder3", will: will}, o.MQTT.Host, o.MQTT.Port)
+		testMQTTReadConnAckV5(t, rw)
+
+		cw.Close()
+		testMQTTReadPublishV5(t, rs, "will/topic", []byte("bye"))
+		if n := testMQTTNumPendingWills(t, s, "wdsub3"); n != 0 {
+			t.Fatalf("expected no pending will for zero delay, got %d", n)
+		}
+	})
+
+	t.Run("zero session expiry publishes immediately", func(t *testing.T) {
+		cs, rs := subscribe(t, "wdsub4", 0)
+		defer cs.Close()
+
+		will := &mqttWill{topic: []byte("will/topic"), message: []byte("bye"), qos: 0}
+		// A session with a zero (absent) Session Expiry Interval ends at
+		// connection close, so the will is published immediately regardless of the
+		// Will Delay Interval.
+		cw, rw := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "wder4", will: will,
+			willProps: mqttV5WillDelayProps(2)}, o.MQTT.Host, o.MQTT.Port)
+		testMQTTReadConnAckV5(t, rw)
+
+		cw.Close()
+		testMQTTReadPublishV5(t, rs, "will/topic", []byte("bye"))
+		if n := testMQTTNumPendingWills(t, s, "wdsub4"); n != 0 {
+			t.Fatalf("expected no pending will for zero session expiry, got %d", n)
+		}
+	})
+
+	t.Run("disconnect-with-will honors delay", func(t *testing.T) {
+		cs, rs := subscribe(t, "wdsub5", 0)
+		defer cs.Close()
+
+		will := &mqttWill{topic: []byte("will/topic"), message: []byte("bye"), qos: 0}
+		cw, rw := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "wder5", will: will,
+			willProps: mqttV5WillDelayProps(1), props: mqttV5ConnPropsSessionExpiry(30)}, o.MQTT.Host, o.MQTT.Port)
+		testMQTTReadConnAckV5(t, rw)
+
+		// v5 DISCONNECT reason 0x04 keeps the will; the delay still applies.
+		dp := [3]byte{mqttPacketDisconnect, 1, mqttReasonDisconnectWithWill}
+		if _, err := testMQTTWrite(cw, dp[:]); err != nil {
+			t.Fatalf("Error writing DISCONNECT: %v", err)
+		}
+		cw.Close()
+		checkFor(t, 2*time.Second, 15*time.Millisecond, func() error {
+			if n := testMQTTNumPendingWills(t, s, "wdsub5"); n != 1 {
+				return fmt.Errorf("expected 1 pending will, got %d", n)
+			}
+			return nil
+		})
+		testMQTTExpectNothing(t, rs)
+		testMQTTReadPublishV5(t, rs, "will/topic", []byte("bye"))
+	})
+}
+
+// A delayed Will must still be subject to the publisher's publish permissions
+// when the timer fires, exactly as an immediate Will is: a Will on a denied
+// topic is dropped (not delivered, not retained), while one on an allowed topic
+// is delivered. Guards against the deferred publish running with no permissions.
+func TestMQTTv5WillDelayPermViolation(t *testing.T) {
+	template := `
+		port: -1
+		jetstream {
+			store_dir = %q
+		}
+		server_name: mqtt
+		authorization {
+			mqtt_perms = {
+				publish = ["will.allowed"]
+				subscribe = ["will.allowed", "will.denied"]
+			}
+			users = [
+				{user: mqtt, password: pass, permissions: $mqtt_perms}
+				{user: admin, password: pass}
+			]
+		}
+		mqtt {
+			port: -1
+			max_protocol_version: 5
+		}
+	`
+	tdir := t.TempDir()
+	conf := createConfFile(t, fmt.Appendf(nil, template, tdir))
+	s, o := RunServerWithConfig(conf)
+	defer testMQTTShutdownServer(s)
+
+	// Subscriber allowed to receive both will topics.
+	cs, rs := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "wpsub", cleanStart: true, user: "mqtt", pass: "pass"},
+		o.MQTT.Host, o.MQTT.Port)
+	defer cs.Close()
+	testMQTTReadConnAckV5(t, rs)
+	testMQTTSubV5(t, cs, rs, 1, []mqttV5SubFilter{{topic: "will/allowed", opts: 0}, {topic: "will/denied", opts: 0}})
+
+	// A delayed Will on a DENIED topic must be dropped when the timer fires.
+	willDenied := &mqttWill{topic: []byte("will/denied"), message: []byte("nope"), qos: 0}
+	cw, rw := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "wpdenied", user: "mqtt", pass: "pass",
+		will: willDenied, willProps: mqttV5WillDelayProps(1), props: mqttV5ConnPropsSessionExpiry(30)},
+		o.MQTT.Host, o.MQTT.Port)
+	testMQTTReadConnAckV5(t, rw)
+	cw.Close()
+	// Scheduled...
+	checkFor(t, 2*time.Second, 15*time.Millisecond, func() error {
+		if n := testMQTTNumPendingWills(t, s, "wpsub"); n != 1 {
+			return fmt.Errorf("expected 1 pending will, got %d", n)
+		}
+		return nil
+	})
+	// A denied Will must never be persisted with the session record: a restart
+	// cannot re-check permissions, so a restored Will would bypass them. The
+	// (would-be) record write races this check, so absence must hold for a
+	// settle period, not just at one instant.
+	nc, js := jsClientConnect(t, s, nats.UserInfo("admin", "pass"))
+	sawRecord := false
+	for deadline := time.Now().Add(750 * time.Millisecond); time.Now().Before(deadline); time.Sleep(50 * time.Millisecond) {
+		m, err := js.GetLastMsg(mqttSessStreamName, mqttSessStreamSubjectPrefix+getHash("wpdenied"))
+		if err != nil {
+			continue
+		}
+		sawRecord = true
+		if bytes.Contains(m.Data, []byte(`"will"`)) {
+			t.Fatal("denied will was persisted with the session record")
+		}
+	}
+	if !sawRecord {
+		t.Fatal("could not read the session record to verify the will was not persisted")
+	}
+	nc.Close()
+	// ...then fired (removed from pending) and suppressed by publish permissions.
+	checkFor(t, 3*time.Second, 20*time.Millisecond, func() error {
+		if n := testMQTTNumPendingWills(t, s, "wpsub"); n != 0 {
+			return fmt.Errorf("expected pending will to have fired, got %d", n)
+		}
+		return nil
+	})
+	testMQTTExpectNothing(t, rs)
+
+	// A delayed Will on an ALLOWED topic is delivered normally.
+	willOK := &mqttWill{topic: []byte("will/allowed"), message: []byte("ok"), qos: 0}
+	cw2, rw2 := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "wpok", user: "mqtt", pass: "pass",
+		will: willOK, willProps: mqttV5WillDelayProps(1), props: mqttV5ConnPropsSessionExpiry(30)},
+		o.MQTT.Host, o.MQTT.Port)
+	testMQTTReadConnAckV5(t, rw2)
+	cw2.Close()
+	testMQTTReadPublishV5(t, rs, "will/allowed", []byte("ok"))
+}
+
+// testMQTTGetClusterTemplateV5 is the standard MQTT cluster config template with
+// MQTT 5.0 enabled.
+func testMQTTGetClusterTemplateV5(t testing.TB) string {
+	t.Helper()
+	tmpl := strings.Replace(testMQTTGetClusterTemplaceNoLeaf(),
+		"mqtt {\n\t\tlisten: 127.0.0.1:-1\n\t}",
+		"mqtt {\n\t\tlisten: 127.0.0.1:-1\n\t\tmax_protocol_version: 5\n\t}", 1)
+	if !strings.Contains(tmpl, "max_protocol_version: 5") {
+		t.Fatal("failed to enable MQTT v5 in the cluster template")
+	}
+	return tmpl
+}
+
+// testMQTTConnectRetryV5 is testMQTTConnectRetry for a v5 CONNECT: it dials and
+// sends the CONNECT, retrying on transient errors (useful while a cluster's JS
+// assets are being set up). The returned reader is positioned to read the CONNACK.
+func testMQTTConnectRetryV5(t testing.TB, ci *mqttV5ConnInfo, host string, port, retryCount int) (net.Conn, *mqttReader) {
+	t.Helper()
+	retry := func(c net.Conn) bool {
+		if c != nil {
+			c.Close()
+		}
+		if retryCount == 0 {
+			return false
+		}
+		time.Sleep(time.Second)
+		retryCount--
+		return true
+	}
+	addr := net.JoinHostPort(host, fmt.Sprintf("%d", port))
+	var c net.Conn
+	var err error
+	var buf []byte
+RETRY:
+	if c, err = net.Dial("tcp", addr); err != nil {
+		if retry(c) {
+			goto RETRY
+		}
+		t.Fatalf("Error dialing: %v", err)
+	}
+	if _, err = testMQTTWrite(c, mqttV5CreateConnect(ci)); err != nil {
+		if retry(c) {
+			goto RETRY
+		}
+		t.Fatalf("Error writing connect: %v", err)
+	}
+	if buf, err = testMQTTRead(c); err != nil {
+		if retry(c) {
+			goto RETRY
+		}
+		t.Fatalf("Error reading connack: %v", err)
+	}
+	mr := &mqttReader{reader: c}
+	mr.reset(buf)
+	return c, mr
+}
+
+// In a cluster, a delayed Will scheduled on the server the client left must be
+// cancelled when the client reconnects to a DIFFERENT server before the delay
+// elapses: the session-persist propagation cancels the pending Will remotely.
+// Spec5 [MQTT-3.1.2-8].
+func TestMQTTv5WillDelayCluster(t *testing.T) {
+	cl := createJetStreamClusterWithTemplate(t, testMQTTGetClusterTemplateV5(t), "MQTT", 2)
+	defer cl.shutdown()
+
+	srvA, optsA := cl.servers[0], cl.opts[0]
+	optsB := cl.opts[1]
+
+	t.Run("fires and is delivered across servers", func(t *testing.T) {
+		// Subscriber on server B.
+		cs, rs := testMQTTConnectRetryV5(t, &mqttV5ConnInfo{clientID: "wdcsub1", cleanStart: true},
+			optsB.MQTT.Host, optsB.MQTT.Port, 5)
+		defer cs.Close()
+		testMQTTReadConnAckV5(t, rs)
+		testMQTTSubV5(t, cs, rs, 1, []mqttV5SubFilter{{topic: "will/topic", opts: 1}})
+
+		// Will client on server A, QoS1 (JetStream-backed, robust across the
+		// cluster), short delay.
+		will := &mqttWill{topic: []byte("will/topic"), message: []byte("bye"), qos: 1}
+		cw, rw := testMQTTConnectRetryV5(t, &mqttV5ConnInfo{clientID: "wdcwill1", will: will,
+			willProps: mqttV5WillDelayProps(1), props: mqttV5ConnPropsSessionExpiry(30)},
+			optsA.MQTT.Host, optsA.MQTT.Port, 5)
+		testMQTTReadConnAckV5(t, rw)
+		cw.Close()
+
+		// After the delay, the will fires on A and is delivered to the subscriber on B.
+		testMQTTReadPublishV5(t, rs, "will/topic", []byte("bye"))
+	})
+
+	t.Run("reconnect to another server cancels the will", func(t *testing.T) {
+		// Prober/subscriber on server A so we can inspect server A's pending wills.
+		cprobe, rprobe := testMQTTConnectRetryV5(t, &mqttV5ConnInfo{clientID: "wdcprobe", cleanStart: true},
+			optsA.MQTT.Host, optsA.MQTT.Port, 5)
+		defer cprobe.Close()
+		testMQTTReadConnAckV5(t, rprobe)
+		testMQTTSubV5(t, cprobe, rprobe, 1, []mqttV5SubFilter{{topic: "will/topic2", opts: 0}})
+
+		// Will client on server A with a long delay so the timer cannot fire during
+		// the test: any removal from server A's pending wills must be a cancellation.
+		will := &mqttWill{topic: []byte("will/topic2"), message: []byte("bye"), qos: 0}
+		cw, rw := testMQTTConnectRetryV5(t, &mqttV5ConnInfo{clientID: "wdcwill2", will: will,
+			willProps: mqttV5WillDelayProps(30), props: mqttV5ConnPropsSessionExpiry(60)},
+			optsA.MQTT.Host, optsA.MQTT.Port, 5)
+		testMQTTReadConnAckV5(t, rw)
+		cw.Close()
+
+		// Scheduled on server A.
+		checkFor(t, 3*time.Second, 20*time.Millisecond, func() error {
+			if n := testMQTTNumPendingWills(t, srvA, "wdcprobe"); n != 1 {
+				return fmt.Errorf("expected 1 pending will on server A, got %d", n)
+			}
+			return nil
+		})
+
+		// Reconnect the same client ID on server B before the 30s delay: a new
+		// connection to the session, so server A must cancel its pending will via
+		// the session-persist callback.
+		cw2, rw2 := testMQTTConnectRetryV5(t, &mqttV5ConnInfo{clientID: "wdcwill2", cleanStart: true},
+			optsB.MQTT.Host, optsB.MQTT.Port, 5)
+		defer cw2.Close()
+		testMQTTReadConnAckV5(t, rw2)
+
+		// Server A cancels its pending will well before the 30s delay could elapse,
+		// so the removal is a cancellation (not a firing).
+		checkFor(t, 5*time.Second, 20*time.Millisecond, func() error {
+			if n := testMQTTNumPendingWills(t, srvA, "wdcprobe"); n != 0 {
+				return fmt.Errorf("expected server A pending will to be cancelled, got %d", n)
+			}
+			return nil
+		})
+		testMQTTExpectNothing(t, rprobe)
+	})
+}
+
 func TestMQTTv5MaxProtocolVersionConfigParse(t *testing.T) {
 	for _, test := range []struct {
 		name    string
@@ -2370,5 +2777,110 @@ func TestMQTTv5MessagesStreamDegradedNoTTL(t *testing.T) {
 	props := testMQTTReadPubV5Props(t, cs, rs, "deg/t", []byte("m2"))
 	if props == nil || !props.present[mqttPropMessageExpiry] {
 		t.Fatal("Expected the Message Expiry property to still be forwarded")
+	}
+}
+
+// A delayed Will must carry the Will's own forwardable properties when it
+// eventually fires, matching the immediate-publish path. Spec5 [3.1.3.2].
+func TestMQTTv5WillDelayForwardsOwnProps(t *testing.T) {
+	o := testMQTTDefaultOptionsV5()
+	s := testMQTTRunServer(t, o)
+	defer testMQTTShutdownServer(s)
+
+	cs, rs := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "wdpsub", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
+	defer cs.Close()
+	testMQTTReadConnAckV5(t, rs)
+	testMQTTSubV5(t, cs, rs, 1, []mqttV5SubFilter{{topic: "wdp/t", opts: 0}})
+	testMQTTFlush(t, cs, nil, rs)
+
+	will := &mqttWill{topic: []byte("wdp/t"), message: []byte("bye"), qos: 0}
+	// Will Delay plus the shared forwardable-props block (strip its length varint).
+	willProps := append(mqttV5WillDelayProps(1), testMQTTv5PubPropsBlock()[1:]...)
+	cw, rw := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "wdppub", cleanStart: true, will: will,
+		willProps: willProps, props: mqttV5ConnPropsSessionExpiry(30)}, o.MQTT.Host, o.MQTT.Port)
+	testMQTTReadConnAckV5(t, rw)
+	// Abrupt close: the Will is deferred by the delay, then fires.
+	cw.Close()
+
+	props := testMQTTReadPubV5Props(t, cs, rs, "wdp/t", []byte("bye"))
+	testMQTTCheckFwdProps(t, props)
+}
+
+// A delayed Will pending at shutdown is persisted with the session record and
+// re-armed on restart, so it still fires. Spec5 [3.1.3.2.2] whichever-first.
+// Covered for both a durable session and a clean-start one (whose Will rides a
+// minimal record created just for it), and with a generated server name (the
+// standalone default), which changes across restarts.
+func TestMQTTv5WillDelaySurvivesRestart(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		cleanStart bool
+	}{
+		{"durable session", false},
+		{"clean start with session expiry", true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			o := testMQTTDefaultOptionsV5()
+			// Standalone servers may run without an explicit server name; the
+			// generated one differs after a restart.
+			o.ServerName = _EMPTY_
+			s := testMQTTRunServer(t, o)
+			defer testMQTTShutdownRestartedServer(&s)
+
+			// Retained Will so the post-restart subscriber gets it even if it
+			// fires before the subscription lands.
+			will := &mqttWill{topic: []byte("wdr/t"), message: []byte("late-bye"), qos: 0, retain: true}
+			cw, rw := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "wdrpub", cleanStart: test.cleanStart, will: will,
+				willProps: mqttV5WillDelayProps(3), props: mqttV5ConnPropsSessionExpiry(300)}, o.MQTT.Host, o.MQTT.Port)
+			testMQTTReadConnAckV5(t, rw)
+			cw.Close()
+
+			// Wait for the pending Will to land in the persisted session record.
+			nc, js := jsClientConnect(t, s)
+			sessSubj := mqttSessStreamSubjectPrefix + getHash("wdrpub")
+			checkFor(t, 2*time.Second, 50*time.Millisecond, func() error {
+				m, err := js.GetLastMsg(mqttSessStreamName, sessSubj)
+				if err != nil {
+					return err
+				}
+				if !bytes.Contains(m.Data, []byte(`"will"`)) {
+					return fmt.Errorf("session record has no pending will yet")
+				}
+				return nil
+			})
+			nc.Close()
+
+			// Restart on the same store.
+			dir := strings.TrimSuffix(s.JetStreamConfig().StoreDir, JetStreamStoreDir)
+			s.Shutdown()
+			o.Port = -1
+			o.MQTT.Port = -1
+			o.StoreDir = dir
+			s = testMQTTRunServer(t, o)
+
+			// The first MQTT connect creates the account session manager, whose
+			// sweep re-arms the persisted Will.
+			cs, rs := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "wdrsub", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
+			defer cs.Close()
+			testMQTTReadConnAckV5(t, rs)
+			testMQTTSubV5(t, cs, rs, 1, []mqttV5SubFilter{{topic: "wdr/t", opts: 0}})
+
+			testMQTTReadPublishV5(t, rs, "wdr/t", []byte("late-bye"))
+
+			// Once fired, the persisted Will must be gone (for a clean session,
+			// its carrier record with it) so it cannot fire again.
+			nc2, js2 := jsClientConnect(t, s)
+			defer nc2.Close()
+			checkFor(t, 2*time.Second, 50*time.Millisecond, func() error {
+				m, err := js2.GetLastMsg(mqttSessStreamName, sessSubj)
+				if err != nil {
+					return nil // record deleted entirely: fine (clean session)
+				}
+				if bytes.Contains(m.Data, []byte(`"will"`)) {
+					return fmt.Errorf("session record still has the fired will")
+				}
+				return nil
+			})
+		})
 	}
 }
