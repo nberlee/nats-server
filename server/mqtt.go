@@ -344,6 +344,13 @@ type mqttAccountSessionManager struct {
 	rmsCache   *sync.Map                              // map[subject]mqttRetainedMsg
 	jsa        mqttJSA
 	domainTk   string // Domain (with trailing "."), or possibly empty. This is added to session subject.
+
+	// Degraded mode, set once at creation (read without lock): per-message TTL
+	// could not be enabled on a pre-existing stream, so stored messages must
+	// not carry a Nats-TTL header (JetStream would reject them). Delivery-side
+	// expiry checks still apply; only storage reaping is lost.
+	msgsStreamNoTTL  bool
+	rmsgsStreamNoTTL bool
 }
 
 type mqttJSAResponse struct {
@@ -445,6 +452,13 @@ type mqttRetainedMsg struct {
 	// PUBLISH, forwarded to v5 subscribers when the message is replayed. Empty
 	// for messages published by 3.1.1 clients or without properties.
 	Props []byte `json:"props,omitempty"`
+
+	// expires is the absolute deadline after which this retained message must no
+	// longer be delivered, when it was published with an MQTT 5.0 Message Expiry
+	// Interval. Zero when the message has no expiry. Persisted with the stored
+	// message via the mqttNatsRetainedMessageExpiry header (not JSON). Spec5
+	// [3.3.2.3.3].
+	expires time.Time
 
 	expiresFromCache time.Time
 }
@@ -646,6 +660,13 @@ const (
 	// properties are replayed to subscribers. Absent for older stored messages.
 	mqttNatsRetainedMessageProps = "Nmqtt-RProps"
 
+	// Absolute expiry deadline (Unix nanoseconds, decimal) for a retained message
+	// that was published with an MQTT 5.0 Message Expiry Interval. Carried with
+	// the stored message so the remaining interval can be computed on replay
+	// regardless of which server (or cache) serves it. Absent when the retained
+	// message has no expiry. Spec5 [3.3.2.3.3].
+	mqttNatsRetainedMessageExpiry = "Nmqtt-RExp"
+
 	// NATS header that indicates that the message is an MQTT PubRel and stores
 	// the PI.
 	mqttNatsPubRelHeader = "Nmqtt-PubRel"
@@ -705,7 +726,7 @@ func (s *Server) startMQTT() {
 	s.Noticef("Listening for MQTT clients on %s://%s:%d", scheme, o.Host, o.Port)
 	if s.mqtt.v5Enabled {
 		s.Warnf("MQTT 5.0 support is enabled but experimental: some v5 features " +
-			"(session/message/will-delay expiry) are not yet honored")
+			"(session/will-delay expiry) are not yet honored")
 	}
 	go s.acceptConnections(hl, "MQTT", func(conn net.Conn) { s.createMQTTClient(conn, nil) }, nil)
 	s.mu.Unlock()
@@ -1428,6 +1449,168 @@ func mqttValidateForwardProps(raw []byte) []byte {
 	return raw
 }
 
+// mqttVarIntFromSlice decodes an MQTT variable byte integer from the front of b.
+// It returns the value and the number of bytes consumed, or (0, -1) if b does
+// not begin with a complete, valid varint. Spec5 [1.5.5].
+func mqttVarIntFromSlice(b []byte) (int, int) {
+	m, v := 1, 0
+	for n := 0; n < len(b) && n < 4; n++ {
+		d := b[n]
+		v += int(d&0x7f) * m
+		if d&0x80 == 0 {
+			return v, n + 1
+		}
+		m *= 0x80
+	}
+	return 0, -1
+}
+
+// mqttMessageExpiryOffset walks a well-formed MQTT 5.0 properties block (length
+// prefix + body) and returns the byte offset of the 4-byte Message Expiry
+// Interval value within it, or -1 if the block carries no Message Expiry
+// Interval or cannot be walked. The block is expected to have already been
+// validated (by readProperties / mqttValidateForwardProps), so property lengths
+// are trusted; anything unexpected returns -1 rather than risk a bad rewrite.
+func mqttMessageExpiryOffset(props []byte) int {
+	plen, n := mqttVarIntFromSlice(props)
+	if n < 0 {
+		return -1
+	}
+	i, end := n, n+plen
+	if end > len(props) {
+		return -1
+	}
+	for i < end {
+		prop := props[i]
+		i++
+		switch prop {
+		case mqttPropMessageExpiry:
+			if i+4 > end {
+				return -1
+			}
+			return i
+		case mqttPropPayloadFormat, mqttPropRequestProblemInfo, mqttPropRequestResponseInfo,
+			mqttPropMaxQoS, mqttPropRetainAvailable, mqttPropWildcardSubAvailable,
+			mqttPropSubIDAvailable, mqttPropSharedSubAvailable:
+			i++
+		case mqttPropServerKeepAlive, mqttPropReceiveMaximum, mqttPropTopicAliasMax,
+			mqttPropTopicAlias:
+			i += 2
+		case mqttPropSessionExpiry, mqttPropWillDelay, mqttPropMaxPacketSize:
+			i += 4
+		case mqttPropContentType, mqttPropResponseTopic, mqttPropAssignedClientID,
+			mqttPropAuthMethod, mqttPropResponseInfo, mqttPropServerReference,
+			mqttPropReasonString, mqttPropCorrelationData, mqttPropAuthData:
+			if i+2 > end {
+				return -1
+			}
+			i += 2 + int(binary.BigEndian.Uint16(props[i:]))
+		case mqttPropUserProperty:
+			// Two length-prefixed strings (key then value).
+			for k := 0; k < 2; k++ {
+				if i+2 > end {
+					return -1
+				}
+				i += 2 + int(binary.BigEndian.Uint16(props[i:]))
+			}
+		case mqttPropSubscriptionID:
+			_, m := mqttVarIntFromSlice(props[i:])
+			if m < 0 {
+				return -1
+			}
+			i += m
+		default:
+			return -1
+		}
+		if i > end {
+			return -1
+		}
+	}
+	return -1
+}
+
+// mqttMessageExpiry returns the Message Expiry Interval (seconds) carried in a
+// raw MQTT 5.0 properties block and whether the property was present. The two
+// differ semantically: an absent property means the message never expires,
+// whereas an explicit value of 0 means it expires immediately. Spec5 [3.3.2.3.3].
+func mqttMessageExpiry(props []byte) (uint32, bool) {
+	off := mqttMessageExpiryOffset(props)
+	if off < 0 {
+		return 0, false
+	}
+	return binary.BigEndian.Uint32(props[off:]), true
+}
+
+// mqttMessageExpiryTTL returns the JetStream per-message TTL (seconds) to apply
+// to a stored message given its properties: 0 when the message has no expiry
+// (never reaped by TTL), otherwise at least 1 (JetStream's minimum). Flooring an
+// explicit expiry of 0 to 1s ensures an "expire immediately" message is still
+// reaped rather than kept forever; onward delivery is additionally gated by
+// mqttForwardExpiry. Spec5 [3.3.2.3.3].
+func mqttMessageExpiryTTL(props []byte) uint32 {
+	if me, ok := mqttMessageExpiry(props); ok {
+		if me < 1 {
+			return 1
+		}
+		return me
+	}
+	return 0
+}
+
+// mqttSetMessageExpiry returns a copy of the raw MQTT 5.0 properties block with
+// the Message Expiry Interval value replaced by rem. If the block carries no
+// Message Expiry Interval, props is returned unchanged (no copy), preserving the
+// verbatim fast path for messages that do not use expiry. Spec5 [3.3.2.3.3].
+func mqttSetMessageExpiry(props []byte, rem uint32) []byte {
+	off := mqttMessageExpiryOffset(props)
+	if off < 0 {
+		return props
+	}
+	out := make([]byte, len(props))
+	copy(out, props)
+	binary.BigEndian.PutUint32(out[off:], rem)
+	return out
+}
+
+// mqttForwardExpiry computes the outbound properties for a stored v5 PUBLISH,
+// honoring the MQTT 5.0 Message Expiry Interval given the message's JetStream
+// store time (storeUnixNano). It returns the (possibly rewritten) properties and
+// whether the message has already expired. Spec5 [3.3.2.3.3]: the PUBLISH sent
+// onward MUST carry the interval reduced by the time waited in the server; if
+// the interval has elapsed before onward delivery the server MUST NOT deliver
+// the message and MUST drop its stored copy. Returns props unchanged when there
+// is no expiry to adjust. Elapsed time is measured on this server's wall clock;
+// as with JetStream per-message TTLs, accuracy across a cluster assumes
+// synchronized clocks.
+func mqttForwardExpiry(props []byte, storeUnixNano int64) (out []byte, expired bool) {
+	off := mqttMessageExpiryOffset(props)
+	if off < 0 {
+		return props, false
+	}
+	orig := int64(binary.BigEndian.Uint32(props[off:]))
+	// An explicit interval of 0 means the message expires immediately: it is
+	// already expired for any onward (stored) delivery, whatever the elapsed
+	// time. Checked before the elapsed/store-time guards so a same-second
+	// delivery cannot forward it. Spec5 [3.3.2.3.3].
+	if orig == 0 {
+		return props, true
+	}
+	if storeUnixNano <= 0 {
+		return props, false
+	}
+	elapsed := (time.Now().UnixNano() - storeUnixNano) / int64(time.Second)
+	if elapsed <= 0 {
+		return props, false
+	}
+	if elapsed >= orig {
+		return props, true
+	}
+	out = make([]byte, len(props))
+	copy(out, props)
+	binary.BigEndian.PutUint32(out[off:], uint32(orig-elapsed))
+	return out, false
+}
+
 func mqttParsePubRelNATSHeader(headerBytes []byte) uint16 {
 	if len(headerBytes) == 0 {
 		return 0
@@ -1661,9 +1844,11 @@ func (s *Server) mqttCreateAccountSessionManager(acc *Account, quitCh chan struc
 		}
 	}
 
-	if si, err := lookupStream(mqttStreamName, "messages"); err != nil {
+	msi, err := lookupStream(mqttStreamName, "messages")
+	if err != nil {
 		return nil, err
-	} else if si == nil {
+	}
+	if msi == nil {
 		// Create the stream for the messages.
 		cfg := &StreamConfig{
 			Name:      mqttStreamName,
@@ -1671,9 +1856,33 @@ func (s *Server) mqttCreateAccountSessionManager(acc *Account, quitCh chan struc
 			Storage:   FileStorage,
 			Retention: InterestPolicy,
 			Replicas:  replicas,
+			// Honor MQTT 5.0 Message Expiry Interval: a stored PUBLISH carries a
+			// per-message Nats-TTL so JetStream drops it once its lifetime has
+			// elapsed, even if never delivered. Spec5 [3.3.2.3.3].
+			AllowMsgTTL: true,
 		}
-		if _, _, err := jsa.createStream(cfg); isErrorOtherThan(err, JSStreamNameExistErr) {
-			return nil, fmt.Errorf("create messages stream for account %q: %v", accName, err)
+		if _, _, cerr := jsa.createStream(cfg); cerr != nil {
+			if isErrorOtherThan(cerr, JSStreamNameExistErr) {
+				return nil, fmt.Errorf("create messages stream for account %q: %v", accName, cerr)
+			}
+			// Lost a creation race: re-check what the winner created, it may
+			// be an older stream without per-message TTL.
+			if msi, err = lookupStream(mqttStreamName, "messages"); err != nil {
+				return nil, err
+			}
+		}
+	}
+	if msi != nil && !msi.Config.AllowMsgTTL {
+		// Enable per-message TTL on a messages stream created before MQTT 5.0
+		// message expiry support was added, so expiry is honored after upgrade.
+		// Degrade rather than fail: without it MQTT still works, only v5
+		// message expiry of stored messages is not enforced (e.g. while other
+		// servers in a mixed-version cluster do not understand AllowMsgTTL).
+		msi.Config.AllowMsgTTL = true
+		if _, err := jsa.updateStream(&msi.Config); err != nil {
+			msi.Config.AllowMsgTTL = false
+			as.msgsStreamNoTTL = true
+			s.Warnf("MQTT: unable to enable per-message TTL on messages stream for account %q, v5 Message Expiry of stored messages will not be enforced: %v", accName, err)
 		}
 	}
 
@@ -1733,6 +1942,9 @@ func (s *Server) mqttCreateAccountSessionManager(acc *Account, quitCh chan struc
 			Retention:  LimitsPolicy,
 			Replicas:   replicas,
 			MaxMsgsPer: 1,
+			// Honor MQTT 5.0 Message Expiry Interval for retained messages via a
+			// per-message Nats-TTL. Spec5 [3.3.2.3.3].
+			AllowMsgTTL: true,
 		}
 		// We will need "si" outside of this block.
 		si, _, err = jsa.createStream(cfg)
@@ -1796,6 +2008,22 @@ func (s *Server) mqttCreateAccountSessionManager(acc *Account, quitCh chan struc
 		// We will need an up-to-date si, so don't use local variable here.
 		if si, err = jsa.updateStream(&si.Config); err != nil {
 			return nil, fmt.Errorf("failed to update stream config: %w", err)
+		}
+	}
+
+	// Enable per-message TTL on a retained messages stream created before MQTT
+	// 5.0 message expiry support was added, so expiry is honored after upgrade.
+	// Degrade rather than fail (see the messages stream above); expired
+	// retained messages are still withheld from delivery, only their stored
+	// copies are not reaped.
+	if !si.Config.AllowMsgTTL {
+		si.Config.AllowMsgTTL = true
+		if nsi, err := jsa.updateStream(&si.Config); err != nil {
+			si.Config.AllowMsgTTL = false
+			as.rmsgsStreamNoTTL = true
+			s.Warnf("MQTT: unable to enable per-message TTL on retained messages stream for account %q, expired retained messages will not be reaped from storage: %v", accName, err)
+		} else {
+			si = nsi
 		}
 	}
 
@@ -2495,7 +2723,11 @@ func (as *mqttAccountSessionManager) cleanupRetainedMessageCache(s *Server, clos
 			now := time.Now()
 			as.rmsCache.Range(func(key, value any) bool {
 				rm := value.(*mqttRetainedMsg)
-				if now.After(rm.expiresFromCache) {
+				// Evict when the cache entry aged out, or when the message
+				// itself reached its MQTT 5.0 Message Expiry deadline (its
+				// stored copy is TTL-reaped by JetStream at the same time).
+				if now.After(rm.expiresFromCache) ||
+					(!rm.expires.IsZero() && now.After(rm.expires)) {
 					as.rmsCache.Delete(key)
 				}
 				i++
@@ -2999,6 +3231,13 @@ func (as *mqttAccountSessionManager) serializeRetainedMsgsForSub(rms map[string]
 			// calling serialize.
 			return
 		}
+		// MQTT 5.0 Message Expiry Interval: an expired retained message must not be
+		// delivered. The stored copy is reaped by its per-message TTL; this guards
+		// the window where the in-memory ref/cache still points at it. Spec5
+		// [3.3.2.3.3].
+		if !rm.expires.IsZero() && !time.Now().Before(rm.expires) {
+			return
+		}
 		// A broad wildcard subscription can overlap a subscribe deny clause.
 		c.mu.Lock()
 		denied := c.mperms != nil && c.checkDenySub(string(subj))
@@ -3022,10 +3261,22 @@ func (as *mqttAccountSessionManager) serializeRetainedMsgsForSub(rms map[string]
 			}
 		}
 
+		// MQTT 5.0 Message Expiry Interval: a v5 subscriber must receive the
+		// interval reduced by the time the retained message has been waiting in the
+		// server. Spec5 [3.3.2.3.3]. 3.1.1 subscribers get no properties section.
+		props := rm.Props
+		if c.mqtt.proto == mqttProtoLevel5 && !rm.expires.IsZero() {
+			rem := uint32(time.Until(rm.expires).Seconds())
+			if rem < 1 {
+				rem = 1
+			}
+			props = mqttSetMessageExpiry(rm.Props, rem)
+		}
+
 		// Need to use the subject for the retained message, not the `sub` subject.
 		// We can find the published retained message in rm.sub.subject.
 		// Set the RETAIN flag: [MQTT-3.3.1-8].
-		flags, headerBytes := mqttMakePublishHeader(pi, qos, false, true, c.mqtt.proto == mqttProtoLevel5, []byte(rm.Topic), rm.Props, len(rm.Msg))
+		flags, headerBytes := mqttMakePublishHeader(pi, qos, false, true, c.mqtt.proto == mqttProtoLevel5, []byte(rm.Topic), props, len(rm.Msg))
 
 		// MQTT 5.0 Maximum Packet Size: skip a retained message that would exceed
 		// the client's limit rather than send an oversized packet (which a strict
@@ -3123,6 +3374,9 @@ func (as *mqttAccountSessionManager) loadRetainedMessages(subjects map[string]ui
 				// does not match.
 				seq := subjects[subj]
 				as.removeRetainedMsg(subj, seq)
+				// Expected when a per-message TTL reaped an expired retained
+				// message; the stale index entry is cleaned up, no warning.
+				continue
 			}
 			w.Warnf("failed to load retained message for subject %q: %v", subj, err)
 			continue
@@ -3152,7 +3406,35 @@ func (as *mqttAccountSessionManager) loadRetainedMessages(subjects map[string]ui
 // servers to fail to decode the message in processRetainedMsg callback and
 // will simply ignore it, which is what we want.
 func mqttEncodeRetainedMessage(rm *mqttRetainedMsg) (natsMsg []byte, headerLen int) {
+	return mqttEncodeRetainedMessageTTL(rm, true)
+}
+
+// withTTL=false skips the JetStream per-message TTL header (degraded mode: the
+// stream does not allow it); the expiry deadline header is still written so
+// delivery-side expiry keeps working.
+func mqttEncodeRetainedMessageTTL(rm *mqttRetainedMsg, withTTL bool) (natsMsg []byte, headerLen int) {
 	delRM := len(rm.Msg) == 0
+
+	// MQTT 5.0 Message Expiry Interval: for a live retained message with an
+	// expiry, carry the absolute deadline (so the remaining interval can be
+	// recomputed on replay) plus a JetStream per-message TTL for the remaining
+	// lifetime (so the stored copy is dropped once it expires). Delete markers
+	// (empty payload) never carry expiry. Spec5 [3.3.2.3.3].
+	var expStr, ttlStr string
+	if !delRM && !rm.expires.IsZero() {
+		expStr = strconv.FormatInt(rm.expires.UnixNano(), 10)
+		// Round the remaining lifetime up so JetStream never deletes the retained
+		// copy before its deadline (truncating a 1.99s remainder to 1s would drop
+		// it almost a second early). At least 1s, JetStream's minimum.
+		secs := int64((time.Until(rm.expires) + time.Second - 1) / time.Second)
+		if secs < 1 {
+			secs = 1
+		}
+		ttlStr = strconv.FormatInt(secs, 10)
+		if !withTTL {
+			ttlStr = _EMPTY_
+		}
+	}
 
 	// No need to encode the subject, we can restore it from topic.
 	l := len(hdrLine)
@@ -3165,6 +3447,12 @@ func mqttEncodeRetainedMessage(rm *mqttRetainedMsg) (natsMsg []byte, headerLen i
 	}
 	if len(rm.Props) > 0 {
 		l += len(mqttNatsRetainedMessageProps) + 1 + base64.StdEncoding.EncodedLen(len(rm.Props)) + 2 // 1 byte for ':', 2 bytes for CRLF
+	}
+	if expStr != _EMPTY_ {
+		l += len(mqttNatsRetainedMessageExpiry) + 1 + len(expStr) + 2 // 1 byte for ':', 2 bytes for CRLF
+	}
+	if ttlStr != _EMPTY_ {
+		l += len(JSMessageTTL) + 1 + len(ttlStr) + 1 + 2 // 1 byte for ':', 1 for 's', 2 bytes for CRLF
 	}
 	l += len(mqttNatsRetainedMessageFlags) + 1 + 2 + 2 // 1 byte for ':', 2 bytes for the flags, 2 bytes for CRLF
 	l += 2                                             // 2 bytes for the extra CRLF after the header
@@ -3207,6 +3495,20 @@ func mqttEncodeRetainedMessage(rm *mqttRetainedMsg) (natsMsg []byte, headerLen i
 		buf.WriteString(mqttNatsRetainedMessageProps)
 		buf.WriteByte(':')
 		buf.WriteString(base64.StdEncoding.EncodeToString(rm.Props))
+		buf.WriteString(_CRLF_)
+	}
+
+	if expStr != _EMPTY_ {
+		buf.WriteString(mqttNatsRetainedMessageExpiry)
+		buf.WriteByte(':')
+		buf.WriteString(expStr)
+		buf.WriteString(_CRLF_)
+	}
+	if ttlStr != _EMPTY_ {
+		buf.WriteString(JSMessageTTL)
+		buf.WriteByte(':')
+		buf.WriteString(ttlStr)
+		buf.WriteByte('s')
 		buf.WriteString(_CRLF_)
 	}
 
@@ -3276,6 +3578,7 @@ func mqttDecodeRetainedMessage(subject string, h, m []byte) (*mqttRetainedMsg, e
 		mqttNatsRetainedMessageFlags:  nil,
 		mqttNatsRetainedMessageSource: nil,
 		mqttNatsRetainedMessageProps:  nil,
+		mqttNatsRetainedMessageExpiry: nil,
 	}
 	var rm *mqttRetainedMsg
 	// Retrieve the values for the above headers.
@@ -3307,6 +3610,12 @@ func mqttDecodeRetainedMessage(subject string, h, m []byte) (*mqttRetainedMsg, e
 		if enc := headers[mqttNatsRetainedMessageProps]; len(enc) > 0 {
 			if raw, err := base64.StdEncoding.DecodeString(bytesToString(enc)); err == nil {
 				rm.Props = mqttValidateForwardProps(raw)
+			}
+		}
+		// MQTT 5.0 Message Expiry Interval: absolute deadline (Unix nanoseconds).
+		if exp := headers[mqttNatsRetainedMessageExpiry]; len(exp) > 0 {
+			if ns, err := strconv.ParseInt(bytesToString(exp), 10, 64); err == nil && ns > 0 {
+				rm.expires = time.Unix(0, ns)
 			}
 		}
 	} else {
@@ -3527,6 +3836,12 @@ func (as *mqttAccountSessionManager) getCachedRetainedMsg(subject string) *mqttR
 	}
 	rm := v.(*mqttRetainedMsg)
 	if rm.expiresFromCache.Before(time.Now()) {
+		as.rmsCache.Delete(subject)
+		return nil
+	}
+	// MQTT 5.0 Message Expiry Interval: drop an expired retained message rather
+	// than serve a stale copy from the cache. Spec5 [3.3.2.3.3].
+	if !rm.expires.IsZero() && !time.Now().Before(rm.expires) {
 		as.rmsCache.Delete(subject)
 		return nil
 	}
@@ -3821,12 +4136,13 @@ func (sess *mqttSession) trackPublishRetained() uint16 {
 // duplicate delivery attempt.
 //
 // Lock held on entry
-func (sess *mqttSession) trackPublish(jsDur, jsAckSubject string) (uint16, bool) {
-	var dup bool
+// The returned started flag is true when the PI was already tracked, i.e. this
+// is a redelivery of a message whose onward delivery already began.
+func (sess *mqttSession) trackPublish(jsDur, jsAckSubject string) (packetID uint16, dup, started bool) {
 	var pi uint16
 
 	if jsAckSubject == _EMPTY_ || jsDur == _EMPTY_ {
-		return 0, false
+		return 0, false, false
 	}
 
 	// Make sure we initialize the tracking maps.
@@ -3858,7 +4174,7 @@ func (sess *mqttSession) trackPublish(jsDur, jsAckSubject string) (uint16, bool)
 		// so, indicate no need for (re-)delivery by returning a PI of 0.
 		_, usedForPubRel := sess.pendingPubRel[pi]
 		if /*dup && */ usedForPubRel {
-			return 0, false
+			return 0, false, false
 		}
 
 		// We should have a pending JS ACK for this PI. This is a redelivery of a
@@ -3869,6 +4185,7 @@ func (sess *mqttSession) trackPublish(jsDur, jsAckSubject string) (uint16, bool)
 		// connection (a known limitation; new deliveries below still are, and
 		// the session drains to the cap as PUBACKs arrive).
 		ack = sess.pendingPublish[pi]
+		started = true
 	} else {
 		// Gate new deliveries at the effective cap: MaxAckPending capped by the
 		// client's MQTT 5.0 Receive Maximum. QoS 2 messages awaiting PUBCOMP are
@@ -3877,12 +4194,12 @@ func (sess *mqttSession) trackPublish(jsDur, jsAckSubject string) (uint16, bool)
 			// Indicate that we did not assign a packet identifier.
 			// The caller will not send the message to the subscription
 			// and JS will redeliver later, based on consumer's AckWait.
-			return 0, false
+			return 0, false, false
 		}
 
 		pi = sess.bumpPI()
 		if pi == 0 {
-			return 0, false
+			return 0, false, false
 		}
 
 		sseqToPi[sseq] = pi
@@ -3900,7 +4217,7 @@ func (sess *mqttSession) trackPublish(jsDur, jsAckSubject string) (uint16, bool)
 		ack.jsDur = jsDur
 	}
 
-	return pi, dup
+	return pi, dup, started
 }
 
 // Stops a PI from being tracked as a PUBLISH. It can still be in use for a
@@ -4832,7 +5149,7 @@ func mqttPubTrace(pp *mqttPublish) string {
 // encodePP: whether to encode complete MQTT PUBLISH packet header information
 //   - false: initial delivery (QoS 0/1) needs only base header
 //   - true: QoS2 storage needs to encode Nmqtt-Subject and Nmqtt-Mapped
-func mqttComputeNatsMsgSize(pp *mqttPublish, encodePP bool) int {
+func mqttComputeNatsMsgSize(pp *mqttPublish, encodePP bool, ttl uint32) int {
 	size := len(hdrLine) +
 		len(mqttNatsHeader) + 2 + 2 + // 2 for ':<qos>', and 2 for CRLF
 		2 + // end-of-header CRLF
@@ -4852,6 +5169,12 @@ func mqttComputeNatsMsgSize(pp *mqttPublish, encodePP bool) int {
 		size += len(mqttNatsHeaderProps) + 1 + // +1 for ':'
 			base64.StdEncoding.EncodedLen(len(pp.props)) + 2 // 2 for CRLF
 	}
+	// MQTT 5.0 Message Expiry Interval maps to a JetStream per-message TTL so the
+	// stored copy is dropped once its lifetime elapses. Spec5 [3.3.2.3.3].
+	if ttl > 0 {
+		size += len(JSMessageTTL) + 1 + // +1 for ':'
+			len(strconv.FormatUint(uint64(ttl), 10)) + 1 + 2 // +1 for 's', 2 for CRLF
+	}
 	return size
 }
 
@@ -4864,8 +5187,8 @@ func mqttComputeNatsMsgSize(pp *mqttPublish, encodePP bool) int {
 //	NATS/1.0\r\n
 //	Nmqtt-Pub:2foo.bar\r\n
 //	\r\n
-func mqttNewDeliverableMessage(pp *mqttPublish, encodePP bool) (natsMsg []byte, headerLen int) {
-	size := mqttComputeNatsMsgSize(pp, encodePP)
+func mqttNewDeliverableMessage(pp *mqttPublish, encodePP bool, ttl uint32) (natsMsg []byte, headerLen int) {
+	size := mqttComputeNatsMsgSize(pp, encodePP, ttl)
 
 	buf := bytes.NewBuffer(make([]byte, 0, size))
 
@@ -4895,6 +5218,17 @@ func mqttNewDeliverableMessage(pp *mqttPublish, encodePP bool) (natsMsg []byte, 
 		buf.WriteString(mqttNatsHeaderProps)
 		buf.WriteByte(':')
 		buf.WriteString(base64.StdEncoding.EncodeToString(pp.props))
+		buf.WriteString(_CRLF_)
+	}
+
+	// MQTT 5.0 Message Expiry Interval: attach a JetStream per-message TTL so the
+	// stored copy expires after the requested lifetime. This is server-internal
+	// metadata (not one of the forwarded Nmqtt-* headers). Spec5 [3.3.2.3.3].
+	if ttl > 0 {
+		buf.WriteString(JSMessageTTL)
+		buf.WriteByte(':')
+		buf.WriteString(strconv.FormatUint(uint64(ttl), 10))
+		buf.WriteByte('s')
 		buf.WriteString(_CRLF_)
 	}
 
@@ -4937,9 +5271,19 @@ func (s *Server) mqttProcessPub(c *client, pp *mqttPublish, trace bool) error {
 	qos := mqttGetQoS(pp.flags)
 
 	// Enforce max_payload using existing client max payload logic (mpay) by
-	// checking the total NATS message size that would be processed.
+	// checking the largest NATS message size that would be processed, including
+	// the Nats-TTL header that a Message Expiry Interval adds to the stored
+	// message. QoS2 is first held with the PUBLISH subject headers (no TTL) and
+	// later delivered with the TTL header (no subject headers); the two header
+	// sets never coexist, so we compare the two actual forms rather than sum them.
 	if maxPayload := atomic.LoadInt32(&c.mpay); maxPayload != jwt.NoLimit {
-		if total := mqttComputeNatsMsgSize(pp, qos == 2); total > int(maxPayload) {
+		total := mqttComputeNatsMsgSize(pp, false, c.mqttStoredMsgTTL(pp))
+		if qos == 2 {
+			if hold := mqttComputeNatsMsgSize(pp, true, 0); hold > total {
+				total = hold
+			}
+		}
+		if total > int(maxPayload) {
 			c.maxPayloadViolation(total, maxPayload)
 			return ErrMaxPayload
 		}
@@ -4981,8 +5325,22 @@ func (s *Server) mqttProcessPub(c *client, pp *mqttPublish, trace bool) error {
 	}
 }
 
+// mqttStoredMsgTTL returns the JetStream per-message TTL to attach to pp's
+// stored copy: its MQTT 5.0 Message Expiry Interval, or 0 in degraded mode
+// (the messages stream refused AllowMsgTTL and would reject the header).
+func (c *client) mqttStoredMsgTTL(pp *mqttPublish) uint32 {
+	if asm := c.mqtt.asm; asm != nil && asm.msgsStreamNoTTL {
+		return 0
+	}
+	return mqttMessageExpiryTTL(pp.props)
+}
+
 func (s *Server) mqttInitiateMsgDelivery(c *client, pp *mqttPublish) error {
-	natsMsg, headerLen := mqttNewDeliverableMessage(pp, false)
+	// A stored (QoS 1/2) PUBLISH carrying an MQTT 5.0 Message Expiry Interval is
+	// given a matching JetStream per-message TTL so it is dropped from the
+	// delivery stream once its lifetime elapses. Spec5 [3.3.2.3.3]. Degraded
+	// mode drops the header; delivery-side expiry checks still apply.
+	natsMsg, headerLen := mqttNewDeliverableMessage(pp, false, c.mqttStoredMsgTTL(pp))
 
 	// Set the client's pubarg for processing.
 	c.pa.subject = pp.subject
@@ -5028,8 +5386,10 @@ func (s *Server) mqttInitiateMsgDelivery(c *client, pp *mqttPublish) error {
 var mqttMaxMsgErrPattern = fmt.Sprintf("%s (%v)", ErrMaxMsgsPerSubject.Error(), JSStreamStoreFailedF)
 
 func (s *Server) mqttStoreQoS2MsgOnce(c *client, pp *mqttPublish) error {
-	// `true` means encode the MQTT PUBLISH packet in the NATS message header.
-	natsMsg, headerLen := mqttNewDeliverableMessage(pp, true)
+	// `true` means encode the MQTT PUBLISH packet in the NATS message header. No
+	// TTL here: this is the QoS2 dedup hold stream (no AllowMsgTTL); the expiry
+	// TTL is applied when the message is moved to the delivery stream on PUBREL.
+	natsMsg, headerLen := mqttNewDeliverableMessage(pp, true, 0)
 
 	// Do not broadcast the message until it has been deduplicated and released
 	// by the sender. Instead store this QoS2 message as
@@ -5094,6 +5454,16 @@ func (s *Server) mqttProcessPubRel(c *client, pi uint16, trace bool) error {
 		props:   h.props, // forward v5 properties captured at store time
 	}
 
+	// MQTT 5.0 Message Expiry Interval: a QoS2 message ages while it waits in the
+	// server for the PUBREL. Measure the interval from the original PUBLISH
+	// receipt (the hold-stream store time) rather than restarting it here: age
+	// the carried interval by the time already elapsed, and drop the message if
+	// it has expired before release. Spec5 [3.3.2.3.3].
+	var expired bool
+	if pp.props, expired = mqttForwardExpiry(pp.props, stored.Time.UnixNano()); expired {
+		return nil
+	}
+
 	return s.mqttInitiateMsgDelivery(c, pp)
 }
 
@@ -5148,6 +5518,16 @@ func (c *client) mqttHandlePubRetain() {
 		Props:  pp.props, // v5 properties to replay to subscribers
 	}
 
+	// MQTT 5.0 Message Expiry Interval on a retained message: record the absolute
+	// deadline so the remaining interval can be recomputed on replay and the
+	// stored message dropped once it expires. A present interval of 0 means the
+	// message expires immediately, so the deadline is "now" (distinct from an
+	// absent interval, which never expires and leaves the deadline zero). Spec5
+	// [3.3.2.3.3].
+	if me, ok := mqttMessageExpiry(pp.props); ok {
+		rm.expires = time.Now().Add(time.Duration(me) * time.Second)
+	}
+
 	if retainSparkbBirth {
 		// [tck-id-conformance-mqtt-aware-store] A Sparkplug Aware MQTT Server
 		// MUST store NBIRTH and DBIRTH messages as they pass through the MQTT
@@ -5191,7 +5571,7 @@ func (c *client) mqttHandlePubRetain() {
 	// Set the key to the subject of the message for retained, or the composed
 	// $sparkplug subject for sparkB.
 	rm.Subject = key
-	rmBytes, hdr := mqttEncodeRetainedMessage(rm) // will copy the payload bytes
+	rmBytes, hdr := mqttEncodeRetainedMessageTTL(rm, !asm.rmsgsStreamNoTTL) // will copy the payload bytes
 	_, err := asm.jsa.storeMsg(mqttRetainedMsgsStreamSubject+key, hdr, rmBytes)
 	if err != nil {
 		c.mu.Lock()
@@ -5776,6 +6156,16 @@ func mqttDeliverMsgCbQoS0(sub *subscription, pc *client, _ *Account, subject, re
 		}
 	}
 
+	// MQTT 5.0 Message Expiry Interval of 0 expires the message immediately, so
+	// it must not reach any subscriber, whatever its protocol level. This live
+	// path otherwise waits ~0s, so no interval rewrite is needed. Spec5
+	// [3.3.2.3.3].
+	if len(props) > 0 {
+		if _, expired := mqttForwardExpiry(props, 0); expired {
+			return
+		}
+	}
+
 	// Message never has a packet identifier nor is marked as duplicate. A QoS0
 	// message dropped for exceeding the client's Maximum Packet Size needs no
 	// completion (it is not JetStream-backed here), so the result is ignored.
@@ -5854,7 +6244,7 @@ func mqttDeliverMsgCbQoS12(sub *subscription, pc *client, _ *Account, subject, r
 		return
 	}
 
-	pi, dup := sess.trackPublish(sub.mqtt.jsDur, reply)
+	pi, dup, started := sess.trackPublish(sub.mqtt.jsDur, reply)
 	sess.mu.Unlock()
 
 	if pi == 0 {
@@ -5868,6 +6258,26 @@ func mqttDeliverMsgCbQoS12(sub *subscription, pc *client, _ *Account, subject, r
 	var props []byte
 	if h != nil {
 		props = h.props
+	}
+	// MQTT 5.0 Message Expiry Interval: a v5 subscriber must receive the interval
+	// reduced by the time the message waited in the server; if it has already
+	// elapsed the message must not be delivered and its stored copy dropped. The
+	// store timestamp is carried in the JetStream ack reply subject. Expiry is a
+	// property of the message, so it equally gates delivery to a 3.1.1
+	// subscriber (whose properties are then stripped on the wire).
+	// Only a message whose onward delivery has NOT started may be dropped on
+	// expiry; a redelivery of an already-sent PUBLISH must be resent, not dropped.
+	// Spec5 [3.3.2.3.3], [MQTT-4.4.0-1].
+	if len(props) > 0 && !started {
+		_, _, _, ts, _ := ackReplyInfo(reply)
+		var expired bool
+		if props, expired = mqttForwardExpiry(props, ts); expired {
+			sess.mu.Lock()
+			sess.untrackPublish(pi)
+			sess.mu.Unlock()
+			sess.jsa.sendAck(reply)
+			return
+		}
 	}
 	if !pc.mqttEnqueuePublishMsgTo(cc, sub, pi, qos, dup, originalTopic, msg, props) {
 		// The PUBLISH exceeds the client's MQTT 5.0 Maximum Packet Size. Discard

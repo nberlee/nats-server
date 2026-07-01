@@ -16,7 +16,9 @@
 package server
 
 import (
+	"bytes"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"net"
@@ -1511,6 +1513,27 @@ func TestMQTTSessionDropUnredeliverableRetained(t *testing.T) {
 	}
 }
 
+// trackPublish must report started=true for a redelivery (a PI already tracked
+// for the stream sequence), reusing the same PI. mqttDeliverMsgCbQoS12 relies on
+// this to resend an already-started delivery on Message Expiry rather than
+// dropping it. An end-to-end expiry test is not deterministic here: the
+// JetStream per-message TTL equals the Message Expiry Interval, so the message
+// is reaped from the stream at the same time it logically expires.
+func TestMQTTSessionTrackPublishStarted(t *testing.T) {
+	sess := &mqttSession{maxp: 10}
+	const dur = "S_C"
+	// $JS.ACK.<stream>.<consumer>.<deliveries>.<streamseq>.<consumerseq>.<ts>.<pending>
+	pi1, dup1, started1 := sess.trackPublish(dur, "$JS.ACK.S.C.1.100.1.0.0")
+	if pi1 == 0 || dup1 || started1 {
+		t.Fatalf("first delivery: pi=%d dup=%v started=%v", pi1, dup1, started1)
+	}
+	// Redelivery of the same stream sequence (deliveries=2).
+	pi2, dup2, started2 := sess.trackPublish(dur, "$JS.ACK.S.C.2.100.2.0.0")
+	if pi2 != pi1 || !dup2 || !started2 {
+		t.Fatalf("redelivery: pi=%d (want %d) dup=%v started=%v", pi2, pi1, dup2, started2)
+	}
+}
+
 // A Receive Maximum of 0 is a protocol error (spec5 [3.1.2.11.3]); the CONNECT
 // is rejected with a CONNACK carrying reason 0x82 (Protocol Error).
 func TestMQTTv5ReceiveMaximumZeroRejected(t *testing.T) {
@@ -1796,4 +1819,556 @@ func TestMQTTv5RetainedMaximumPacketSize(t *testing.T) {
 
 	testMQTTReadPubV5Props(t, cs, rs, "retmp/small", []byte("ok")) // reads and acks the QoS1 delivery
 	testMQTTExpectNothing(t, rs)
+}
+
+// mqttV5PropsWithExpiry builds a v5 PUBLISH properties block carrying a Message
+// Expiry Interval alongside a few other forwardable properties, so tests can
+// assert the interval is adjusted without the rest being disturbed.
+func mqttV5PropsWithExpiry(me uint32) []byte {
+	body := newMQTTWriter(0)
+	body.WriteByte(mqttPropPayloadFormat)
+	body.WriteByte(1)
+	body.WriteByte(mqttPropMessageExpiry)
+	body.WriteUint32(me)
+	body.WriteByte(mqttPropContentType)
+	body.WriteString("text/plain")
+	body.WriteByte(mqttPropUserProperty)
+	body.WriteString("mk")
+	body.WriteString("mv")
+	return mqttMakePropsBlock(body.Bytes())
+}
+
+// The Message Expiry Interval can be located and rewritten inside a raw v5
+// properties block without disturbing the other properties, and blocks without
+// one are left untouched.
+func TestMQTTv5MessageExpiryPropsHelpers(t *testing.T) {
+	block := mqttV5PropsWithExpiry(100)
+
+	off := mqttMessageExpiryOffset(block)
+	if off < 0 {
+		t.Fatal("expected to find the message expiry offset")
+	}
+	if got := binary.BigEndian.Uint32(block[off:]); got != 100 {
+		t.Fatalf("value at offset is %d, want 100", got)
+	}
+	if got, ok := mqttMessageExpiry(block); !ok || got != 100 {
+		t.Fatalf("mqttMessageExpiry: got %d present=%v, want 100/true", got, ok)
+	}
+	if got := mqttMessageExpiryTTL(block); got != 100 {
+		t.Fatalf("mqttMessageExpiryTTL: got %d want 100", got)
+	}
+
+	// Rewriting must copy (not mutate the input) and preserve every other prop.
+	orig := append([]byte(nil), block...)
+	out := mqttSetMessageExpiry(block, 42)
+	if string(block) != string(orig) {
+		t.Fatal("mqttSetMessageExpiry mutated its input")
+	}
+	if &out[0] == &block[0] {
+		t.Fatal("expected mqttSetMessageExpiry to return a copy")
+	}
+	r := &mqttReader{}
+	r.reset(out)
+	p, err := r.readProperties(mqttPacketPub)
+	if err != nil || r.hasMore() {
+		t.Fatalf("re-parse rewritten block: err=%v hasMore=%v", err, r.hasMore())
+	}
+	if !p.present[mqttPropMessageExpiry] || p.messageExpiry != 42 {
+		t.Fatalf("message expiry not updated: present=%v val=%d", p.present[mqttPropMessageExpiry], p.messageExpiry)
+	}
+	if !p.present[mqttPropPayloadFormat] || p.payloadFormat != 1 {
+		t.Fatal("payload format indicator was lost")
+	}
+	if p.contentType != "text/plain" {
+		t.Fatalf("content type was lost: %q", p.contentType)
+	}
+	if len(p.user) != 1 || p.user[0].key != "mk" || p.user[0].value != "mv" {
+		t.Fatalf("user property was lost: %+v", p.user)
+	}
+
+	// A block with no Message Expiry Interval: nothing found, no-op rewrite, and
+	// no TTL. Absent must be distinguishable from an explicit 0.
+	noexp := testMQTTv5PubPropsBlock()
+	if mqttMessageExpiryOffset(noexp) != -1 {
+		t.Fatal("did not expect a message expiry offset")
+	}
+	if got, ok := mqttMessageExpiry(noexp); ok || got != 0 {
+		t.Fatalf("mqttMessageExpiry on absent: got %d present=%v, want 0/false", got, ok)
+	}
+	if got := mqttMessageExpiryTTL(noexp); got != 0 {
+		t.Fatalf("mqttMessageExpiryTTL on absent: got %d want 0 (no TTL)", got)
+	}
+	if same := mqttSetMessageExpiry(noexp, 5); &same[0] != &noexp[0] {
+		t.Fatal("expected the same slice back when there is no expiry to set")
+	}
+
+	// An explicit interval of 0 is present (expire immediately) and must map to a
+	// 1s storage TTL, never to "no TTL".
+	zero := mqttV5PropsWithExpiry(0)
+	if got, ok := mqttMessageExpiry(zero); !ok || got != 0 {
+		t.Fatalf("mqttMessageExpiry on explicit 0: got %d present=%v, want 0/true", got, ok)
+	}
+	if got := mqttMessageExpiryTTL(zero); got != 1 {
+		t.Fatalf("mqttMessageExpiryTTL on explicit 0: got %d want 1", got)
+	}
+}
+
+// A retained message published with a Message Expiry Interval round-trips its
+// absolute deadline through encode/decode and carries a JetStream per-message
+// TTL; a retained message without one carries neither.
+func TestMQTTv5RetainedMessageExpiryEncodeDecode(t *testing.T) {
+	subj := mqttRetainedMsgsStreamSubject + "a.b"
+	props := mqttV5PropsWithExpiry(3600)
+	exp := time.Now().Add(time.Hour)
+
+	rm := &mqttRetainedMsg{Topic: "a/b", Flags: mqttPubQos1 | mqttPubFlagRetain, Props: props, Msg: []byte("hi"), expires: exp}
+	natsMsg, hlen := mqttEncodeRetainedMessage(rm)
+	// The TTL must round up: for a ~3599.99s remainder it must be 3600s, not a
+	// truncated 3599s that would delete the copy early.
+	if ttl := string(getHeader(JSMessageTTL, natsMsg[:hlen])); ttl != "3600s" {
+		t.Fatalf("expected %s header of 3600s (ceiling), got %q", JSMessageTTL, ttl)
+	}
+	dec, err := mqttDecodeRetainedMessage(subj, natsMsg[:hlen], natsMsg[hlen:])
+	if err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if dec.expires.IsZero() {
+		t.Fatal("expiry deadline was not preserved")
+	}
+	if !dec.expires.Equal(time.Unix(0, exp.UnixNano())) {
+		t.Fatalf("expiry deadline drift: got %v want %v", dec.expires, exp)
+	}
+
+	// No expiry: neither the TTL header nor a decoded deadline.
+	rm2 := &mqttRetainedMsg{Topic: "a/b", Flags: mqttPubQos1 | mqttPubFlagRetain, Msg: []byte("x")}
+	nm2, hl2 := mqttEncodeRetainedMessage(rm2)
+	if strings.Contains(string(nm2[:hl2]), JSMessageTTL+":") {
+		t.Fatal("did not expect a TTL header without expiry")
+	}
+	dec2, err := mqttDecodeRetainedMessage(subj, nm2[:hl2], nm2[hl2:])
+	if err != nil {
+		t.Fatalf("decode (no expiry): %v", err)
+	}
+	if !dec2.expires.IsZero() {
+		t.Fatal("expected a zero expiry deadline")
+	}
+}
+
+// A retained message replayed to a late v5 subscriber carries the Message Expiry
+// Interval reduced by the time it has been waiting in the server. Spec5 [3.3.2.3.3].
+func TestMQTTv5RetainedMessageExpiryDecrement(t *testing.T) {
+	o := testMQTTDefaultOptionsV5()
+	s := testMQTTRunServer(t, o)
+	defer testMQTTShutdownServer(s)
+
+	cp, rp := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "rexp-pub", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
+	defer cp.Close()
+	testMQTTReadConnAckV5(t, rp)
+	testMQTTPubV5Props(t, cp, rp, 1, true, 21, "rexp/topic", []byte("retained"), mqttV5PropsWithExpiry(1000))
+
+	// Let the message wait in the server for a couple of seconds.
+	time.Sleep(2100 * time.Millisecond)
+
+	cs, rs := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "rexp-sub", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
+	defer cs.Close()
+	testMQTTReadConnAckV5(t, rs)
+	testMQTTSubV5(t, cs, rs, 1, []mqttV5SubFilter{{topic: "rexp/topic", opts: 1}})
+
+	props := testMQTTReadPubV5Props(t, cs, rs, "rexp/topic", []byte("retained"))
+	if props == nil || !props.present[mqttPropMessageExpiry] {
+		t.Fatalf("expected a message expiry interval, got %+v", props)
+	}
+	if me := props.messageExpiry; me == 0 || me >= 1000 || me < 990 {
+		t.Fatalf("message expiry not decremented as expected: got %d (want ~998)", me)
+	}
+	// The rest of the forwarded properties must be intact.
+	if props.contentType != "text/plain" {
+		t.Fatalf("forwarded content type lost: %q", props.contentType)
+	}
+}
+
+// A retained message whose Message Expiry Interval has elapsed is no longer
+// delivered to a new subscriber. Spec5 [3.3.2.3.3].
+func TestMQTTv5RetainedMessageExpires(t *testing.T) {
+	o := testMQTTDefaultOptionsV5()
+	s := testMQTTRunServer(t, o)
+	defer testMQTTShutdownServer(s)
+
+	cp, rp := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "rexp2-pub", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
+	defer cp.Close()
+	testMQTTReadConnAckV5(t, rp)
+	testMQTTPubV5Props(t, cp, rp, 1, true, 22, "rexp2/topic", []byte("gone"), mqttV5PropsWithExpiry(1))
+
+	time.Sleep(2200 * time.Millisecond)
+
+	cs, rs := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "rexp2-sub", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
+	defer cs.Close()
+	testMQTTReadConnAckV5(t, rs)
+	testMQTTSubV5(t, cs, rs, 1, []mqttV5SubFilter{{topic: "rexp2/topic", opts: 1}})
+	testMQTTExpectNothing(t, rs)
+}
+
+// A QoS2 PUBLISH carrying a Message Expiry Interval completes its store/PUBREL
+// handshake (the dedup hold stream has no per-message TTL, so the interval must
+// not be written there) and is forwarded to a v5 subscriber with its properties
+// intact. Spec5 [3.3.2.3.3].
+func TestMQTTv5QoS2MessageExpiryForwarded(t *testing.T) {
+	o := testMQTTDefaultOptionsV5()
+	s := testMQTTRunServer(t, o)
+	defer testMQTTShutdownServer(s)
+
+	cs, rs := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "q2exp-sub", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
+	defer cs.Close()
+	testMQTTReadConnAckV5(t, rs)
+	testMQTTSubV5(t, cs, rs, 1, []mqttV5SubFilter{{topic: "q2exp/topic", opts: 2}})
+
+	cp, rp := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "q2exp-pub", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
+	defer cp.Close()
+	testMQTTReadConnAckV5(t, rp)
+	// A successful QoS2 handshake here proves the hold-stream store was not
+	// rejected by a stray TTL header.
+	testMQTTPubV5Props(t, cp, rp, 2, false, 40, "q2exp/topic", []byte("q2"), mqttV5PropsWithExpiry(3600))
+
+	props := testMQTTReadPubV5Props(t, cs, rs, "q2exp/topic", []byte("q2"))
+	if props == nil || !props.present[mqttPropMessageExpiry] {
+		t.Fatalf("expected a forwarded message expiry interval, got %+v", props)
+	}
+	// Delivered promptly, so the interval is essentially unchanged.
+	if me := props.messageExpiry; me == 0 || me > 3600 || me < 3590 {
+		t.Fatalf("unexpected forwarded message expiry: got %d (want ~3600)", me)
+	}
+	if props.contentType != "text/plain" {
+		t.Fatalf("forwarded content type lost: %q", props.contentType)
+	}
+}
+
+// A stored QoS1 message whose Message Expiry Interval elapses while its
+// subscriber is offline must not be delivered on reconnect. Spec5 [3.3.2.3.3].
+func TestMQTTv5QoS1MessageExpires(t *testing.T) {
+	o := testMQTTDefaultOptionsV5()
+	s := testMQTTRunServer(t, o)
+	defer testMQTTShutdownServer(s)
+
+	// A persistent session subscribes, then goes offline.
+	cs, rs := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "qexp-sub", cleanStart: false}, o.MQTT.Host, o.MQTT.Port)
+	testMQTTReadConnAckV5(t, rs)
+	testMQTTSubV5(t, cs, rs, 1, []mqttV5SubFilter{{topic: "qexp/topic", opts: 1}})
+	cs.Close()
+
+	cp, rp := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "qexp-pub", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
+	defer cp.Close()
+	testMQTTReadConnAckV5(t, rp)
+	testMQTTPubV5Props(t, cp, rp, 1, false, 30, "qexp/topic", []byte("gone"), mqttV5PropsWithExpiry(1))
+
+	time.Sleep(2200 * time.Millisecond)
+
+	// Reconnect the persistent session: the expired message must not arrive.
+	cs2, rs2 := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "qexp-sub", cleanStart: false}, o.MQTT.Host, o.MQTT.Port)
+	defer cs2.Close()
+	if sp, _, _ := testMQTTReadConnAckV5(t, rs2); !sp {
+		t.Fatal("expected the session to be present on reconnect")
+	}
+	testMQTTExpectNothing(t, rs2)
+}
+
+// A retained message published with an explicit Message Expiry Interval of 0
+// expires immediately and must not be delivered to a later subscriber. This
+// distinguishes an explicit 0 (expire now) from an absent interval (never
+// expires). Spec5 [3.3.2.3.3].
+func TestMQTTv5RetainedMessageExpiryZeroImmediate(t *testing.T) {
+	o := testMQTTDefaultOptionsV5()
+	s := testMQTTRunServer(t, o)
+	defer testMQTTShutdownServer(s)
+
+	cp, rp := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "r0-pub", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
+	defer cp.Close()
+	testMQTTReadConnAckV5(t, rp)
+	testMQTTPubV5Props(t, cp, rp, 1, true, 23, "r0/topic", []byte("boom"), mqttV5PropsWithExpiry(0))
+
+	time.Sleep(200 * time.Millisecond)
+
+	cs, rs := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "r0-sub", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
+	defer cs.Close()
+	testMQTTReadConnAckV5(t, rs)
+	testMQTTSubV5(t, cs, rs, 1, []mqttV5SubFilter{{topic: "r0/topic", opts: 1}})
+	testMQTTExpectNothing(t, rs)
+}
+
+// A QoS2 PUBLISH ages against its Message Expiry Interval while it waits for the
+// PUBREL. If the interval elapses before the sender releases the message, the
+// server must not forward it (the clock does not restart at PUBREL). Spec5
+// [3.3.2.3.3].
+func TestMQTTv5QoS2ExpiryAgesDuringPubRel(t *testing.T) {
+	o := testMQTTDefaultOptionsV5()
+	s := testMQTTRunServer(t, o)
+	defer testMQTTShutdownServer(s)
+
+	cs, rs := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "q2age-sub", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
+	defer cs.Close()
+	testMQTTReadConnAckV5(t, rs)
+	testMQTTSubV5(t, cs, rs, 1, []mqttV5SubFilter{{topic: "q2age/topic", opts: 2}})
+
+	cp, rp := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "q2age-pub", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
+	defer cp.Close()
+	testMQTTReadConnAckV5(t, rp)
+
+	// Send the QoS2 PUBLISH (expiry 1s) and its PUBREC, then stall before PUBREL
+	// so the message expires while held on the server.
+	pi := uint16(41)
+	vh := newMQTTWriter(0)
+	vh.WriteBytes([]byte("q2age/topic"))
+	vh.WriteUint16(pi)
+	vh.Write(mqttV5PropsWithExpiry(1))
+	vh.Write([]byte("stale"))
+	w := newMQTTWriter(0)
+	w.WriteByte(mqttPacketPub | (2 << 1))
+	w.WriteVarInt(vh.Len())
+	w.Write(vh.Bytes())
+	if _, err := testMQTTWrite(cp, w.Bytes()); err != nil {
+		t.Fatalf("Error writing PUBLISH: %v", err)
+	}
+	testMQTTReadPIPacket(mqttPacketPubRec, t, rp, pi)
+
+	time.Sleep(1500 * time.Millisecond)
+
+	pubrel := [4]byte{mqttPacketPubRel | 0x2, 0x2, byte(pi >> 8), byte(pi)}
+	if _, err := testMQTTWrite(cp, pubrel[:]); err != nil {
+		t.Fatalf("Error writing PUBREL: %v", err)
+	}
+	testMQTTReadPIPacket(mqttPacketPubComp, t, rp, pi)
+
+	// Expired while awaiting PUBREL: the subscriber must receive nothing.
+	testMQTTExpectNothing(t, rs)
+}
+
+// A stored (QoS 1/2) message published with an explicit Message Expiry Interval
+// of 0 expires immediately and must not be forwarded to a subscriber, even when
+// onward delivery would otherwise happen within the same second. Covers the
+// QoS1 delivery and QoS2 PUBREL-release paths. Spec5 [3.3.2.3.3].
+func TestMQTTv5StoredMessageExpiryZeroNotDelivered(t *testing.T) {
+	o := testMQTTDefaultOptionsV5()
+	s := testMQTTRunServer(t, o)
+	defer testMQTTShutdownServer(s)
+
+	for _, qos := range []byte{1, 2} {
+		t.Run(fmt.Sprintf("qos%d", qos), func(t *testing.T) {
+			topic := fmt.Sprintf("z0/q%d", qos)
+			cs, rs := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: fmt.Sprintf("z0sub%d", qos), cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
+			defer cs.Close()
+			testMQTTReadConnAckV5(t, rs)
+			testMQTTSubV5(t, cs, rs, 1, []mqttV5SubFilter{{topic: topic, opts: qos}})
+
+			cp, rp := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: fmt.Sprintf("z0pub%d", qos), cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
+			defer cp.Close()
+			testMQTTReadConnAckV5(t, rp)
+			// A successful handshake with no onward delivery is the assertion.
+			testMQTTPubV5Props(t, cp, rp, qos, false, 50, topic, []byte("x"), mqttV5PropsWithExpiry(0))
+
+			testMQTTExpectNothing(t, rs)
+		})
+	}
+}
+
+// The max_payload preflight must account for the Nats-TTL header a Message
+// Expiry Interval adds to the stored message, and must not double-count the QoS2
+// hold-stream subject headers together with that TTL header (they never coexist
+// on the same stored message). Sizes are derived from the production sizing so
+// the boundary is exact. Spec5 [3.3.2.3.3].
+func TestMQTTv5MessageExpiryMaxPayload(t *testing.T) {
+	props := mqttV5PropsWithExpiry(60)
+	payload := bytes.Repeat([]byte("x"), 2000)
+
+	// Build the mqttPublish exactly as the server does for a PUBLISH to "foo".
+	subj, err := mqttTopicToNATSPubSubject([]byte("foo"))
+	if err != nil {
+		t.Fatalf("subject conversion: %v", err)
+	}
+	pp := &mqttPublish{topic: []byte("foo"), subject: subj, msg: payload, sz: len(payload), props: props}
+	delivery := mqttComputeNatsMsgSize(pp, false, mqttMessageExpiryTTL(props)) // QoS0/1 store form, QoS2 delivery form
+	hold := mqttComputeNatsMsgSize(pp, true, 0)                                // QoS2 dedup-hold form
+
+	sendPub := func(t *testing.T, c net.Conn, qos byte) {
+		vh := newMQTTWriter(0)
+		vh.WriteBytes([]byte("foo"))
+		vh.WriteUint16(7)
+		vh.Write(props)
+		vh.Write(payload)
+		w := newMQTTWriter(0)
+		w.WriteByte(mqttPacketPub | (qos << 1))
+		w.WriteVarInt(vh.Len())
+		w.Write(vh.Bytes())
+		if _, err := testMQTTWrite(c, w.Bytes()); err != nil {
+			t.Fatalf("Error writing PUBLISH: %v", err)
+		}
+	}
+
+	// One byte below the full stored size: accepted only if the TTL header were
+	// (wrongly) omitted from the check, so this asserts the TTL is counted.
+	t.Run("qos1 rejected when TTL header exceeds the limit", func(t *testing.T) {
+		o := testMQTTDefaultOptionsV5()
+		o.MaxPayload = int32(delivery - 1)
+		s := testMQTTRunServer(t, o)
+		defer testMQTTShutdownServer(s)
+		c, r := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "mp-rej", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
+		defer c.Close()
+		testMQTTReadConnAckV5(t, r)
+		sendPub(t, c, 1)
+		testMQTTExpectDisconnect(t, c)
+	})
+
+	t.Run("qos1 accepted at exactly the full stored size", func(t *testing.T) {
+		o := testMQTTDefaultOptionsV5()
+		o.MaxPayload = int32(delivery)
+		s := testMQTTRunServer(t, o)
+		defer testMQTTShutdownServer(s)
+		c, r := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "mp-acc", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
+		defer c.Close()
+		testMQTTReadConnAckV5(t, r)
+		testMQTTPubV5Props(t, c, r, 1, false, 7, "foo", payload, props) // completes with PUBACK
+	})
+
+	// max_payload set to the larger of the two actual QoS2 forms. The message
+	// fits; only the old buggy sum (hold headers + TTL header) would reject it.
+	t.Run("qos2 not over-rejected", func(t *testing.T) {
+		maxp := hold
+		if delivery > maxp {
+			maxp = delivery
+		}
+		o := testMQTTDefaultOptionsV5()
+		o.MaxPayload = int32(maxp)
+		s := testMQTTRunServer(t, o)
+		defer testMQTTShutdownServer(s)
+		c, r := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "mp-q2", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
+		defer c.Close()
+		testMQTTReadConnAckV5(t, r)
+		testMQTTPubV5Props(t, c, r, 2, false, 7, "foo", payload, props) // full QoS2 handshake completes
+	})
+}
+
+// A message published with Message Expiry Interval = 0 expires immediately and
+// must not be delivered to ANY subscriber, whatever its protocol level or QoS.
+// Spec5 [3.3.2.3.3].
+func TestMQTTv5MessageExpiryZeroAllProtos(t *testing.T) {
+	o := testMQTTDefaultOptionsV5()
+	s := testMQTTRunServer(t, o)
+	defer testMQTTShutdownServer(s)
+
+	// 3.1.1 subscriber at QoS1 (JetStream-backed delivery path).
+	c311, r311 := testMQTTConnect(t, &mqttConnInfo{clientID: "mei311", cleanSess: true}, o.MQTT.Host, o.MQTT.Port)
+	defer c311.Close()
+	testMQTTCheckConnAck(t, r311, mqttConnAckRCConnectionAccepted, false)
+	testMQTTSub(t, 1, c311, r311, []*mqttFilter{{filter: "mei/z", qos: 1}}, []byte{1})
+	testMQTTFlush(t, c311, nil, r311)
+
+	// v5 subscriber at QoS0 (direct delivery path).
+	cs0, rs0 := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "meiq0", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
+	defer cs0.Close()
+	testMQTTReadConnAckV5(t, rs0)
+	testMQTTSubV5(t, cs0, rs0, 1, []mqttV5SubFilter{{topic: "mei/z", opts: 0}})
+	testMQTTFlush(t, cs0, nil, rs0)
+
+	// v5 publisher sends QoS1 with Message Expiry Interval = 0.
+	props := newMQTTWriter(0)
+	props.WriteByte(mqttPropMessageExpiry)
+	props.WriteUint32(0)
+	block := newMQTTWriter(0)
+	block.WriteVarInt(props.Len())
+	block.Write(props.Bytes())
+	cp, rp := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "meipub", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
+	defer cp.Close()
+	testMQTTReadConnAckV5(t, rp)
+	testMQTTPubV5Props(t, cp, rp, 1, false, 1, "mei/z", []byte("x"), block.Bytes())
+
+	testMQTTExpectNothing(t, r311)
+	testMQTTExpectNothing(t, rs0)
+}
+
+// In degraded mode (the retained stream refused AllowMsgTTL) the encoded
+// retained message must omit the Nats-TTL header, which the stream would
+// reject, while keeping the expiry deadline so delivery-side expiry still
+// works.
+func TestMQTTv5RetainedMessageEncodeNoTTL(t *testing.T) {
+	rm := &mqttRetainedMsg{Topic: "t", Msg: []byte("m"), expires: time.Now().Add(time.Minute)}
+	full, _ := mqttEncodeRetainedMessageTTL(rm, true)
+	if !bytes.Contains(full, []byte(JSMessageTTL)) {
+		t.Fatal("Expected a Nats-TTL header with withTTL=true")
+	}
+	deg, hdr := mqttEncodeRetainedMessageTTL(rm, false)
+	if bytes.Contains(deg, []byte(JSMessageTTL)) {
+		t.Fatal("Expected no Nats-TTL header with withTTL=false")
+	}
+	if !bytes.Contains(deg, []byte(mqttNatsRetainedMessageExpiry)) {
+		t.Fatal("Expected the expiry deadline header to be kept")
+	}
+	dec, err := mqttDecodeRetainedMessage(mqttRetainedMsgsStreamSubject+"t", deg[:hdr], deg[hdr:])
+	if err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if dec.expires.IsZero() {
+		t.Fatal("Expected the decoded message to keep its expiry deadline")
+	}
+}
+
+// In degraded mode (the messages stream refused AllowMsgTTL) a stored QoS1/2
+// PUBLISH must omit the Nats-TTL header JetStream would reject; the Message
+// Expiry properties are still stored and forwarded for delivery-side checks.
+func TestMQTTv5MessagesStreamDegradedNoTTL(t *testing.T) {
+	o := testMQTTDefaultOptionsV5()
+	s := testMQTTRunServer(t, o)
+	defer testMQTTShutdownServer(s)
+
+	cs, rs := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "degsub", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
+	defer cs.Close()
+	testMQTTReadConnAckV5(t, rs)
+	testMQTTSubV5(t, cs, rs, 1, []mqttV5SubFilter{{topic: "deg/t", opts: 1}})
+	testMQTTFlush(t, cs, nil, rs)
+
+	meiBlock := func() []byte {
+		p := newMQTTWriter(0)
+		p.WriteByte(mqttPropMessageExpiry)
+		p.WriteUint32(600)
+		b := newMQTTWriter(0)
+		b.WriteVarInt(p.Len())
+		b.Write(p.Bytes())
+		return b.Bytes()
+	}
+
+	cp, rp := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "degpub", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
+	defer cp.Close()
+	testMQTTReadConnAckV5(t, rp)
+
+	nc, js := jsClientConnect(t, s)
+	defer nc.Close()
+
+	// Normal mode: the stored copy carries the per-message TTL. Fetch it
+	// before the subscriber acks (this is an interest stream).
+	testMQTTPubV5Props(t, cp, rp, 1, false, 1, "deg/t", []byte("m1"), meiBlock())
+	msg, err := js.GetLastMsg(mqttStreamName, "$MQTT.msgs.deg.t")
+	if err != nil {
+		t.Fatalf("get stored message: %v", err)
+	}
+	if msg.Header.Get(JSMessageTTL) == "" {
+		t.Fatal("Expected a Nats-TTL header on the stored message in normal mode")
+	}
+	testMQTTReadPubV5Props(t, cs, rs, "deg/t", []byte("m1"))
+
+	// Degraded mode, as set when enabling AllowMsgTTL on the stream failed.
+	asm := testMQTTGetAccountSessionManager(t, s, "degpub")
+	asm.msgsStreamNoTTL = true
+
+	testMQTTPubV5Props(t, cp, rp, 1, false, 2, "deg/t", []byte("m2"), meiBlock())
+	msg, err = js.GetLastMsg(mqttStreamName, "$MQTT.msgs.deg.t")
+	if err != nil {
+		t.Fatalf("get stored message: %v", err)
+	}
+	if string(msg.Data) != "m2" {
+		t.Fatalf("Expected the degraded-mode message to be stored, got %q", msg.Data)
+	}
+	if v := msg.Header.Get(JSMessageTTL); v != "" {
+		t.Fatalf("Expected no Nats-TTL header on the stored message in degraded mode, got %q", v)
+	}
+	props := testMQTTReadPubV5Props(t, cs, rs, "deg/t", []byte("m2"))
+	if props == nil || !props.present[mqttPropMessageExpiry] {
+		t.Fatal("Expected the Message Expiry property to still be forwarded")
+	}
 }

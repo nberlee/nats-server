@@ -3230,7 +3230,7 @@ func TestMQTTTrackPendingOverrun(t *testing.T) {
 	for i := 1; i <= 0xFFFF; i++ {
 		sess.pendingPublish[uint16(i)] = p
 	}
-	pi, _ = sess.trackPublish("test", "test")
+	pi, _, _ = sess.trackPublish("test", "test")
 	if pi != 0 {
 		t.Fatalf("Expected 0, got %v", pi)
 	}
@@ -9036,18 +9036,9 @@ func TestMQTTRetainedMsgRemovedFromMapIfNotInStream(t *testing.T) {
 
 	checkRetained(_EMPTY_)
 
-	// We should have got a warning.
-	select {
-	case w := <-l.warn:
-		if !strings.Contains(w, ApiErrors[JSNoMessageFoundErr].Description) {
-			t.Fatalf("Unexpected warning: %q", w)
-		}
-	case <-time.After(time.Second):
-		t.Fatalf("Test timed out")
-	}
-
-	// But restarting it should not cause the server to try to load the retained
-	// message again. So we should not have a warning.
+	// A missing stored message is an expected outcome (per-message TTL reaps
+	// expired retained messages routinely), so no warning is emitted; the
+	// stale index entry is silently removed instead.
 	checkRetained(_EMPTY_)
 
 	select {
