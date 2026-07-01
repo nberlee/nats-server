@@ -414,7 +414,12 @@ type mqttSession struct {
 	last_pi uint16
 
 	// Maximum number of pending acks for this session.
-	maxp     uint16
+	maxp uint16
+	// rmax is the current connection's MQTT 5.0 Receive Maximum: the max number
+	// of unacknowledged QoS1/2 PUBLISH the server may have in flight to the
+	// client. 0 means no client-imposed limit (3.1.1, or not sent). The
+	// effective in-flight cap is min(maxp, rmax). Set on each CONNECT.
+	rmax     uint16
 	tmaxack  int
 	clean    bool
 	domainTk string
@@ -691,8 +696,8 @@ func (s *Server) startMQTT() {
 	s.Noticef("Listening for MQTT clients on %s://%s:%d", scheme, o.Host, o.Port)
 	if s.mqtt.v5Enabled {
 		s.Warnf("MQTT 5.0 support is enabled but experimental: some v5 features " +
-			"(Receive Maximum and Maximum Packet Size flow control, " +
-			"session/message/will-delay expiry) are not yet honored")
+			"(Maximum Packet Size flow control, session/message/will-delay " +
+			"expiry) are not yet honored")
 	}
 	go s.acceptConnections(hl, "MQTT", func(conn net.Conn) { s.createMQTTClient(conn, nil) }, nil)
 	s.mu.Unlock()
@@ -3717,11 +3722,50 @@ func (sess *mqttSession) bumpPI() uint16 {
 	return sess.last_pi
 }
 
-// trackPublishRetained is invoked when a retained (QoS) message is published.
-// It need a new PI to be allocated, so we add it to the pendingPublish map,
-// with an empty value. Since cpending (not pending) is used to serialize the PI
-// mappings, we need to add this PI there as well. Make a unique key by using
-// mqttRetainedMsgsStreamName for the durable name, and PI for sseq.
+// effectiveMaxAck returns the maximum number of unacknowledged QoS1/2 PUBLISH
+// this session may have in flight: the configured MaxAckPending, further capped
+// by the client's MQTT 5.0 Receive Maximum when one was advertised (rmax != 0).
+//
+// Lock held on entry.
+func (sess *mqttSession) effectiveMaxAck() int {
+	m := sess.maxp
+	if sess.rmax != 0 && sess.rmax < m {
+		m = sess.rmax
+	}
+	return int(m)
+}
+
+// qos12InflightForCap counts in-flight QoS 1/2 PUBLISHes against effectiveMaxAck.
+// With a Receive Maximum, QoS 2 messages awaiting PUBCOMP (pendingPubRel) still
+// count: Spec5 [4.9] frees the quota only on PUBACK/PUBCOMP or a failed PUBREC.
+// Without one, the cap is JetStream MaxAckPending, which those were acked out of.
+//
+// Lock held on entry
+func (sess *mqttSession) qos12InflightForCap() int {
+	n := len(sess.pendingPublish)
+	if sess.rmax != 0 {
+		n += len(sess.pendingPubRel)
+	}
+	return n
+}
+
+// dropUnredeliverableRetained releases pending retained (QoS1/2) deliveries,
+// identified by an empty jsAckSubject: they have no JetStream backing and so
+// cannot be redelivered on resume. Keeping them would leak a Receive Maximum
+// slot for the life of a persistent session.
+//
+// Lock held on entry
+func (sess *mqttSession) dropUnredeliverableRetained() {
+	for pi, ack := range sess.pendingPublish {
+		if ack.jsAckSubject == _EMPTY_ {
+			delete(sess.pendingPublish, pi)
+		}
+	}
+}
+
+// trackPublishRetained is invoked when a retained (QoS) message is published. It
+// allocates a new PI and adds it to pendingPublish with an empty value (no
+// JetStream backing). Spec5 [3.3.4].
 //
 // Lock held on entry
 func (sess *mqttSession) trackPublishRetained() uint16 {
@@ -3731,6 +3775,14 @@ func (sess *mqttSession) trackPublishRetained() uint16 {
 	}
 	if sess.cpending == nil {
 		sess.cpending = make(map[string]map[uint64]uint16)
+	}
+
+	// Honor the effective in-flight cap (MaxAckPending capped by the client's
+	// Receive Maximum). At the limit, return 0 so the caller downgrades this
+	// retained message to QoS0: it is still delivered, but does not count as an
+	// unacknowledged QoS1/2 PUBLISH. Spec5 [3.3.4].
+	if sess.qos12InflightForCap() >= sess.effectiveMaxAck() {
+		return 0
 	}
 
 	pi := sess.bumpPI()
@@ -3789,11 +3841,19 @@ func (sess *mqttSession) trackPublish(jsDur, jsAckSubject string) (uint16, bool)
 			return 0, false
 		}
 
-		// We should have a pending JS ACK for this PI.
+		// We should have a pending JS ACK for this PI. This is a redelivery of a
+		// message already counted against the in-flight cap, so it is not gated
+		// again here. NOTE: if a persistent session accumulated more unacked
+		// messages than a newly-lowered Receive Maximum, redeliveries of those
+		// pre-existing pending messages are not additionally paced on the new
+		// connection (a known limitation; new deliveries below still are, and
+		// the session drains to the cap as PUBACKs arrive).
 		ack = sess.pendingPublish[pi]
 	} else {
-		// sess.maxp will always have a value > 0.
-		if len(sess.pendingPublish) >= int(sess.maxp) {
+		// Gate new deliveries at the effective cap: MaxAckPending capped by the
+		// client's MQTT 5.0 Receive Maximum. QoS 2 messages awaiting PUBCOMP are
+		// counted too when a Receive Maximum applies (Spec5 [4.9]).
+		if sess.qos12InflightForCap() >= sess.effectiveMaxAck() {
 			// Indicate that we did not assign a packet identifier.
 			// The caller will not send the message to the subscription
 			// and JS will redeliver later, based on consumer's AckWait.
@@ -4330,6 +4390,12 @@ CHECK:
 		es.clean = cleanSess
 		// Clear this flag so we resubscribe to PUBREL subject is needed.
 		es.pubRelSubscribed = false
+		if sessp {
+			// Resumed session: release retained (QoS1/2) deliveries with no
+			// JetStream backing. They cannot be redelivered, so keeping them would
+			// leak a Receive Maximum slot for the life of the session.
+			es.dropUnredeliverableRetained()
+		}
 		es.mu.Unlock()
 		if ec != nil {
 			// Remove "will" of existing client before closing
@@ -4356,6 +4422,18 @@ CHECK:
 		// Now add this new session into the account sessions
 		asm.addSession(es, true)
 	}
+	// MQTT 5.0 Receive Maximum: cap the number of in-flight unacknowledged
+	// QoS1/2 PUBLISH we will send to this client. Re-evaluated on every CONNECT
+	// since a resumed session may be taken over by a client with a different
+	// (or no) limit. 0 means no client-imposed limit.
+	var rmax uint16
+	if cp.props != nil {
+		rmax = cp.props.receiveMax
+	}
+	es.mu.Lock()
+	es.rmax = rmax
+	es.mu.Unlock()
+
 	// We would need to save only if it did not exist previously, but we save
 	// always in case we are running in cluster mode. This will notify other
 	// running servers that this session is being used.
@@ -6112,6 +6190,7 @@ func (sess *mqttSession) processJSConsumer(c *client, subject, sid string,
 	cc, exists := sess.cons[sid]
 	tmaxack := sess.tmaxack
 	idHash := sess.idHash
+	rmax := sess.rmax
 	sess.mu.Unlock()
 
 	// Check if we are already a JS consumer for this SID.
@@ -6162,6 +6241,13 @@ func (sess *mqttSession) processJSConsumer(c *client, subject, sid string,
 		maxAckPending := int(opts.MQTT.MaxAckPending)
 		if maxAckPending == 0 {
 			maxAckPending = mqttDefaultMaxAckPending
+		}
+		// Pace JetStream delivery to the client's Receive Maximum so the
+		// in-flight gate rarely drops at the cap (a drop waits out AckWait and
+		// reorders). The gate stays the hard bound across subscriptions; a
+		// consumer that outlives this connection keeps this cap until deleted.
+		if rmax != 0 && int(rmax) < maxAckPending {
+			maxAckPending = int(rmax)
 		}
 
 		// Check that the limit of subs' maxAckPending are not going over the limit
@@ -6905,7 +6991,12 @@ func (r *mqttReader) readProperties(ctx byte) (*mqttProperties, error) {
 		case mqttPropServerKeepAlive:
 			props.serverKeepAlive, err = r.readUint16("server keep alive")
 		case mqttPropReceiveMaximum:
-			props.receiveMax, err = r.readUint16("receive maximum")
+			if props.receiveMax, err = r.readUint16("receive maximum"); err == nil && props.receiveMax == 0 {
+				// Spec5 [3.1.2.11.3]: a Receive Maximum value of 0 is a Protocol
+				// Error. (Absent means no property, i.e. the default, which we
+				// treat as no client-imposed limit.)
+				err = fmt.Errorf("%w: receive maximum of 0", errMQTTProtocolError)
+			}
 		case mqttPropTopicAliasMax:
 			props.topicAliasMax, err = r.readUint16("topic alias maximum")
 		case mqttPropTopicAlias:

@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"net"
 	"testing"
+	"time"
 
 	"github.com/nats-io/nats.go"
 )
@@ -1388,5 +1389,240 @@ func TestMQTTv5RetainedJSONFallbackPropsValidated(t *testing.T) {
 	}
 	if rm.Props != nil {
 		t.Fatalf("Expected forbidden props to be dropped, got %v", rm.Props)
+	}
+}
+
+// ---- Receive Maximum ----
+
+// mqttV5ConnPropsReceiveMax returns a CONNECT properties body carrying a
+// Receive Maximum property (0x21).
+func mqttV5ConnPropsReceiveMax(n uint16) []byte {
+	b := newMQTTWriter(0)
+	b.WriteByte(mqttPropReceiveMaximum)
+	b.WriteUint16(n)
+	return b.Bytes()
+}
+
+func testMQTTSessionReceiveMax(t testing.TB, s *Server, clientID string) uint16 {
+	t.Helper()
+	c := testMQTTGetClient(t, s, clientID)
+	sess := c.mqtt.sess
+	sess.mu.Lock()
+	defer sess.mu.Unlock()
+	return sess.rmax
+}
+
+// The client's Receive Maximum is recorded on the session (0 for 3.1.1), and
+// bounds the number of unacknowledged QoS1 PUBLISH the server has in flight:
+// a second message is held until the first is acked and then redelivered.
+func TestMQTTv5ReceiveMaximum(t *testing.T) {
+	o := testMQTTDefaultOptionsV5()
+	o.MQTT.AckWait = time.Second // keep redelivery of the held message fast
+	s := testMQTTRunServer(t, o)
+	defer testMQTTShutdownServer(s)
+
+	// 3.1.1 client imposes no limit.
+	c311, r311 := testMQTTConnect(t, &mqttConnInfo{clientID: "rm311", cleanSess: true}, o.MQTT.Host, o.MQTT.Port)
+	defer c311.Close()
+	testMQTTCheckConnAck(t, r311, mqttConnAckRCConnectionAccepted, false)
+	if got := testMQTTSessionReceiveMax(t, s, "rm311"); got != 0 {
+		t.Fatalf("expected rmax=0 for a 3.1.1 client, got %d", got)
+	}
+
+	// v5 subscriber with Receive Maximum = 1.
+	cs, rs := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "rmsub", cleanStart: true, props: mqttV5ConnPropsReceiveMax(1)}, o.MQTT.Host, o.MQTT.Port)
+	defer cs.Close()
+	testMQTTReadConnAckV5(t, rs)
+	if got := testMQTTSessionReceiveMax(t, s, "rmsub"); got != 1 {
+		t.Fatalf("expected rmax=1, got %d", got)
+	}
+	testMQTTSubV5(t, cs, rs, 1, []mqttV5SubFilter{{topic: "rm/t", opts: 1}})
+
+	// Publisher sends two QoS1 messages back to back.
+	cp, rp := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "rmpub", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
+	defer cp.Close()
+	testMQTTReadConnAckV5(t, rp)
+	testMQTTPubV5Props(t, cp, rp, 1, false, 1, "rm/t", []byte("m1"), nil)
+	testMQTTPubV5Props(t, cp, rp, 1, false, 2, "rm/t", []byte("m2"), nil)
+
+	// Only the first is delivered; the second is held while one is unacked.
+	// testMQTTReadPublishV5 does not ack.
+	_, pi := testMQTTReadPublishV5(t, rs, "rm/t", []byte("m1"))
+	testMQTTExpectNothing(t, rs)
+
+	// Ack the first; the held message is redelivered once a slot frees.
+	pa := [4]byte{mqttPacketPubAck, 0x2, byte(pi >> 8), byte(pi)}
+	if _, err := testMQTTWrite(cs, pa[:]); err != nil {
+		t.Fatalf("Error writing PUBACK: %v", err)
+	}
+	testMQTTReadPublishV5(t, rs, "rm/t", []byte("m2"))
+}
+
+func TestMQTTv5ReceiveMaximumQoS2(t *testing.T) {
+	o := testMQTTDefaultOptionsV5()
+	o.MQTT.AckWait = time.Second
+	s := testMQTTRunServer(t, o)
+	defer testMQTTShutdownServer(s)
+
+	// v5 subscriber, Receive Maximum = 1, QoS2 subscription.
+	cs, rs := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "rm2sub", cleanStart: true, props: mqttV5ConnPropsReceiveMax(1)}, o.MQTT.Host, o.MQTT.Port)
+	defer cs.Close()
+	testMQTTReadConnAckV5(t, rs)
+	testMQTTSubV5(t, cs, rs, 1, []mqttV5SubFilter{{topic: "rm2/t", opts: 2}})
+
+	cp, rp := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "rm2pub", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
+	defer cp.Close()
+	testMQTTReadConnAckV5(t, rp)
+	testMQTTPubV5Props(t, cp, rp, 2, false, 1, "rm2/t", []byte("m1"), nil)
+	testMQTTPubV5Props(t, cp, rp, 2, false, 2, "rm2/t", []byte("m2"), nil)
+
+	// m1 delivered; m2 held at the cap.
+	_, pi := testMQTTReadPublishV5(t, rs, "rm2/t", []byte("m1"))
+	testMQTTExpectNothing(t, rs)
+
+	// PUBREC moves m1 to the awaiting-PUBCOMP state, which still counts against
+	// the Receive Maximum: the server sends PUBREL but must keep m2 held.
+	testMQTTSendPIPacket(mqttPacketPubRec, t, cs, pi)
+	testMQTTReadPIPacket(mqttPacketPubRel, t, rs, pi)
+	testMQTTExpectNothing(t, rs)
+
+	// PUBCOMP frees the slot; m2 is now delivered.
+	testMQTTSendPIPacket(mqttPacketPubComp, t, cs, pi)
+	testMQTTReadPublishV5(t, rs, "rm2/t", []byte("m2"))
+}
+
+func TestMQTTSessionDropUnredeliverableRetained(t *testing.T) {
+	// A retained (QoS1/2) delivery is tracked with no JetStream backing (empty
+	// jsAckSubject); it cannot be redelivered, so it must be released on resume
+	// rather than leaking a Receive Maximum slot. JS-backed entries stay.
+	sess := &mqttSession{
+		pendingPublish: map[uint16]*mqttPending{
+			1: {jsDur: "d", sseq: 10, jsAckSubject: "$JS.ACK.x"},
+			2: {}, // retained, no backing
+		},
+	}
+	sess.dropUnredeliverableRetained()
+	if _, ok := sess.pendingPublish[2]; ok {
+		t.Fatal("expected retained entry (empty jsAckSubject) to be dropped")
+	}
+	if _, ok := sess.pendingPublish[1]; !ok {
+		t.Fatal("expected JS-backed entry to be kept")
+	}
+}
+
+// A Receive Maximum of 0 is a protocol error (spec5 [3.1.2.11.3]); the CONNECT
+// is rejected with a CONNACK carrying reason 0x82 (Protocol Error).
+func TestMQTTv5ReceiveMaximumZeroRejected(t *testing.T) {
+	o := testMQTTDefaultOptionsV5()
+	s := testMQTTRunServer(t, o)
+	defer testMQTTShutdownServer(s)
+
+	c, r := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "rmzero", cleanStart: true, props: mqttV5ConnPropsReceiveMax(0)}, o.MQTT.Host, o.MQTT.Port)
+	defer c.Close()
+	_, reason, _ := testMQTTReadConnAckV5(t, r)
+	if reason != mqttReasonProtocolError {
+		t.Fatalf("Expected reason 0x%x (protocol error), got 0x%x", mqttReasonProtocolError, reason)
+	}
+}
+
+// testMQTTReadAnyPublishV5 reads one v5 PUBLISH without asserting its topic and
+// returns (qos, topic, payload). Does not ack.
+func testMQTTReadAnyPublishV5(t testing.TB, r *mqttReader) (byte, string, []byte) {
+	t.Helper()
+	b, pl := testMQTTReadPacket(t, r)
+	if pt := b & mqttPacketMask; pt != mqttPacketPub {
+		t.Fatalf("Expected PUBLISH (%x), got %x", mqttPacketPub, pt)
+	}
+	start := r.pos
+	qos := mqttGetQoS(b & mqttPacketFlagMask)
+	topic, err := r.readBytes("topic", false)
+	if err != nil {
+		t.Fatalf("Error reading topic: %v", err)
+	}
+	if qos > 0 {
+		if _, err = r.readUint16("pi"); err != nil {
+			t.Fatalf("Error reading pi: %v", err)
+		}
+	}
+	if _, err = r.readProperties(mqttPacketPub); err != nil {
+		t.Fatalf("Error reading PUBLISH properties: %v", err)
+	}
+	payloadLen := pl - (r.pos - start)
+	got := r.buf[r.pos : r.pos+payloadLen]
+	r.pos += payloadLen
+	return qos, string(topic), append([]byte(nil), got...)
+}
+
+// Retained QoS>0 replay is bounded by the effective cap (MaxAckPending capped by
+// Receive Maximum): with Receive Maximum=1, only one matching retained message
+// is delivered as QoS1; the rest are downgraded to QoS0 (delivered, not counted
+// against the in-flight limit).
+func TestMQTTv5RetainedReceiveMaximum(t *testing.T) {
+	o := testMQTTDefaultOptionsV5()
+	s := testMQTTRunServer(t, o)
+	defer testMQTTShutdownServer(s)
+
+	// Publish three retained QoS1 messages under a common prefix.
+	cp, rp := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "retpub2", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
+	defer cp.Close()
+	testMQTTReadConnAckV5(t, rp)
+	topics := []string{"ret/a", "ret/b", "ret/c"}
+	for i, tp := range topics {
+		testMQTTPubV5Props(t, cp, rp, 1, true, uint16(i+1), tp, []byte("v"), nil)
+	}
+
+	// Subscribe QoS1 with Receive Maximum = 1.
+	cs, rs := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "retsub2", cleanStart: true, props: mqttV5ConnPropsReceiveMax(1)}, o.MQTT.Host, o.MQTT.Port)
+	defer cs.Close()
+	testMQTTReadConnAckV5(t, rs)
+	testMQTTSubV5(t, cs, rs, 1, []mqttV5SubFilter{{topic: "ret/#", opts: 1}})
+
+	seen := map[string]bool{}
+	qos1 := 0
+	for range topics {
+		qos, tp, _ := testMQTTReadAnyPublishV5(t, rs)
+		seen[tp] = true
+		if qos > 0 {
+			qos1++
+		}
+	}
+	if len(seen) != len(topics) {
+		t.Fatalf("Expected all %d retained topics delivered, got %v", len(topics), seen)
+	}
+	// At most the effective cap (1) may be in flight as QoS>0; the rest are QoS0.
+	if qos1 > 1 {
+		t.Fatalf("Expected at most 1 retained message as QoS>0 under Receive Maximum=1, got %d", qos1)
+	}
+}
+
+// With Receive Maximum=1 the server must pace QoS1 delivery without reordering:
+// each message arrives only after the previous one is acked, in publish order,
+// and without waiting out AckWait (which is left at its 30s default here, so a
+// drop-at-cap would make this test time out).
+func TestMQTTv5ReceiveMaximumOrdering(t *testing.T) {
+	o := testMQTTDefaultOptionsV5()
+	s := testMQTTRunServer(t, o)
+	defer testMQTTShutdownServer(s)
+
+	cs, rs := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "ordsub", cleanStart: true, props: mqttV5ConnPropsReceiveMax(1)}, o.MQTT.Host, o.MQTT.Port)
+	defer cs.Close()
+	testMQTTReadConnAckV5(t, rs)
+	testMQTTSubV5(t, cs, rs, 1, []mqttV5SubFilter{{topic: "ord/t", opts: 1}})
+	testMQTTFlush(t, cs, nil, rs)
+
+	cp, rp := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "ordpub", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
+	defer cp.Close()
+	testMQTTReadConnAckV5(t, rp)
+	for i := 1; i <= 3; i++ {
+		testMQTTPublishV5(t, cp, 1, uint16(i), "ord/t", []byte{byte('0' + i)})
+		testMQTTReadPubAck(t, rp, uint16(i))
+	}
+
+	for i := 1; i <= 3; i++ {
+		_, pi := testMQTTReadPublishV5(t, rs, "ord/t", []byte{byte('0' + i)})
+		pa := [4]byte{mqttPacketPubAck, 0x2, byte(pi >> 8), byte(pi)}
+		if _, err := testMQTTWrite(cs, pa[:]); err != nil {
+			t.Fatalf("Error writing PUBACK: %v", err)
+		}
 	}
 }

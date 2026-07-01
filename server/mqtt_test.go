@@ -3213,6 +3213,12 @@ func TestMQTTSubWithNATSStream(t *testing.T) {
 
 func TestMQTTTrackPendingOverrun(t *testing.T) {
 	sess := mqttSession{}
+	// Real sessions always have a positive max pending (mqttSessionCreate uses
+	// the configured MaxAckPending or the default); use the maximum here so this
+	// PI-allocation test exercises the full packet-identifier range. With the
+	// zero value the effective in-flight cap would be 0 and nothing could be
+	// published.
+	sess.maxp = 0xFFFF
 
 	sess.last_pi = 0xFFFF
 	pi := sess.trackPublishRetained()
