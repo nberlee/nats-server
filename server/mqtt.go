@@ -489,6 +489,15 @@ type mqtt struct {
 	// long after CONNECT can select the proper wire framing.
 	proto byte
 
+	// maxPacketSize is the current connection's MQTT 5.0 Maximum Packet Size:
+	// the largest PUBLISH (whole control packet) the client is willing to
+	// accept. 0 means no client-imposed limit (3.1.1, or not sent). Set during
+	// CONNECT and read lock-free on the delivery paths like proto. Unlike the
+	// session's Receive Maximum (rmax), this lives on the per-connection client:
+	// it must gate the QoS0 direct-delivery path, which runs without the session
+	// lock. Spec5 [3.1.2.11.4].
+	maxPacketSize uint32
+
 	// cidGenerated is true when the client sent an empty client ID and the
 	// server assigned one. For v5 it must be echoed back in the CONNACK as the
 	// Assigned Client Identifier property. Spec5 [3.2.2.3.7].
@@ -696,8 +705,7 @@ func (s *Server) startMQTT() {
 	s.Noticef("Listening for MQTT clients on %s://%s:%d", scheme, o.Host, o.Port)
 	if s.mqtt.v5Enabled {
 		s.Warnf("MQTT 5.0 support is enabled but experimental: some v5 features " +
-			"(Maximum Packet Size flow control, session/message/will-delay " +
-			"expiry) are not yet honored")
+			"(session/message/will-delay expiry) are not yet honored")
 	}
 	go s.acceptConnections(hl, "MQTT", func(conn net.Conn) { s.createMQTTClient(conn, nil) }, nil)
 	s.mu.Unlock()
@@ -3018,6 +3026,18 @@ func (as *mqttAccountSessionManager) serializeRetainedMsgsForSub(rms map[string]
 		// We can find the published retained message in rm.sub.subject.
 		// Set the RETAIN flag: [MQTT-3.3.1-8].
 		flags, headerBytes := mqttMakePublishHeader(pi, qos, false, true, c.mqtt.proto == mqttProtoLevel5, []byte(rm.Topic), rm.Props, len(rm.Msg))
+
+		// MQTT 5.0 Maximum Packet Size: skip a retained message that would exceed
+		// the client's limit rather than send an oversized packet (which a strict
+		// client rejects as a protocol error). Discarding is spec-correct: the
+		// message is treated as delivered. Release the packet identifier if one
+		// was allocated (the session lock is held on entry). Spec5 [3.1.2.11.4].
+		if mp := c.mqtt.maxPacketSize; mp != 0 && len(headerBytes)+len(rm.Msg) > int(mp) {
+			if pi != 0 {
+				sess.untrackPublish(pi)
+			}
+			return
+		}
 		c.mu.Lock()
 		sub.mqtt.prm = append(sub.mqtt.prm, headerBytes, rm.Msg)
 		c.mu.Unlock()
@@ -4013,11 +4033,11 @@ func (c *client) mqttParseConnect(r *mqttReader, hasMappings bool) (byte, *mqttC
 		return mqttConnAckRCUnacceptableProtocolVersion, nil, fmt.Errorf("unacceptable protocol version of %v", level)
 	}
 	// Enforce the maximum accepted protocol version. MQTT 5.0 support is still
-	// being completed (e.g. PUBLISH property forwarding, Receive Maximum flow
-	// control, session/message expiry are not yet honored), so it is opt-in:
-	// unless the operator sets MaxProtocolVersion to 5, the server accepts only
-	// 3.1.1. When rejecting, reply using the framing the client asked for (set
-	// c.mqtt.proto) so it can read the reason code and fall back.
+	// being completed (e.g. session/message/will-delay expiry are not yet
+	// honored), so it is opt-in: unless the operator sets MaxProtocolVersion to
+	// 5, the server accepts only 3.1.1. When rejecting, reply using the framing
+	// the client asked for (set c.mqtt.proto) so it can read the reason code and
+	// fall back.
 	if c.srv != nil {
 		maxv := c.srv.getOpts().MQTT.MaxProtocolVersion
 		if maxv == 0 {
@@ -4433,6 +4453,16 @@ CHECK:
 	es.mu.Lock()
 	es.rmax = rmax
 	es.mu.Unlock()
+
+	// MQTT 5.0 Maximum Packet Size: never send this client a PUBLISH larger than
+	// it will accept. Unlike Receive Maximum this lands on the per-connection
+	// client (not the session): it is read lock-free on the delivery paths and
+	// must gate the QoS0 path, which has no session lock. A fresh client per
+	// connection makes it inherently per-connection, so no explicit re-eval is
+	// needed. 0 means no client-imposed limit.
+	if cp.props != nil {
+		c.mqtt.maxPacketSize = cp.props.maxPacketSize
+	}
 
 	// We would need to save only if it did not exist previously, but we save
 	// always in case we are running in cluster mode. This will notify other
@@ -5746,7 +5776,9 @@ func mqttDeliverMsgCbQoS0(sub *subscription, pc *client, _ *Account, subject, re
 		}
 	}
 
-	// Message never has a packet identifier nor is marked as duplicate.
+	// Message never has a packet identifier nor is marked as duplicate. A QoS0
+	// message dropped for exceeding the client's Maximum Packet Size needs no
+	// completion (it is not JetStream-backed here), so the result is ignored.
 	pc.mqttEnqueuePublishMsgTo(cc, sub, 0, 0, false, topic, msg, props)
 }
 
@@ -5837,7 +5869,15 @@ func mqttDeliverMsgCbQoS12(sub *subscription, pc *client, _ *Account, subject, r
 	if h != nil {
 		props = h.props
 	}
-	pc.mqttEnqueuePublishMsgTo(cc, sub, pi, qos, dup, originalTopic, msg, props)
+	if !pc.mqttEnqueuePublishMsgTo(cc, sub, pi, qos, dup, originalTopic, msg, props) {
+		// The PUBLISH exceeds the client's MQTT 5.0 Maximum Packet Size. Discard
+		// it and complete the delivery so JetStream does not redeliver it forever:
+		// release the packet identifier and ack the JS message. Spec5 [3.1.2.11.4].
+		sess.mu.Lock()
+		sess.untrackPublish(pi)
+		sess.mu.Unlock()
+		sess.jsa.sendAck(reply)
+	}
 }
 
 func mqttDeliverPubRelCb(sub *subscription, pc *client, _ *Account, subject, reply string, rmsg []byte) {
@@ -5943,7 +5983,11 @@ func sparkbReplaceDeathTimestamp(msg []byte) []byte {
 
 // Common function to mqtt delivery callbacks to serialize and send the message
 // to the `cc` client.
-func (c *client) mqttEnqueuePublishMsgTo(cc *client, sub *subscription, pi uint16, qos byte, dup bool, topic, msg, props []byte) {
+// mqttEnqueuePublishMsgTo frames and queues an outbound PUBLISH to cc. It
+// returns false without sending when the packet would exceed the client's MQTT
+// 5.0 Maximum Packet Size; the caller is then responsible for completing the
+// message (for QoS1/2, acking the JS delivery so it is not redelivered).
+func (c *client) mqttEnqueuePublishMsgTo(cc *client, sub *subscription, pi uint16, qos byte, dup bool, topic, msg, props []byte) bool {
 	// [tck-id-conformance-mqtt-aware-nbirth-mqtt-retain] A Sparkplug Aware
 	// MQTT Server MUST make NBIRTH messages available on the topic:
 	// $sparkplug/certificates/namespace/group_id/NBIRTH/edge_node_id with
@@ -5967,6 +6011,14 @@ func (c *client) mqttEnqueuePublishMsgTo(cc *client, sub *subscription, pi uint1
 
 	flags, headerBytes := mqttMakePublishHeader(pi, qos, dup, retain, cc.mqtt.proto == mqttProtoLevel5, topic, props, len(msg))
 
+	// MQTT 5.0 Maximum Packet Size: never send a PUBLISH larger than the client
+	// is willing to accept. Discard it instead and let the caller complete the
+	// delivery. Spec5 [3.1.2.11.4]. mqtt.maxPacketSize is 0 for 3.1.1 or when the
+	// client did not advertise a limit.
+	if mp := cc.mqtt.maxPacketSize; mp != 0 && len(headerBytes)+len(msg) > int(mp) {
+		return false
+	}
+
 	cc.mu.Lock()
 	if sub.mqtt.prm != nil {
 		for _, data := range sub.mqtt.prm {
@@ -5989,6 +6041,7 @@ func (c *client) mqttEnqueuePublishMsgTo(cc *client, sub *subscription, pi uint1
 		}
 		cc.traceOutOp("PUBLISH", []byte(mqttPubTrace(&pp)))
 	}
+	return true
 }
 
 // Serializes to the given writer the message for the given subject.
@@ -7008,12 +7061,16 @@ func (r *mqttReader) readProperties(ctx byte) (*mqttProperties, error) {
 		case mqttPropWillDelay:
 			props.willDelay, err = r.readUint32("will delay interval")
 		case mqttPropMaxPacketSize:
-			// NOTE: parsed but not yet enforced. The client is telling us the
-			// largest packet it will accept; a full implementation must not send
-			// an outbound packet larger than this (spec5 [3.1.2.11.4]). Outbound
-			// PUBLISH is currently framed unconditionally, so this limit is not
-			// honored yet (surfaced by the experimental-mode startup warning).
-			props.maxPacketSize, err = r.readUint32("maximum packet size")
+			// The client is telling us the largest packet it will accept. We
+			// honor this on outbound PUBLISH (see mqttEnqueuePublishMsgTo and
+			// serializeRetainedMsgsForSub): a PUBLISH exceeding it is discarded
+			// rather than sent. Stored on the connection as c.mqtt.maxPacketSize.
+			// Spec5 [3.1.2.11.4].
+			if props.maxPacketSize, err = r.readUint32("maximum packet size"); err == nil && props.maxPacketSize == 0 {
+				// Spec5 [3.1.2.11.4]: a Maximum Packet Size of 0 is a Protocol
+				// Error. (Absent means no property, i.e. no client-imposed limit.)
+				err = fmt.Errorf("%w: maximum packet size of 0", errMQTTProtocolError)
+			}
 		case mqttPropContentType:
 			props.contentType, err = r.readPropString("content type")
 		case mqttPropResponseTopic:

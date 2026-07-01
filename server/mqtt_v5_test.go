@@ -20,6 +20,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net"
+	"strings"
 	"testing"
 	"time"
 
@@ -1625,4 +1626,174 @@ func TestMQTTv5ReceiveMaximumOrdering(t *testing.T) {
 			t.Fatalf("Error writing PUBACK: %v", err)
 		}
 	}
+}
+
+// mqttV5ConnPropsMaxPacketSize returns a CONNECT properties body carrying a
+// Maximum Packet Size property (0x27).
+func mqttV5ConnPropsMaxPacketSize(n uint32) []byte {
+	b := newMQTTWriter(0)
+	b.WriteByte(mqttPropMaxPacketSize)
+	b.WriteUint32(n)
+	return b.Bytes()
+}
+
+// testMQTTConnMaxPacketSize returns the Maximum Packet Size recorded on the
+// connection for clientID (0 when none was advertised).
+func testMQTTConnMaxPacketSize(t testing.TB, s *Server, clientID string) uint32 {
+	t.Helper()
+	c := testMQTTGetClient(t, s, clientID)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.mqtt.maxPacketSize
+}
+
+// testMQTTSessionNumPending returns the number of unacknowledged QoS1/2 PUBLISH
+// currently in flight for clientID's session.
+func testMQTTSessionNumPending(t testing.TB, s *Server, clientID string) int {
+	t.Helper()
+	c := testMQTTGetClient(t, s, clientID)
+	sess := c.mqtt.sess
+	sess.mu.Lock()
+	defer sess.mu.Unlock()
+	return len(sess.pendingPublish)
+}
+
+// The client's Maximum Packet Size is recorded on the connection (0 for a 3.1.1
+// client or when not sent). An outbound QoS1 PUBLISH that would exceed it is not
+// sent; instead it is discarded and the delivery is completed so it does not
+// occupy an in-flight slot forever (the pending set drains back to empty), while
+// the connection keeps working for messages within the limit. Spec5 [3.1.2.11.4].
+func TestMQTTv5MaximumPacketSize(t *testing.T) {
+	o := testMQTTDefaultOptionsV5()
+	s := testMQTTRunServer(t, o)
+	defer testMQTTShutdownServer(s)
+
+	// 3.1.1 client imposes no limit.
+	c311, r311 := testMQTTConnect(t, &mqttConnInfo{clientID: "mp311", cleanSess: true}, o.MQTT.Host, o.MQTT.Port)
+	defer c311.Close()
+	testMQTTCheckConnAck(t, r311, mqttConnAckRCConnectionAccepted, false)
+	if got := testMQTTConnMaxPacketSize(t, s, "mp311"); got != 0 {
+		t.Fatalf("expected maxPacketSize=0 for a 3.1.1 client, got %d", got)
+	}
+
+	// v5 subscriber with a small Maximum Packet Size.
+	cs, rs := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "mpsub", cleanStart: true, props: mqttV5ConnPropsMaxPacketSize(50)}, o.MQTT.Host, o.MQTT.Port)
+	defer cs.Close()
+	testMQTTReadConnAckV5(t, rs)
+	if got := testMQTTConnMaxPacketSize(t, s, "mpsub"); got != 50 {
+		t.Fatalf("expected maxPacketSize=50, got %d", got)
+	}
+	testMQTTSubV5(t, cs, rs, 1, []mqttV5SubFilter{{topic: "mp/t", opts: 1}})
+
+	cp, rp := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "mppub", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
+	defer cp.Close()
+	testMQTTReadConnAckV5(t, rp)
+
+	// An oversized QoS1 PUBLISH is not delivered...
+	large := []byte(strings.Repeat("x", 200))
+	testMQTTPubV5Props(t, cp, rp, 1, false, 1, "mp/t", large, nil)
+	testMQTTExpectNothing(t, rs)
+
+	// ...and it is completed rather than left occupying an in-flight slot: the
+	// subscriber's pending-publish set drains back to empty.
+	checkFor(t, 2*time.Second, 15*time.Millisecond, func() error {
+		if n := testMQTTSessionNumPending(t, s, "mpsub"); n != 0 {
+			return fmt.Errorf("expected 0 pending publishes after discard, got %d", n)
+		}
+		return nil
+	})
+
+	// A PUBLISH within the limit is delivered and ackable.
+	small := []byte("ok")
+	testMQTTPubV5Props(t, cp, rp, 1, false, 2, "mp/t", small, nil)
+	testMQTTReadPubV5Props(t, cs, rs, "mp/t", small) // reads and acks the QoS1 delivery
+}
+
+// A QoS0 PUBLISH exceeding the client's Maximum Packet Size is silently dropped
+// (there is nothing to ack); one within the limit is delivered.
+func TestMQTTv5MaximumPacketSizeQoS0(t *testing.T) {
+	o := testMQTTDefaultOptionsV5()
+	s := testMQTTRunServer(t, o)
+	defer testMQTTShutdownServer(s)
+
+	cs, rs := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "mpq0sub", cleanStart: true, props: mqttV5ConnPropsMaxPacketSize(50)}, o.MQTT.Host, o.MQTT.Port)
+	defer cs.Close()
+	testMQTTReadConnAckV5(t, rs)
+	testMQTTSubV5(t, cs, rs, 1, []mqttV5SubFilter{{topic: "mp/q0", opts: 0}})
+
+	cp, rp := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "mpq0pub", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
+	defer cp.Close()
+	testMQTTReadConnAckV5(t, rp)
+
+	testMQTTPubV5Props(t, cp, rp, 0, false, 0, "mp/q0", []byte(strings.Repeat("x", 200)), nil)
+	testMQTTExpectNothing(t, rs)
+
+	small := []byte("ok")
+	testMQTTPubV5Props(t, cp, rp, 0, false, 0, "mp/q0", small, nil)
+	testMQTTReadPubV5Props(t, cs, rs, "mp/q0", small)
+}
+
+// A 3.1.1 subscriber advertises no Maximum Packet Size (maxPacketSize == 0), so
+// the limit never applies: a large message is delivered unchanged.
+func TestMQTTv5MaximumPacketSize311Unaffected(t *testing.T) {
+	o := testMQTTDefaultOptionsV5()
+	s := testMQTTRunServer(t, o)
+	defer testMQTTShutdownServer(s)
+
+	cs, rs := testMQTTConnect(t, &mqttConnInfo{clientID: "mp311sub", cleanSess: true}, o.MQTT.Host, o.MQTT.Port)
+	defer cs.Close()
+	testMQTTCheckConnAck(t, rs, mqttConnAckRCConnectionAccepted, false)
+	testMQTTSub(t, 1, cs, rs, []*mqttFilter{{filter: "mp/t", qos: 0}}, []byte{0})
+
+	cp, rp := testMQTTConnect(t, &mqttConnInfo{clientID: "mp311pub", cleanSess: true}, o.MQTT.Host, o.MQTT.Port)
+	defer cp.Close()
+	testMQTTCheckConnAck(t, rp, mqttConnAckRCConnectionAccepted, false)
+
+	large := []byte(strings.Repeat("x", 200))
+	testMQTTPublish(t, cp, rp, 0, false, false, "mp/t", 0, large)
+	testMQTTCheckPubMsg(t, cs, rs, "mp/t", 0, large)
+}
+
+// A Maximum Packet Size of 0 is a protocol error (spec5 [3.1.2.11.4]); the
+// CONNECT is rejected with a CONNACK carrying reason 0x82 (Protocol Error).
+func TestMQTTv5MaximumPacketSizeZeroRejected(t *testing.T) {
+	o := testMQTTDefaultOptionsV5()
+	s := testMQTTRunServer(t, o)
+	defer testMQTTShutdownServer(s)
+
+	c, r := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "mpzero", cleanStart: true, props: mqttV5ConnPropsMaxPacketSize(0)}, o.MQTT.Host, o.MQTT.Port)
+	defer c.Close()
+	_, reason, _ := testMQTTReadConnAckV5(t, r)
+	if reason != mqttReasonProtocolError {
+		t.Fatalf("Expected reason 0x%x (protocol error), got 0x%x", mqttReasonProtocolError, reason)
+	}
+}
+
+// Retained-message replay on subscribe frames its own PUBLISH and has a guard
+// separate from the live-delivery path (serializeRetainedMsgsForSub): a retained
+// message exceeding the subscriber's Maximum Packet Size is skipped, while a
+// within-limit retained message on the same subscription is delivered.
+func TestMQTTv5RetainedMaximumPacketSize(t *testing.T) {
+	o := testMQTTDefaultOptionsV5()
+	s := testMQTTRunServer(t, o)
+	defer testMQTTShutdownServer(s)
+
+	// Publish two retained QoS1 messages under a common prefix: one oversized,
+	// one within the subscriber's future limit.
+	cp, rp := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "retmppub", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
+	defer cp.Close()
+	testMQTTReadConnAckV5(t, rp)
+	testMQTTPubV5Props(t, cp, rp, 1, true, 1, "retmp/big", []byte(strings.Repeat("x", 200)), nil)
+	testMQTTPubV5Props(t, cp, rp, 1, true, 2, "retmp/small", []byte("ok"), nil)
+
+	// Subscribe (QoS1) with a small Maximum Packet Size covering both retained
+	// topics. Only the within-limit message is replayed; the oversized one is
+	// skipped, so exactly one PUBLISH arrives regardless of replay order.
+	cs, rs := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "retmpsub", cleanStart: true, props: mqttV5ConnPropsMaxPacketSize(50)}, o.MQTT.Host, o.MQTT.Port)
+	defer cs.Close()
+	testMQTTReadConnAckV5(t, rs)
+	testMQTTSubV5(t, cs, rs, 1, []mqttV5SubFilter{{topic: "retmp/#", opts: 1}})
+
+	testMQTTReadPubV5Props(t, cs, rs, "retmp/small", []byte("ok")) // reads and acks the QoS1 delivery
+	testMQTTExpectNothing(t, rs)
 }
