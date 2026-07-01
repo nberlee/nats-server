@@ -2398,7 +2398,7 @@ func testMQTTSendPIPacket(packetType byte, t testing.TB, c net.Conn, pi uint16) 
 
 func testMQTTWritePublishPacket(t testing.TB, w *mqttWriter, qos byte, dup, retain bool, topic string, pi uint16, payload []byte) {
 	t.Helper()
-	w.WritePublishHeader(pi, qos, dup, retain, false, []byte(topic), len(payload))
+	w.WritePublishHeader(pi, qos, dup, retain, false, []byte(topic), nil, len(payload))
 	if _, err := w.Write(payload); err != nil {
 		t.Fatalf("Error writing PUBLISH proto: %v", err)
 	}
@@ -2407,7 +2407,7 @@ func testMQTTWritePublishPacket(t testing.TB, w *mqttWriter, qos byte, dup, reta
 func testMQTTSendPublishPacket(t testing.TB, c net.Conn, qos byte, dup, retain bool, topic string, pi uint16, payload []byte) {
 	t.Helper()
 	c.SetWriteDeadline(time.Now().Add(testMQTTTimeout))
-	_, header := mqttMakePublishHeader(pi, qos, dup, retain, false, []byte(topic), len(payload))
+	_, header := mqttMakePublishHeader(pi, qos, dup, retain, false, []byte(topic), nil, len(payload))
 	if _, err := c.Write(header); err != nil {
 		t.Fatalf("Error writing PUBLISH header: %v", err)
 	}

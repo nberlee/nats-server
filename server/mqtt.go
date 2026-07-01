@@ -16,6 +16,7 @@ package server
 import (
 	"bytes"
 	"crypto/tls"
+	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
@@ -435,6 +436,10 @@ type mqttRetainedMsg struct {
 	Msg     []byte `json:"msg,omitempty"`
 	Flags   byte   `json:"flags,omitempty"`
 	Source  string `json:"source,omitempty"`
+	// Props is the raw MQTT 5.0 properties block captured from the retained
+	// PUBLISH, forwarded to v5 subscribers when the message is replayed. Empty
+	// for messages published by 3.1.1 clients or without properties.
+	Props []byte `json:"props,omitempty"`
 
 	expiresFromCache time.Time
 }
@@ -596,6 +601,11 @@ type mqttPublish struct {
 	sz      int
 	pi      uint16
 	flags   byte
+	// props is the raw MQTT 5.0 properties block (variable-int length prefix +
+	// body, exactly as received on the wire), captured so it can be forwarded
+	// unaltered to v5 subscribers. nil when absent or empty (3.1.1, or a v5
+	// PUBLISH with no properties). Spec5 [3.3.2.3].
+	props []byte
 }
 
 // When we re-encode incoming MQTT PUBLISH messages for NATS delivery, we add
@@ -618,6 +628,9 @@ const (
 	mqttNatsRetainedMessageOrigin = "Nmqtt-ROrigin"
 	mqttNatsRetainedMessageFlags  = "Nmqtt-RFlags"
 	mqttNatsRetainedMessageSource = "Nmqtt-RSource"
+	// Raw MQTT 5.0 properties block for a retained message (base64), so v5
+	// properties are replayed to subscribers. Absent for older stored messages.
+	mqttNatsRetainedMessageProps = "Nmqtt-RProps"
 
 	// NATS header that indicates that the message is an MQTT PubRel and stores
 	// the PI.
@@ -626,12 +639,19 @@ const (
 	// NATS headers to store the original MQTT subject and the subject mapping.
 	mqttNatsHeaderSubject = "Nmqtt-Subject"
 	mqttNatsHeaderMapped  = "Nmqtt-Mapped"
+
+	// NATS header carrying the raw MQTT 5.0 PUBLISH properties block
+	// (base64-encoded, since the block is binary and NATS header values are
+	// CRLF-delimited text) so end-to-end properties survive the NATS/JetStream
+	// hop and can be re-emitted to v5 subscribers.
+	mqttNatsHeaderProps = "Nmqtt-Props"
 )
 
 type mqttParsedPublishNATSHeader struct {
 	qos     byte
 	subject []byte
 	mapped  []byte
+	props   []byte // raw MQTT 5.0 properties block (decoded from Nmqtt-Props)
 }
 
 func (s *Server) startMQTT() {
@@ -671,8 +691,8 @@ func (s *Server) startMQTT() {
 	s.Noticef("Listening for MQTT clients on %s://%s:%d", scheme, o.Host, o.Port)
 	if s.mqtt.v5Enabled {
 		s.Warnf("MQTT 5.0 support is enabled but experimental: some v5 features " +
-			"(PUBLISH property forwarding, Receive Maximum and Maximum Packet Size " +
-			"flow control, session/message/will-delay expiry) are not yet honored")
+			"(Receive Maximum and Maximum Packet Size flow control, " +
+			"session/message/will-delay expiry) are not yet honored")
 	}
 	go s.acceptConnections(hl, "MQTT", func(conn net.Conn) { s.createMQTTClient(conn, nil) }, nil)
 	s.mu.Unlock()
@@ -1351,11 +1371,48 @@ func mqttParsePublishNATSHeader(headerBytes []byte) *mqttParsedPublishNATSHeader
 	if len(pubValue) == 0 {
 		return nil
 	}
-	return &mqttParsedPublishNATSHeader{
+	h := &mqttParsedPublishNATSHeader{
 		qos:     pubValue[0] - '0',
 		subject: getHeader(mqttNatsHeaderSubject, headerBytes),
 		mapped:  getHeader(mqttNatsHeaderMapped, headerBytes),
 	}
+	// MQTT 5.0 properties block, carried base64-encoded. This header can come
+	// from an untrusted source (a NATS publisher can set Nmqtt-Pub/Nmqtt-Props
+	// on a message an MQTT client is subscribed to), so the decoded block is
+	// re-validated before it may be forwarded verbatim into an outbound PUBLISH
+	// (see mqttValidateForwardProps). Best effort: anything invalid is simply
+	// dropped, never a delivery failure and never a malformed outbound packet.
+	if enc := getHeader(mqttNatsHeaderProps, headerBytes); len(enc) > 0 {
+		if raw, err := base64.StdEncoding.DecodeString(string(enc)); err == nil {
+			h.props = mqttValidateForwardProps(raw)
+		}
+	}
+	return h
+}
+
+// mqttValidateForwardProps returns raw only if it is a well-formed MQTT 5.0
+// properties block that is safe to forward to a subscriber: it must parse
+// cleanly with no trailing bytes and must not contain a Topic Alias (hop-by-hop,
+// never forwarded) or a Subscription Identifier (unsupported; disallowed in the
+// PUBLISH context). Otherwise it returns nil so the message is delivered
+// without properties. This protects against a crafted Nmqtt-Props header from a
+// non-MQTT publisher making the server emit a malformed or forbidden PUBLISH.
+func mqttValidateForwardProps(raw []byte) []byte {
+	if len(raw) == 0 {
+		return nil
+	}
+	r := &mqttReader{}
+	r.reset(raw)
+	props, err := r.readProperties(mqttPacketPub)
+	if err != nil || r.hasMore() {
+		return nil
+	}
+	// Subscription Identifier is already rejected by readProperties (not allowed
+	// in the PUBLISH context); Topic Alias parses but must not be forwarded.
+	if props != nil && props.present[mqttPropTopicAlias] {
+		return nil
+	}
+	return raw
 }
 
 func mqttParsePubRelNATSHeader(headerBytes []byte) uint16 {
@@ -2955,7 +3012,7 @@ func (as *mqttAccountSessionManager) serializeRetainedMsgsForSub(rms map[string]
 		// Need to use the subject for the retained message, not the `sub` subject.
 		// We can find the published retained message in rm.sub.subject.
 		// Set the RETAIN flag: [MQTT-3.3.1-8].
-		flags, headerBytes := mqttMakePublishHeader(pi, qos, false, true, c.mqtt.proto == mqttProtoLevel5, []byte(rm.Topic), len(rm.Msg))
+		flags, headerBytes := mqttMakePublishHeader(pi, qos, false, true, c.mqtt.proto == mqttProtoLevel5, []byte(rm.Topic), rm.Props, len(rm.Msg))
 		c.mu.Lock()
 		sub.mqtt.prm = append(sub.mqtt.prm, headerBytes, rm.Msg)
 		c.mu.Unlock()
@@ -3081,6 +3138,9 @@ func mqttEncodeRetainedMessage(rm *mqttRetainedMsg) (natsMsg []byte, headerLen i
 	if rm.Source != _EMPTY_ {
 		l += len(mqttNatsRetainedMessageSource) + 1 + len(rm.Source) + 2 // 1 byte for ':', 2 bytes for CRLF
 	}
+	if len(rm.Props) > 0 {
+		l += len(mqttNatsRetainedMessageProps) + 1 + base64.StdEncoding.EncodedLen(len(rm.Props)) + 2 // 1 byte for ':', 2 bytes for CRLF
+	}
 	l += len(mqttNatsRetainedMessageFlags) + 1 + 2 + 2 // 1 byte for ':', 2 bytes for the flags, 2 bytes for CRLF
 	l += 2                                             // 2 bytes for the extra CRLF after the header
 	if delRM {
@@ -3116,6 +3176,12 @@ func mqttEncodeRetainedMessage(rm *mqttRetainedMsg) (natsMsg []byte, headerLen i
 		buf.WriteString(mqttNatsRetainedMessageSource)
 		buf.WriteByte(':')
 		buf.WriteString(rm.Source)
+		buf.WriteString(_CRLF_)
+	}
+	if len(rm.Props) > 0 {
+		buf.WriteString(mqttNatsRetainedMessageProps)
+		buf.WriteByte(':')
+		buf.WriteString(base64.StdEncoding.EncodeToString(rm.Props))
 		buf.WriteString(_CRLF_)
 	}
 
@@ -3184,6 +3250,7 @@ func mqttDecodeRetainedMessage(subject string, h, m []byte) (*mqttRetainedMsg, e
 		mqttNatsRetainedMessageOrigin: nil,
 		mqttNatsRetainedMessageFlags:  nil,
 		mqttNatsRetainedMessageSource: nil,
+		mqttNatsRetainedMessageProps:  nil,
 	}
 	var rm *mqttRetainedMsg
 	// Retrieve the values for the above headers.
@@ -3208,10 +3275,22 @@ func mqttDecodeRetainedMessage(subject string, h, m []byte) (*mqttRetainedMsg, e
 			Source: string(headers[mqttNatsRetainedMessageSource]),
 			Msg:    m,
 		}
+		// MQTT 5.0 properties block (base64). Absent for older stored messages.
+		// Validate before keeping it: the retained stream could contain a
+		// crafted Nmqtt-RProps from a non-MQTT publisher, and rm.Props is later
+		// written verbatim into outbound PUBLISH packets.
+		if enc := headers[mqttNatsRetainedMessageProps]; len(enc) > 0 {
+			if raw, err := base64.StdEncoding.DecodeString(bytesToString(enc)); err == nil {
+				rm.Props = mqttValidateForwardProps(raw)
+			}
+		}
 	} else {
 		if err := json.Unmarshal(m, &rm); err != nil {
 			return nil, err
 		}
+		// Same validation as the header path above: a JSON record from a
+		// non-MQTT publisher could carry crafted Props.
+		rm.Props = mqttValidateForwardProps(rm.Props)
 	}
 	// Now check that the values are correct.
 	//
@@ -4465,9 +4544,29 @@ func (s *Server) mqttHandleWill(c *client) {
 	if will.retain {
 		pp.flags |= mqttPubFlagRetain
 	}
+	// pp is the shared publish struct; replace any properties left over from
+	// the client's last PUBLISH with the Will's own. Spec5 [3.1.3.2].
+	pp.props = mqttWillForwardProps(will.props)
 	c.mu.Unlock()
 	s.mqttInitiateMsgDelivery(c, pp)
 	c.flushClients(0)
+}
+
+// mqttWillForwardProps encodes a Will's properties as the raw block (length
+// prefix + body, the pp.props format) to attach to the Will PUBLISH. Will Delay
+// Interval is consumed by the server and has no encode case, so it is never
+// forwarded. Spec5 [3.1.3.2].
+func mqttWillForwardProps(p *mqttProperties) []byte {
+	if p == nil {
+		return nil
+	}
+	w := newMQTTWriter(0)
+	w.writeProperties(p)
+	// Just the zero-length varint: nothing to forward.
+	if w.Len() <= 1 {
+		return nil
+	}
+	return w.Bytes()
 }
 
 //////////////////////////////////////////////////////////////////////////////
@@ -4544,6 +4643,12 @@ func (c *client) mqttParsePub(r *mqttReader, pl int, pp *mqttPublish, hasMapping
 	// but do not act on them yet (foundation). Reading here also advances the
 	// reader so the payload-size computation below is correct.
 	if c.mqtt.proto == mqttProtoLevel5 {
+		// Capture the raw properties block (length prefix + body) so it can be
+		// forwarded verbatim to v5 subscribers. An inbound client PUBLISH can
+		// only carry forwardable properties (Topic Alias is rejected below;
+		// Subscription Identifier is server->client only), so verbatim re-emit
+		// is spec-correct. Spec5 [3.3.2.3].
+		propStart := r.pos
 		props, perr := r.readProperties(mqttPacketPub)
 		if perr != nil {
 			return perr
@@ -4553,6 +4658,13 @@ func (c *client) mqttParsePub(r *mqttReader, pl int, pp *mqttPublish, hasMapping
 		// rather than risk mis-delivery. Spec5 [3.3.2.3.4].
 		if props != nil && props.present[mqttPropTopicAlias] {
 			return fmt.Errorf("MQTT topic alias is not supported")
+		}
+		// Keep the block only if it carries something (more than the single
+		// zero length byte). Copy: the reader buffer is transient.
+		if raw := r.buf[propStart:r.pos]; len(raw) > 1 {
+			pp.props = copyBytes(raw)
+		} else {
+			pp.props = nil
 		}
 	}
 
@@ -4626,6 +4738,12 @@ func mqttComputeNatsMsgSize(pp *mqttPublish, encodePP bool) int {
 				len(pp.mapped) + 2 // 2 for CRLF
 		}
 	}
+	// MQTT 5.0 properties are carried (base64) so they can be forwarded to v5
+	// subscribers. Independent of encodePP: needed for both delivery and storage.
+	if len(pp.props) > 0 {
+		size += len(mqttNatsHeaderProps) + 1 + // +1 for ':'
+			base64.StdEncoding.EncodedLen(len(pp.props)) + 2 // 2 for CRLF
+	}
 	return size
 }
 
@@ -4663,6 +4781,13 @@ func mqttNewDeliverableMessage(pp *mqttPublish, encodePP bool) (natsMsg []byte, 
 			buf.Write(pp.mapped)
 			buf.WriteString(_CRLF_)
 		}
+	}
+
+	if len(pp.props) > 0 {
+		buf.WriteString(mqttNatsHeaderProps)
+		buf.WriteByte(':')
+		buf.WriteString(base64.StdEncoding.EncodeToString(pp.props))
+		buf.WriteString(_CRLF_)
 	}
 
 	// End of header
@@ -4858,6 +4983,7 @@ func (s *Server) mqttProcessPubRel(c *client, pi uint16, trace bool) error {
 		sz:      len(stored.Data),
 		pi:      pi,
 		flags:   h.qos << 1,
+		props:   h.props, // forward v5 properties captured at store time
 	}
 
 	return s.mqttInitiateMsgDelivery(c, pp)
@@ -4911,6 +5037,7 @@ func (c *client) mqttHandlePubRetain() {
 		Msg:    pp.msg, // will copy these bytes later as we process rm.
 		Flags:  pp.flags,
 		Source: c.opts.Username,
+		Props:  pp.props, // v5 properties to replay to subscribers
 	}
 
 	if retainSparkbBirth {
@@ -5500,6 +5627,7 @@ func mqttDeliverMsgCbQoS0(sub *subscription, pc *client, _ *Account, subject, re
 
 	hdr, msg := pc.msgParts(rmsg)
 	var topic []byte
+	var props []byte
 	if pc.isMqtt() {
 		// This is an MQTT publisher directly connected to this server.
 
@@ -5511,6 +5639,7 @@ func mqttDeliverMsgCbQoS0(sub *subscription, pc *client, _ *Account, subject, re
 			return
 		}
 		topic = pc.mqtt.pp.topic
+		props = pc.mqtt.pp.props
 		// If the subject is different than the one in pp.subject, then some
 		// mapping/transform occurred and we need to recreate the topic.
 		if subject != bytesToString(pc.mqtt.pp.subject) {
@@ -5534,10 +5663,13 @@ func mqttDeliverMsgCbQoS0(sub *subscription, pc *client, _ *Account, subject, re
 			msg = msg[:mqttMaxPayloadSize]
 		}
 		topic = natsSubjectStrToMQTTTopic(subject)
+		if h != nil {
+			props = h.props
+		}
 	}
 
 	// Message never has a packet identifier nor is marked as duplicate.
-	pc.mqttEnqueuePublishMsgTo(cc, sub, 0, 0, false, topic, msg)
+	pc.mqttEnqueuePublishMsgTo(cc, sub, 0, 0, false, topic, msg, props)
 }
 
 // This is the callback attached to a JS durable subscription for a MQTT QoS 1+
@@ -5623,7 +5755,11 @@ func mqttDeliverMsgCbQoS12(sub *subscription, pc *client, _ *Account, subject, r
 	}
 
 	originalTopic := natsSubjectStrToMQTTTopic(strippedSubj)
-	pc.mqttEnqueuePublishMsgTo(cc, sub, pi, qos, dup, originalTopic, msg)
+	var props []byte
+	if h != nil {
+		props = h.props
+	}
+	pc.mqttEnqueuePublishMsgTo(cc, sub, pi, qos, dup, originalTopic, msg, props)
 }
 
 func mqttDeliverPubRelCb(sub *subscription, pc *client, _ *Account, subject, reply string, rmsg []byte) {
@@ -5729,7 +5865,7 @@ func sparkbReplaceDeathTimestamp(msg []byte) []byte {
 
 // Common function to mqtt delivery callbacks to serialize and send the message
 // to the `cc` client.
-func (c *client) mqttEnqueuePublishMsgTo(cc *client, sub *subscription, pi uint16, qos byte, dup bool, topic, msg []byte) {
+func (c *client) mqttEnqueuePublishMsgTo(cc *client, sub *subscription, pi uint16, qos byte, dup bool, topic, msg, props []byte) {
 	// [tck-id-conformance-mqtt-aware-nbirth-mqtt-retain] A Sparkplug Aware
 	// MQTT Server MUST make NBIRTH messages available on the topic:
 	// $sparkplug/certificates/namespace/group_id/NBIRTH/edge_node_id with
@@ -5751,7 +5887,7 @@ func (c *client) mqttEnqueuePublishMsgTo(cc *client, sub *subscription, pi uint1
 		msg = sparkbReplaceDeathTimestamp(msg)
 	}
 
-	flags, headerBytes := mqttMakePublishHeader(pi, qos, dup, retain, cc.mqtt.proto == mqttProtoLevel5, topic, len(msg))
+	flags, headerBytes := mqttMakePublishHeader(pi, qos, dup, retain, cc.mqtt.proto == mqttProtoLevel5, topic, props, len(msg))
 
 	cc.mu.Lock()
 	if sub.mqtt.prm != nil {
@@ -5778,7 +5914,7 @@ func (c *client) mqttEnqueuePublishMsgTo(cc *client, sub *subscription, pi uint1
 }
 
 // Serializes to the given writer the message for the given subject.
-func (w *mqttWriter) WritePublishHeader(pi uint16, qos byte, dup, retained, v5 bool, topic []byte, msgLen int) byte {
+func (w *mqttWriter) WritePublishHeader(pi uint16, qos byte, dup, retained, v5 bool, topic, props []byte, msgLen int) byte {
 	// Compute len (will have to add packet id if message is sent as QoS>=1)
 	pkLen := 2 + len(topic) + msgLen
 	var flags byte
@@ -5794,10 +5930,17 @@ func (w *mqttWriter) WritePublishHeader(pi uint16, qos byte, dup, retained, v5 b
 		pkLen += 2
 		flags |= qos << 1
 	}
-	// MQTT 5.0 PUBLISH carries a properties section after the packet
-	// identifier. We send an empty one (a single 0 length byte). Spec5 [3.3.2.3].
+	// MQTT 5.0 PUBLISH carries a properties section after the packet identifier.
+	// props (when set) is the raw block from the publisher, including its length
+	// prefix, forwarded verbatim; otherwise a single 0 length byte. For 3.1.1
+	// receivers (v5 false) there is no properties section, which is how
+	// properties get stripped when delivering to a 3.1.1 subscriber. Spec5 [3.3.2.3].
 	if v5 {
-		pkLen++
+		if len(props) > 0 {
+			pkLen += len(props)
+		} else {
+			pkLen++
+		}
 	}
 
 	w.WriteByte(mqttPacketPub | flags)
@@ -5807,17 +5950,21 @@ func (w *mqttWriter) WritePublishHeader(pi uint16, qos byte, dup, retained, v5 b
 		w.WriteUint16(pi)
 	}
 	if v5 {
-		w.WriteByte(0)
+		if len(props) > 0 {
+			w.Write(props)
+		} else {
+			w.WriteByte(0)
+		}
 	}
 
 	return flags
 }
 
-// Serializes to the given writer the message for the given subject. v5 adds an
-// empty properties section for MQTT 5.0 receivers.
-func mqttMakePublishHeader(pi uint16, qos byte, dup, retained, v5 bool, topic []byte, msgLen int) (byte, []byte) {
-	headerBuf := newMQTTWriter(mqttInitialPubHeader + len(topic))
-	flags := headerBuf.WritePublishHeader(pi, qos, dup, retained, v5, topic, msgLen)
+// Serializes to the given writer the message for the given subject. For v5
+// receivers it appends the properties section (props, if any, else empty).
+func mqttMakePublishHeader(pi uint16, qos byte, dup, retained, v5 bool, topic, props []byte, msgLen int) (byte, []byte) {
+	headerBuf := newMQTTWriter(mqttInitialPubHeader + len(topic) + len(props))
+	flags := headerBuf.WritePublishHeader(pi, qos, dup, retained, v5, topic, props, msgLen)
 	return flags, headerBuf.Bytes()
 }
 
@@ -6630,7 +6777,14 @@ func mqttPropertyAllowed(prop, ctx byte) bool {
 		mqttPropResponseTopic, mqttPropCorrelationData:
 		return ctx == mqttPacketPub || ctx == mqttPropsContextWill
 	case mqttPropSubscriptionID:
-		return ctx == mqttPacketPub || ctx == mqttPacketSub
+		// A Subscription Identifier is valid only on a SUBSCRIBE and (from the
+		// server) on a delivered PUBLISH. A client-to-server PUBLISH MUST NOT
+		// carry one (spec5 [MQTT-3.3.4-6]); since we only ever parse inbound
+		// (client->server) PUBLISH properties and validate forwarded blocks
+		// with the PUBLISH context, disallow it here so both are rejected
+		// rather than relayed (subscription identifiers are unsupported and
+		// advertised as unavailable).
+		return ctx == mqttPacketSub
 	case mqttPropSessionExpiry:
 		return ctx == mqttPacketConnect || ctx == mqttPacketConnectAck || ctx == mqttPacketDisconnect
 	case mqttPropAssignedClientID, mqttPropServerKeepAlive, mqttPropResponseInfo,
@@ -6845,6 +6999,24 @@ func (p *mqttProperties) encode(w *mqttWriter) {
 	w32 := func(id byte, v uint32) {
 		w.WriteByte(id)
 		w.WriteUint32(v)
+	}
+	if p.present[mqttPropPayloadFormat] {
+		wb(mqttPropPayloadFormat, p.payloadFormat)
+	}
+	if p.present[mqttPropMessageExpiry] {
+		w32(mqttPropMessageExpiry, p.messageExpiry)
+	}
+	if p.present[mqttPropContentType] {
+		w.WriteByte(mqttPropContentType)
+		w.WriteString(p.contentType)
+	}
+	if p.present[mqttPropResponseTopic] {
+		w.WriteByte(mqttPropResponseTopic)
+		w.WriteString(p.responseTopic)
+	}
+	if p.present[mqttPropCorrelationData] {
+		w.WriteByte(mqttPropCorrelationData)
+		w.WriteBytes(p.correlationData)
 	}
 	if p.present[mqttPropSessionExpiry] {
 		w32(mqttPropSessionExpiry, p.sessionExpiry)

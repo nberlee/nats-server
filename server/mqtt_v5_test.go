@@ -16,9 +16,13 @@
 package server
 
 import (
+	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"net"
 	"testing"
+
+	"github.com/nats-io/nats.go"
 )
 
 // mqttV5ConnInfo describes an MQTT 5.0 CONNECT to craft. props/willProps are
@@ -958,5 +962,431 @@ func TestMQTTv5ConnectLengthMismatch(t *testing.T) {
 	_, reason, _ := testMQTTReadConnAckV5(t, &mqttReader{reader: c})
 	if reason != mqttReasonMalformedPacket {
 		t.Fatalf("Expected reason 0x%x (malformed packet), got 0x%x", mqttReasonMalformedPacket, reason)
+	}
+}
+
+// ---- PUBLISH property forwarding ----
+
+// testMQTTv5PubPropsBlock builds a raw MQTT 5.0 PUBLISH properties block
+// (var-int length prefix + body) exercising the forwardable property types.
+func testMQTTv5PubPropsBlock() []byte {
+	body := newMQTTWriter(0)
+	body.WriteByte(mqttPropPayloadFormat)
+	body.WriteByte(1)
+	body.WriteByte(mqttPropContentType)
+	body.WriteString("application/json")
+	body.WriteByte(mqttPropResponseTopic)
+	body.WriteString("resp/topic")
+	body.WriteByte(mqttPropCorrelationData)
+	body.WriteBytes([]byte("corr-1"))
+	body.WriteByte(mqttPropUserProperty)
+	body.WriteString("k1")
+	body.WriteString("v1")
+	body.WriteByte(mqttPropUserProperty)
+	body.WriteString("k2")
+	body.WriteString("v2")
+	w := newMQTTWriter(0)
+	w.WriteVarInt(body.Len())
+	w.Write(body.Bytes())
+	return w.Bytes()
+}
+
+// testMQTTCheckFwdProps asserts that p matches testMQTTv5PubPropsBlock.
+func testMQTTCheckFwdProps(t testing.TB, p *mqttProperties) {
+	t.Helper()
+	if p == nil {
+		t.Fatal("Expected forwarded properties, got none")
+	}
+	if p.contentType != "application/json" {
+		t.Fatalf("content type: got %q", p.contentType)
+	}
+	if p.responseTopic != "resp/topic" {
+		t.Fatalf("response topic: got %q", p.responseTopic)
+	}
+	if string(p.correlationData) != "corr-1" {
+		t.Fatalf("correlation data: got %q", p.correlationData)
+	}
+	if !p.present[mqttPropPayloadFormat] || p.payloadFormat != 1 {
+		t.Fatalf("payload format indicator: present=%v val=%v", p.present[mqttPropPayloadFormat], p.payloadFormat)
+	}
+	if len(p.user) != 2 || p.user[0].key != "k1" || p.user[0].value != "v1" ||
+		p.user[1].key != "k2" || p.user[1].value != "v2" {
+		t.Fatalf("user properties: got %+v", p.user)
+	}
+}
+
+// testMQTTPubV5Props publishes a v5 PUBLISH with the given raw properties block
+// (nil => empty), completing the QoS1/QoS2 sender handshake.
+func testMQTTPubV5Props(t testing.TB, c net.Conn, r *mqttReader, qos byte, retain bool, pi uint16, topic string, payload, props []byte) {
+	t.Helper()
+	flags := qos << 1
+	if retain {
+		flags |= mqttPubFlagRetain
+	}
+	vh := newMQTTWriter(0)
+	vh.WriteBytes([]byte(topic))
+	if qos > 0 {
+		vh.WriteUint16(pi)
+	}
+	if len(props) > 0 {
+		vh.Write(props)
+	} else {
+		vh.WriteVarInt(0)
+	}
+	vh.Write(payload)
+	w := newMQTTWriter(0)
+	w.WriteByte(mqttPacketPub | flags)
+	w.WriteVarInt(vh.Len())
+	w.Write(vh.Bytes())
+	if _, err := testMQTTWrite(c, w.Bytes()); err != nil {
+		t.Fatalf("Error writing PUBLISH: %v", err)
+	}
+	switch qos {
+	case 1:
+		testMQTTReadPubAck(t, r, pi)
+	case 2:
+		testMQTTReadPIPacket(mqttPacketPubRec, t, r, pi)
+		pubrel := [4]byte{mqttPacketPubRel | 0x2, 0x2, byte(pi >> 8), byte(pi)}
+		if _, err := testMQTTWrite(c, pubrel[:]); err != nil {
+			t.Fatalf("Error writing PUBREL: %v", err)
+		}
+		testMQTTReadPIPacket(mqttPacketPubComp, t, r, pi)
+	}
+}
+
+// testMQTTReadPubV5Props reads a delivered v5 PUBLISH, validates topic/payload,
+// acks a QoS1 delivery, and returns the parsed properties (nil if empty).
+func testMQTTReadPubV5Props(t testing.TB, c net.Conn, r *mqttReader, expTopic string, expPayload []byte) *mqttProperties {
+	t.Helper()
+	b, pl := testMQTTReadPacket(t, r)
+	if pt := b & mqttPacketMask; pt != mqttPacketPub {
+		t.Fatalf("Expected PUBLISH (%x), got %x", mqttPacketPub, pt)
+	}
+	start := r.pos
+	qos := mqttGetQoS(b & mqttPacketFlagMask)
+	topic, err := r.readBytes("topic", false)
+	if err != nil {
+		t.Fatalf("Error reading topic: %v", err)
+	}
+	if string(topic) != expTopic {
+		t.Fatalf("Expected topic %q, got %q", expTopic, topic)
+	}
+	var pi uint16
+	if qos > 0 {
+		if pi, err = r.readUint16("pi"); err != nil {
+			t.Fatalf("Error reading pi: %v", err)
+		}
+	}
+	props, err := r.readProperties(mqttPacketPub)
+	if err != nil {
+		t.Fatalf("Error reading PUBLISH properties: %v", err)
+	}
+	payloadLen := pl - (r.pos - start)
+	if payloadLen < 0 || r.pos+payloadLen > len(r.buf) {
+		t.Fatalf("Invalid payload length %d", payloadLen)
+	}
+	got := r.buf[r.pos : r.pos+payloadLen]
+	r.pos += payloadLen
+	if string(got) != string(expPayload) {
+		t.Fatalf("Expected payload %q, got %q", expPayload, got)
+	}
+	if qos == 1 {
+		pa := [4]byte{mqttPacketPubAck, 0x2, byte(pi >> 8), byte(pi)}
+		if _, err := testMQTTWrite(c, pa[:]); err != nil {
+			t.Fatalf("Error writing PUBACK: %v", err)
+		}
+	}
+	return props
+}
+
+// v5 PUBLISH properties are forwarded unaltered to a v5 subscriber, across the
+// QoS0/1/2 publish paths (including QoS2 store + PUBREL replay).
+func TestMQTTv5PublishPropertyForwarding(t *testing.T) {
+	o := testMQTTDefaultOptionsV5()
+	s := testMQTTRunServer(t, o)
+	defer testMQTTShutdownServer(s)
+
+	for _, pubQoS := range []byte{0, 1, 2} {
+		t.Run(fmt.Sprintf("pubqos%d", pubQoS), func(t *testing.T) {
+			topic := fmt.Sprintf("fwd/q%d", pubQoS)
+			cs, rs := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: fmt.Sprintf("fwdsub%d", pubQoS), cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
+			defer cs.Close()
+			testMQTTReadConnAckV5(t, rs)
+			testMQTTSubV5(t, cs, rs, 1, []mqttV5SubFilter{{topic: topic, opts: 1}})
+
+			cp, rp := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: fmt.Sprintf("fwdpub%d", pubQoS), cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
+			defer cp.Close()
+			testMQTTReadConnAckV5(t, rp)
+			testMQTTPubV5Props(t, cp, rp, pubQoS, false, 10, topic, []byte("payload"), testMQTTv5PubPropsBlock())
+
+			props := testMQTTReadPubV5Props(t, cs, rs, topic, []byte("payload"))
+			testMQTTCheckFwdProps(t, props)
+		})
+	}
+}
+
+// A Will must not inherit the properties of the client's last PUBLISH (they
+// share c.mqtt.pp). The Will's own properties are not forwarded yet, so the
+// delivered Will must carry an empty properties block.
+func TestMQTTv5WillDoesNotLeakPublishProps(t *testing.T) {
+	o := testMQTTDefaultOptionsV5()
+	s := testMQTTRunServer(t, o)
+	defer testMQTTShutdownServer(s)
+
+	cs, rs := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "wlsub", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
+	defer cs.Close()
+	testMQTTReadConnAckV5(t, rs)
+	testMQTTSubV5(t, cs, rs, 1, []mqttV5SubFilter{{topic: "wl/t", opts: 0}})
+
+	// Client with a Will publishes a property-bearing message, then dies
+	// ungracefully so the Will fires.
+	will := &mqttWill{topic: []byte("wl/t"), message: []byte("bye"), qos: 0}
+	cw, rw := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "wlpub", cleanStart: true, will: will}, o.MQTT.Host, o.MQTT.Port)
+	testMQTTReadConnAckV5(t, rw)
+	testMQTTPubV5Props(t, cw, rw, 0, false, 0, "other", []byte("x"), testMQTTv5PubPropsBlock())
+	cw.Close()
+
+	if props := testMQTTReadPubV5Props(t, cs, rs, "wl/t", []byte("bye")); props != nil {
+		t.Fatalf("Will leaked publisher properties: %+v", props)
+	}
+}
+
+// Retained v5 properties are persisted and replayed to a late v5 subscriber.
+func TestMQTTv5RetainedPropertyForwarding(t *testing.T) {
+	o := testMQTTDefaultOptionsV5()
+	s := testMQTTRunServer(t, o)
+	defer testMQTTShutdownServer(s)
+
+	cp, rp := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "retpub", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
+	defer cp.Close()
+	testMQTTReadConnAckV5(t, rp)
+	testMQTTPubV5Props(t, cp, rp, 1, true, 20, "ret/topic", []byte("retained"), testMQTTv5PubPropsBlock())
+
+	cs, rs := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "retsub", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
+	defer cs.Close()
+	testMQTTReadConnAckV5(t, rs)
+	testMQTTSubV5(t, cs, rs, 1, []mqttV5SubFilter{{topic: "ret/topic", opts: 1}})
+
+	props := testMQTTReadPubV5Props(t, cs, rs, "ret/topic", []byte("retained"))
+	testMQTTCheckFwdProps(t, props)
+}
+
+// A v5 publisher's properties must be stripped when delivering to a 3.1.1
+// subscriber, and a 3.1.1 publisher must yield an empty properties block to a
+// v5 subscriber.
+func TestMQTTv5PropertyForwardingInterop(t *testing.T) {
+	o := testMQTTDefaultOptionsV5()
+	s := testMQTTRunServer(t, o)
+	defer testMQTTShutdownServer(s)
+
+	t.Run("v5 pub props to 3.1.1 sub are stripped", func(t *testing.T) {
+		c311, r311 := testMQTTConnect(t, &mqttConnInfo{clientID: "sub311", cleanSess: true}, o.MQTT.Host, o.MQTT.Port)
+		defer c311.Close()
+		testMQTTCheckConnAck(t, r311, mqttConnAckRCConnectionAccepted, false)
+		testMQTTSub(t, 1, c311, r311, []*mqttFilter{{filter: "interop/a", qos: 0}}, []byte{0})
+
+		cp, rp := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "pub5", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
+		defer cp.Close()
+		testMQTTReadConnAckV5(t, rp)
+		testMQTTPubV5Props(t, cp, rp, 0, false, 0, "interop/a", []byte("hello"), testMQTTv5PubPropsBlock())
+
+		// A 3.1.1 reader parses the packet with no properties section; if props
+		// leaked through, the payload would not match.
+		testMQTTCheckPubMsg(t, c311, r311, "interop/a", 0, []byte("hello"))
+	})
+
+	t.Run("3.1.1 pub to v5 sub yields empty props", func(t *testing.T) {
+		cs, rs := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "sub5", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
+		defer cs.Close()
+		testMQTTReadConnAckV5(t, rs)
+		testMQTTSubV5(t, cs, rs, 1, []mqttV5SubFilter{{topic: "interop/b", opts: 1}})
+
+		cp, rp := testMQTTConnect(t, &mqttConnInfo{clientID: "pub311", cleanSess: true}, o.MQTT.Host, o.MQTT.Port)
+		defer cp.Close()
+		testMQTTCheckConnAck(t, rp, mqttConnAckRCConnectionAccepted, false)
+		testMQTTPublish(t, cp, rp, 0, false, false, "interop/b", 0, []byte("plain"))
+
+		if props := testMQTTReadPubV5Props(t, cs, rs, "interop/b", []byte("plain")); props != nil {
+			t.Fatalf("Expected no forwarded properties from a 3.1.1 publisher, got %+v", props)
+		}
+	})
+}
+
+// Retained-message encode/decode round-trips the properties block and stays
+// backward compatible with stored messages that have none.
+func TestMQTTv5RetainedMessagePropsEncodeDecode(t *testing.T) {
+	subj := mqttRetainedMsgsStreamSubject + "a.b"
+	props := testMQTTv5PubPropsBlock()
+
+	rm := &mqttRetainedMsg{Topic: "a/b", Flags: mqttPubQos1 | mqttPubFlagRetain, Origin: "orig", Source: "src", Props: props, Msg: []byte("hello")}
+	natsMsg, hlen := mqttEncodeRetainedMessage(rm)
+	dec, err := mqttDecodeRetainedMessage(subj, natsMsg[:hlen], natsMsg[hlen:])
+	if err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if string(dec.Props) != string(props) {
+		t.Fatalf("props round-trip mismatch: got %x want %x", dec.Props, props)
+	}
+
+	// No properties: must decode with empty Props (also the shape of older
+	// stored messages).
+	rm2 := &mqttRetainedMsg{Topic: "a/b", Flags: mqttPubQos1 | mqttPubFlagRetain, Msg: []byte("x")}
+	natsMsg2, hlen2 := mqttEncodeRetainedMessage(rm2)
+	dec2, err := mqttDecodeRetainedMessage(subj, natsMsg2[:hlen2], natsMsg2[hlen2:])
+	if err != nil {
+		t.Fatalf("decode (no props): %v", err)
+	}
+	if len(dec2.Props) != 0 {
+		t.Fatalf("expected no props, got %x", dec2.Props)
+	}
+}
+
+// mqttMakePropsBlock wraps a raw properties body with its var-int length prefix.
+func mqttMakePropsBlock(body []byte) []byte {
+	w := newMQTTWriter(0)
+	w.WriteVarInt(len(body))
+	w.Write(body)
+	return w.Bytes()
+}
+
+// Only well-formed, forwardable property blocks survive validation; malformed
+// blocks and blocks carrying Topic Alias or a Subscription Identifier are
+// dropped so the server never emits a malformed/forbidden outbound PUBLISH.
+func TestMQTTv5ValidateForwardProps(t *testing.T) {
+	valid := testMQTTv5PubPropsBlock()
+	topicAlias := mqttMakePropsBlock([]byte{mqttPropTopicAlias, 0x00, 0x01})
+	subID := mqttMakePropsBlock([]byte{mqttPropSubscriptionID, 0x01})
+	lyingLen := []byte{0x0a, 0x01}                      // says 10 bytes follow, only 1
+	trailing := append(testMQTTv5PubPropsBlock(), 0xff) // valid block + junk
+
+	for _, test := range []struct {
+		name string
+		in   []byte
+		keep bool
+	}{
+		{"valid", valid, true},
+		{"empty", nil, false},
+		{"topic alias", topicAlias, false},
+		{"subscription id", subID, false},
+		{"lying length", lyingLen, false},
+		{"trailing bytes", trailing, false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			out := mqttValidateForwardProps(test.in)
+			if test.keep && string(out) != string(test.in) {
+				t.Fatalf("expected block kept unchanged, got %x", out)
+			}
+			if !test.keep && out != nil {
+				t.Fatalf("expected block dropped (nil), got %x", out)
+			}
+		})
+	}
+}
+
+// A client-to-server PUBLISH carrying a Subscription Identifier is a protocol
+// error (spec5 [MQTT-3.3.4-6]); the server must reject it, not relay it.
+func TestMQTTv5PublishSubscriptionIdRejected(t *testing.T) {
+	o := testMQTTDefaultOptionsV5()
+	s := testMQTTRunServer(t, o)
+	defer testMQTTShutdownServer(s)
+
+	c, r := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "subidpub", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
+	defer c.Close()
+	testMQTTReadConnAckV5(t, r)
+
+	// v5 PUBLISH (QoS1) whose properties include a Subscription Identifier.
+	props := mqttMakePropsBlock([]byte{mqttPropSubscriptionID, 0x01})
+	vh := newMQTTWriter(0)
+	vh.WriteBytes([]byte("foo"))
+	vh.WriteUint16(1)
+	vh.Write(props)
+	vh.Write([]byte("x"))
+	w := newMQTTWriter(0)
+	w.WriteByte(mqttPacketPub | (1 << 1))
+	w.WriteVarInt(vh.Len())
+	w.Write(vh.Bytes())
+	if _, err := testMQTTWrite(c, w.Bytes()); err != nil {
+		t.Fatalf("Error writing PUBLISH: %v", err)
+	}
+
+	// Server rejects: no PUBACK, connection is closed.
+	if buf, err := testMQTTRead(c); err == nil {
+		if pt := buf[0] & mqttPacketMask; pt == mqttPacketPubAck {
+			t.Fatal("server acked a PUBLISH carrying a Subscription Identifier")
+		}
+	}
+}
+
+// A non-MQTT (NATS) publisher can set Nmqtt-Pub/Nmqtt-Props on a message an MQTT
+// client is subscribed to. A crafted (malformed) Nmqtt-Props must be dropped so
+// the v5 subscriber still receives a well-formed PUBLISH with no properties.
+func TestMQTTv5ForwardPropsFromNATSPublisherValidated(t *testing.T) {
+	o := testMQTTDefaultOptionsV5()
+	s := testMQTTRunServer(t, o)
+	defer testMQTTShutdownServer(s)
+
+	cs, rs := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "injsub", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
+	defer cs.Close()
+	testMQTTReadConnAckV5(t, rs)
+	testMQTTSubV5(t, cs, rs, 1, []mqttV5SubFilter{{topic: "inj/x", opts: 0}})
+
+	nc := natsConnect(t, s.ClientURL())
+	defer nc.Close()
+	hdr := nats.Header{}
+	hdr.Set(mqttNatsHeader, "0") // makes the delivery path parse MQTT metadata
+	hdr.Set(mqttNatsHeaderProps, base64.StdEncoding.EncodeToString([]byte{0x0a, 0x01}))
+	if err := nc.PublishMsg(&nats.Msg{Subject: "inj.x", Header: hdr, Data: []byte("hello")}); err != nil {
+		t.Fatalf("nats publish: %v", err)
+	}
+	nc.Flush()
+
+	if props := testMQTTReadPubV5Props(t, cs, rs, "inj/x", []byte("hello")); props != nil {
+		t.Fatalf("Expected injected malformed props to be dropped, got %+v", props)
+	}
+}
+
+// A Will PUBLISH must carry the Will's own properties (Payload Format, Content
+// Type, Response Topic, Correlation Data, User Properties), not none and not
+// the client's last PUBLISH's. Spec5 [3.1.3.2].
+func TestMQTTv5WillForwardsOwnProps(t *testing.T) {
+	o := testMQTTDefaultOptionsV5()
+	s := testMQTTRunServer(t, o)
+	defer testMQTTShutdownServer(s)
+
+	cs, rs := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "wpsub", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
+	defer cs.Close()
+	testMQTTReadConnAckV5(t, rs)
+	testMQTTSubV5(t, cs, rs, 1, []mqttV5SubFilter{{topic: "wp/t", opts: 0}})
+
+	will := &mqttWill{topic: []byte("wp/t"), message: []byte("bye"), qos: 0}
+	// willProps is the raw properties body: strip the length varint (one byte,
+	// the block is short) from the shared test block.
+	willProps := testMQTTv5PubPropsBlock()[1:]
+	cw, rw := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "wppub", cleanStart: true, will: will, willProps: willProps}, o.MQTT.Host, o.MQTT.Port)
+	testMQTTReadConnAckV5(t, rw)
+	// Die ungracefully so the Will fires.
+	cw.Close()
+
+	props := testMQTTReadPubV5Props(t, cs, rs, "wp/t", []byte("bye"))
+	testMQTTCheckFwdProps(t, props)
+}
+
+// A legacy JSON-encoded retained message must have its Props validated like the
+// header-encoded path: a forbidden block (e.g. Topic Alias) is dropped rather
+// than forwarded verbatim to subscribers.
+func TestMQTTv5RetainedJSONFallbackPropsValidated(t *testing.T) {
+	badProps := newMQTTWriter(0)
+	badProps.WriteByte(mqttPropTopicAlias)
+	badProps.WriteUint16(5)
+	jm, err := json.Marshal(&mqttRetainedMsg{Topic: "foo", Msg: []byte("m"), Props: badProps.Bytes()})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	rm, err := mqttDecodeRetainedMessage(mqttRetainedMsgsStreamSubject+"foo", nil, jm)
+	if err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if rm.Props != nil {
+		t.Fatalf("Expected forbidden props to be dropped, got %v", rm.Props)
 	}
 }
