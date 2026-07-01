@@ -769,6 +769,13 @@ type MQTTOpts struct {
 	// Note that changes to this option is applied only to new subscriptions.
 	MaxAckPending uint16
 
+	// MaxProtocolVersion caps the MQTT protocol level the server will accept.
+	// MQTT 5.0 support is still being completed and is therefore opt-in: when
+	// this is 0 (default) or 4, the server accepts only MQTT 3.1.1 and rejects
+	// a v5 CONNECT with reason code 0x84 (Unsupported Protocol Version). Set it
+	// to 5 to enable (experimental) MQTT 5.0.
+	MaxProtocolVersion byte
+
 	// Snapshot of configured TLS options.
 	tlsConfigOpts *TLSConfigOpts
 
@@ -5638,6 +5645,14 @@ func parseMQTT(v any, o *Options, errors *[]error, warnings *[]error) error {
 			o.MQTT.rejectQoS2Pub = mv.(bool)
 		case "downgrade_qos2_subscribe":
 			o.MQTT.downgradeQoS2Sub = mv.(bool)
+		case "max_protocol_version", "max_proto_version":
+			tmp := int(mv.(int64))
+			if tmp != 0 && tmp != 4 && tmp != 5 {
+				err := &configErr{tk, fmt.Sprintf("invalid value %v, should be 0 (no cap), 4 or 5", tmp)}
+				*errors = append(*errors, err)
+			} else {
+				o.MQTT.MaxProtocolVersion = byte(tmp)
+			}
 
 		default:
 			if !tk.IsUsedVariable() {
