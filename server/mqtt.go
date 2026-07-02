@@ -4933,6 +4933,136 @@ func (sess *mqttSession) untrackPublish(pi uint16) (jsAckSubject string) {
 	return ack.jsAckSubject
 }
 
+// resendPendingRedelivery re-sends the session's unacknowledged QoS 1/2 PUBLISH
+// and PUBREL packets by NAK'ing each on its JS ack subject, forcing immediate
+// redelivery (with the DUP flag set) on session resume as required by spec
+// [MQTT-4.4.0-1], instead of waiting for the JS consumer's AckWait interval.
+// NAKs are ordered by stream sequence so redeliveries preserve original order
+// [MQTT-4.6.0-1], and re-use the original packet identifiers. This only takes
+// effect on a same-server reconnect, where the in-memory tracking maps survive;
+// after a restart or failover, redelivery falls back to the AckWait interval.
+//
+// If the disconnect lasted longer than AckWait, the consumer's own pending
+// check may already redeliver a message as interest is re-established; the NAK
+// then produces one extra copy. That is harmless (same packet identifier, DUP
+// set, so the client dedups) and does not happen on a timely reconnect.
+func (sess *mqttSession) resendPendingRedelivery(c *client) {
+	type pendingNak struct {
+		pi         uint16
+		sseq       uint64
+		ackSubject string
+	}
+	bySeq := func(a, b pendingNak) int {
+		switch {
+		case a.sseq < b.sseq:
+			return -1
+		case a.sseq > b.sseq:
+			return 1
+		default:
+			return 0
+		}
+	}
+	// Snapshot the messages pending AT RESUME first, before any JS round-trip
+	// below: re-establishing subscriptions (processSubs, already done) can trigger
+	// asynchronous fresh deliveries into pendingPublish, and those must not be
+	// NAK'd here (they are already being delivered). PUBLISH and PUBREL live on
+	// different streams (distinct sequence spaces) and are paced differently, so
+	// collect them separately.
+	sess.mu.Lock()
+	jsa := sess.jsa
+	maxAck := sess.effectiveMaxAck()
+	hasReceiveMax := sess.rmax != 0
+	pubNaks := make([]pendingNak, 0, len(sess.pendingPublish))
+	for pi, ack := range sess.pendingPublish {
+		if ack.jsAckSubject != _EMPTY_ {
+			pubNaks = append(pubNaks, pendingNak{pi, ack.sseq, ack.jsAckSubject})
+		}
+	}
+	relNaks := make([]pendingNak, 0, len(sess.pendingPubRel))
+	for _, ack := range sess.pendingPubRel {
+		if ack.jsAckSubject != _EMPTY_ {
+			relNaks = append(relNaks, pendingNak{0, ack.sseq, ack.jsAckSubject})
+		}
+	}
+	// Any pending PUBREL (including a placeholder created at PUBREC before its
+	// delivery recorded an ack subject) needs the PUBREL delivery subscription.
+	hasPendingPubRel := len(sess.pendingPubRel) > 0
+	inflightPubRel := len(sess.pendingPubRel)
+	sess.mu.Unlock()
+
+	// Reconcile against the messages stream: a QoS1/2 message whose Message Expiry
+	// TTL reaped it while it was delivered-but-unacked is gone from the stream, so
+	// it can neither be redelivered nor PUBACK'd. Such an entry would otherwise
+	// leak a Receive Maximum slot for the life of the session. Drop any snapshot
+	// entry whose message no longer exists — below the stream's first sequence, or
+	// (per-message expiry can leave holes above it) confirmed absent by an exact
+	// lookup — releasing its packet identifier and skipping its NAK. The lookups
+	// run outside the session lock. Spec5 [3.3.2.3.3].
+	if si, err := jsa.lookupStream(mqttStreamName); err == nil && si != nil {
+		firstSeq := si.State.FirstSeq
+		kept := make([]pendingNak, 0, len(pubNaks))
+		var gone []uint16
+		for _, n := range pubNaks {
+			reaped := n.sseq < firstSeq
+			if !reaped {
+				if _, err := jsa.loadMsg(mqttStreamName, n.sseq); err != nil && !isErrorOtherThan(err, JSNoMessageFoundErr) {
+					reaped = true
+				}
+			}
+			if reaped {
+				gone = append(gone, n.pi)
+			} else {
+				kept = append(kept, n)
+			}
+		}
+		if len(gone) > 0 {
+			sess.mu.Lock()
+			for _, pi := range gone {
+				sess.untrackPublish(pi)
+			}
+			sess.mu.Unlock()
+		}
+		pubNaks = kept
+	}
+
+	// Replay pending PUBRELs: they complete already-started QoS2 handshakes (the
+	// client answers PUBCOMP, freeing its Receive Maximum slot) rather than
+	// starting new deliveries. The PUBREL delivery subscription is only (re)created
+	// by the QoS2 subscribe path, so ensure it exists here whenever any PUBREL is
+	// pending (a resume may restore no QoS2 subscription, and a placeholder created
+	// at PUBREC may not yet carry an ack subject). Spec5 [MQTT-4.4.0-1].
+	if hasPendingPubRel {
+		if err := sess.ensurePubRelConsumerSubscription(c); err != nil {
+			c.Errorf("Unable to re-establish PUBREL delivery on resume: %v", err)
+		}
+		slices.SortFunc(relNaks, bySeq)
+		for _, n := range relNaks {
+			jsa.sendMsg(n.ackSubject, AckNak)
+		}
+	}
+
+	// PUBLISH redeliveries reuse their packet identifiers and bypass the in-flight
+	// gate, so respect the client's Receive Maximum: NAK at most the effective cap,
+	// in stream order; the JS consumer re-offers the rest via AckWait. When a
+	// Receive Maximum applies, in-flight PUBRELs count against it too, so subtract
+	// them; without one the cap is the JS MaxAckPending, which PUBRELs have already
+	// acked out of. Spec5 [MQTT-3.3.4-9].
+	capacity := maxAck
+	if hasReceiveMax {
+		capacity -= inflightPubRel
+	}
+	if capacity < 0 {
+		capacity = 0
+	}
+	slices.SortFunc(pubNaks, bySeq)
+	if len(pubNaks) > capacity {
+		pubNaks = pubNaks[:capacity]
+	}
+	for _, n := range pubNaks {
+		jsa.sendMsg(n.ackSubject, AckNak)
+	}
+}
+
 // trackAsPubRel is invoked in 2 cases: (a) when we receive a PUBREC and we need
 // to change from tracking the PI as a PUBLISH to a PUBREL; and (b) when we
 // attempt to deliver the PUBREL to record the JS ack subject for it.
@@ -5537,6 +5667,10 @@ CHECK:
 			return err
 		}
 	}
+	// Re-send unacked QoS 1/2 messages (and reconcile any that expired while
+	// offline) on resume, whether or not saved subscriptions were restored: a
+	// session can carry unacknowledged PUBRELs with no active subscription.
+	es.resendPendingRedelivery(c)
 	return nil
 }
 

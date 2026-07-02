@@ -6038,6 +6038,52 @@ func TestMQTTRedeliveryAckWait(t *testing.T) {
 	}
 }
 
+// [MQTT-4.4.0-1] On reconnect with CleanSession=0, the server must re-send
+// unacknowledged QoS 1/2 PUBLISH messages (with DUP set). AckWait is kept well
+// above the client read deadline (testMQTTTimeout) so a redelivery arriving
+// proves it was triggered by the reconnect, not by the AckWait timer.
+func TestMQTTReconnectForcesRedeliveryWithDUP(t *testing.T) {
+	o := testMQTTDefaultOptions()
+	o.MQTT.AckWait = 3 * testMQTTTimeout
+	s := testMQTTRunServer(t, o)
+	defer testMQTTShutdownServer(s)
+
+	cisub := &mqttConnInfo{clientID: "sub", cleanSess: false}
+	c, r := testMQTTConnect(t, cisub, o.MQTT.Host, o.MQTT.Port)
+	defer c.Close()
+	testMQTTCheckConnAck(t, r, mqttConnAckRCConnectionAccepted, false)
+	testMQTTSub(t, 1, c, r, []*mqttFilter{{filter: "foo", qos: 1}}, []byte{1})
+
+	cipub := &mqttConnInfo{clientID: "pub", cleanSess: true}
+	cp, rp := testMQTTConnect(t, cipub, o.MQTT.Host, o.MQTT.Port)
+	defer cp.Close()
+	testMQTTCheckConnAck(t, rp, mqttConnAckRCConnectionAccepted, false)
+
+	// Publish a QoS 1 message; receive it (DUP=0) but do not ack.
+	testMQTTPublish(t, cp, rp, 1, false, false, "foo", 1, []byte("msg"))
+	testMQTTDisconnect(t, cp, nil)
+	cp.Close()
+
+	pi := testMQTTCheckPubMsgNoAck(t, c, r, "foo", mqttPubQos1, []byte("msg"))
+
+	// Drop the subscriber's connection without acking.
+	c.Close()
+
+	// Reconnect the same (persistent) session.
+	c, r = testMQTTConnect(t, cisub, o.MQTT.Host, o.MQTT.Port)
+	defer c.Close()
+	testMQTTCheckConnAck(t, r, mqttConnAckRCConnectionAccepted, true)
+
+	// The unacknowledged message must be re-delivered promptly with DUP set,
+	// well before the 30s AckWait could fire. Same-server reconnect keeps the
+	// session's pending maps, so the original packet identifier is reused.
+	rpi := testMQTTCheckPubMsgNoAck(t, c, r, "foo", mqttPubQos1|mqttPubFlagDup, []byte("msg"))
+	if rpi != pi {
+		t.Fatalf("Expected redelivery to reuse original packet identifier %v, got %v", pi, rpi)
+	}
+	testMQTTSendPIPacket(mqttPacketPubAck, t, c, rpi)
+}
+
 // - [MQTT-3.10.4-3] If a Server deletes a Subscription It MUST complete the
 // delivery of any QoS 1 or QoS 2 messages which it has started to send to the
 // Client.

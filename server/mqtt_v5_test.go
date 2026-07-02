@@ -1868,6 +1868,137 @@ func TestMQTTv5ReceiveMaximum(t *testing.T) {
 	testMQTTReadPublishV5(t, rs, "rm/t", []byte("m2"))
 }
 
+// mqttV5PropsSessionExpiryReceiveMax builds a CONNECT properties body with a
+// Session Expiry Interval and, when rmax > 0, a Receive Maximum.
+func mqttV5PropsSessionExpiryReceiveMax(secs uint32, rmax uint16) []byte {
+	w := newMQTTWriter(0)
+	w.WriteByte(mqttPropSessionExpiry)
+	w.WriteUint32(secs)
+	if rmax > 0 {
+		w.WriteByte(mqttPropReceiveMaximum)
+		w.WriteUint16(rmax)
+	}
+	return w.Bytes()
+}
+
+// On resume the server re-sends unacknowledged QoS 1/2 messages, but must not
+// exceed the resumed connection's Receive Maximum. Spec5 [MQTT-3.3.4-9].
+func TestMQTTv5ReceiveMaximumResumeCap(t *testing.T) {
+	o := testMQTTDefaultOptionsV5()
+	o.MQTT.AckWait = 3 * testMQTTTimeout // keep un-NAK'd messages from redelivering during the test
+	s := testMQTTRunServer(t, o)
+	defer testMQTTShutdownServer(s)
+
+	// First connection: no Receive Maximum, so several QoS1 messages are delivered
+	// unacked and accumulate as pending.
+	c, r := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "rmr", cleanStart: false,
+		props: mqttV5PropsSessionExpiryReceiveMax(300, 0)}, o.MQTT.Host, o.MQTT.Port)
+	testMQTTReadConnAckV5(t, r)
+	testMQTTSubV5(t, c, r, 1, []mqttV5SubFilter{{topic: "rmr/t", opts: 1}})
+
+	cp, rp := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "rmrpub", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
+	defer cp.Close()
+	testMQTTReadConnAckV5(t, rp)
+	for i, m := range []string{"m1", "m2", "m3"} {
+		testMQTTPubV5Props(t, cp, rp, 1, false, uint16(i+1), "rmr/t", []byte(m), nil)
+		testMQTTReadPublishV5(t, r, "rmr/t", []byte(m))
+	}
+	c.Close()
+
+	// Resume with Receive Maximum = 1: only one message may be re-sent now; the
+	// rest wait for AckWait (set very long above).
+	c2, r2 := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "rmr", cleanStart: false,
+		props: mqttV5PropsSessionExpiryReceiveMax(300, 1)}, o.MQTT.Host, o.MQTT.Port)
+	defer c2.Close()
+	if sp, _, _ := testMQTTReadConnAckV5(t, r2); !sp {
+		t.Fatal("expected session present on resume")
+	}
+	testMQTTReadPublishV5(t, r2, "rmr/t", []byte("m1"))
+	testMQTTExpectNothing(t, r2)
+}
+
+// A QoS1/2 message reaped by its Message Expiry TTL while the client was offline
+// can neither be redelivered nor acked; on resume its pending entry must be
+// released so it does not leak a Receive Maximum slot. Spec5 [3.3.2.3.3].
+func TestMQTTv5MessageExpiryPendingReconciledOnResume(t *testing.T) {
+	o := testMQTTDefaultOptionsV5()
+	o.MQTT.AckWait = 3 * testMQTTTimeout
+	s := testMQTTRunServer(t, o)
+	defer testMQTTShutdownServer(s)
+
+	cprobe, rprobe := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "h5probe", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
+	defer cprobe.Close()
+	testMQTTReadConnAckV5(t, rprobe)
+
+	c, r := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "h5", cleanStart: false,
+		props: mqttV5PropsSessionExpiryReceiveMax(300, 0)}, o.MQTT.Host, o.MQTT.Port)
+	testMQTTReadConnAckV5(t, r)
+	testMQTTSubV5(t, c, r, 1, []mqttV5SubFilter{{topic: "h5/t", opts: 1}})
+
+	// Two QoS1 messages delivered unacked, so both are pending.
+	cp, rp := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "h5pub", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
+	defer cp.Close()
+	testMQTTReadConnAckV5(t, rp)
+	testMQTTPubV5Props(t, cp, rp, 1, false, 1, "h5/t", []byte("m1"), nil)
+	testMQTTPubV5Props(t, cp, rp, 1, false, 2, "h5/t", []byte("m2"), nil)
+	testMQTTReadPublishV5(t, r, "h5/t", []byte("m1"))
+	testMQTTReadPublishV5(t, r, "h5/t", []byte("m2"))
+	c.Close()
+
+	asm := testMQTTGetAccountSessionManager(t, s, "h5probe")
+	hash := getHash("h5")
+	asm.mu.RLock()
+	sess := asm.sessByHash[hash]
+	asm.mu.RUnlock()
+	require_NotNil(t, sess)
+	sess.mu.Lock()
+	var loSeq, hiSeq uint64
+	for _, ack := range sess.pendingPublish {
+		if loSeq == 0 || ack.sseq < loSeq {
+			loSeq = ack.sseq
+		}
+		if ack.sseq > hiSeq {
+			hiSeq = ack.sseq
+		}
+	}
+	pendBefore := len(sess.pendingPublish)
+	sess.mu.Unlock()
+	require_True(t, pendBefore == 2 && loSeq > 0 && hiSeq > loSeq)
+
+	// Simulate the Message Expiry TTL reaping only the LATER message, leaving a
+	// hole above the stream's first sequence (the earlier message survives).
+	require_NoError(t, asm.jsa.deleteMsg(mqttStreamName, hiSeq, true))
+
+	// Resume: the pending entry for the reaped (mid-stream) message must be
+	// released; the surviving message's entry stays.
+	c2, r2 := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "h5", cleanStart: false,
+		props: mqttV5PropsSessionExpiryReceiveMax(300, 0)}, o.MQTT.Host, o.MQTT.Port)
+	defer c2.Close()
+	testMQTTReadConnAckV5(t, r2)
+	checkFor(t, 2*time.Second, 15*time.Millisecond, func() error {
+		sess.mu.Lock()
+		defer sess.mu.Unlock()
+		if _, ok := findPendingBySeq(sess, hiSeq); ok {
+			return fmt.Errorf("expected reaped entry (seq %d) released", hiSeq)
+		}
+		if _, ok := findPendingBySeq(sess, loSeq); !ok {
+			return fmt.Errorf("surviving entry (seq %d) was wrongly dropped", loSeq)
+		}
+		return nil
+	})
+}
+
+// findPendingBySeq reports the packet id tracking the given stream sequence.
+// Session lock held on entry.
+func findPendingBySeq(sess *mqttSession, sseq uint64) (uint16, bool) {
+	for pi, ack := range sess.pendingPublish {
+		if ack.sseq == sseq {
+			return pi, true
+		}
+	}
+	return 0, false
+}
+
 func TestMQTTv5ReceiveMaximumQoS2(t *testing.T) {
 	o := testMQTTDefaultOptionsV5()
 	o.MQTT.AckWait = time.Second
