@@ -530,6 +530,12 @@ type mqttSub struct {
 	qos   byte
 	jsDur string
 
+	// closed marks the subscription as torn down (QoS downgrade to 0, or
+	// unsubscribe) so QoS 1/2 delivery callbacks stop tracking new messages for
+	// it. Guarded like qos/jsDur (sess.mu or sess.subsMu). Unlike clearing
+	// sub.mqtt, this keeps the struct valid for an in-flight enqueue.
+	closed bool
+
 	// Pending serialization of retained messages to be sent when subscription
 	// is registered. The sub's delivery callbacks must wait until `prm` is
 	// ready (can block on sess.mu for that, too).
@@ -3673,6 +3679,8 @@ func (sess *mqttSession) processSub(
 		// accessing it later requires a lock.
 		ss.mqtt.qos = qos
 		ss.mqtt.jsDur = jsDurName
+		// A (re)configured subscription is live; clear any prior teardown mark.
+		ss.mqtt.closed = false
 	}
 
 	if len(rms) > 0 {
@@ -7140,7 +7148,7 @@ func mqttDeliverMsgCbQoS12(sub *subscription, pc *client, _ *Account, subject, r
 	// track of pending acks, etc. There is no need to acquire the subsMu RLock
 	// since sess.Lock is overarching for modifying subscriptions.
 	sess.mu.Lock()
-	if sess.c != cc || sub.mqtt == nil {
+	if sess.c != cc || sub.mqtt == nil || sub.mqtt.closed {
 		sess.mu.Unlock()
 		return
 	}
@@ -7603,8 +7611,28 @@ func (sess *mqttSession) processJSConsumer(c *client, subject, sid string,
 			sub := c.subs[cc.DeliverSubject]
 			c.mu.Unlock()
 
+			// Delete the consumer entry, mark its delivery subscription closed,
+			// and purge its pending QoS 1/2 deliveries — all under the session
+			// lock. Otherwise those packet identifiers leak and count against the
+			// in-flight cap for the life of the session (as mqttProcessUnsubs
+			// purges on unsubscribe). deleteConsumer is asynchronous, so an
+			// in-flight delivery callback could re-populate the maps after the
+			// purge; marking sub.mqtt.closed (guarded by sess.mu and sess.subsMu,
+			// same as delivery) makes mqttDeliverMsgCbQoS12 skip instead. The flag
+			// leaves sub.mqtt valid so an already-committed enqueue does not panic.
 			sess.mu.Lock()
 			delete(sess.cons, sid)
+			if sub != nil && sub.mqtt != nil {
+				sess.subsMu.Lock()
+				sub.mqtt.closed = true
+				sess.subsMu.Unlock()
+			}
+			if seqPis, ok := sess.cpending[cc.Durable]; ok {
+				delete(sess.cpending, cc.Durable)
+				for _, pi := range seqPis {
+					delete(sess.pendingPublish, pi)
+				}
+			}
 			sess.mu.Unlock()
 
 			sess.deleteConsumer(cc)
@@ -7775,8 +7803,21 @@ func (c *client) mqttProcessUnsubs(filters []*mqttFilter) error {
 		if ok {
 			delete(sess.cons, sid)
 			sess.deleteConsumer(cc)
+
+			c.mu.Lock()
+			sub := c.subs[cc.DeliverSubject]
+			c.mu.Unlock()
+
 			// Need lock here since these are accessed by callbacks
 			sess.mu.Lock()
+			// Mark the delivery sub closed so an in-flight QoS 1/2 callback stops
+			// tracking new messages after the purge (deleteConsumer is async);
+			// same barrier as the QoS 0 downgrade path in processJSConsumer.
+			if sub != nil && sub.mqtt != nil {
+				sess.subsMu.Lock()
+				sub.mqtt.closed = true
+				sess.subsMu.Unlock()
+			}
 			if seqPis, ok := sess.cpending[cc.Durable]; ok {
 				delete(sess.cpending, cc.Durable)
 				for _, pi := range seqPis {
