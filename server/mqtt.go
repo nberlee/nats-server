@@ -63,6 +63,11 @@ const (
 	mqttProtoLevel  = byte(0x4)
 	mqttProtoLevel5 = byte(0x5)
 
+	// mqttSessionNeverExpire is the MQTT 5.0 Session Expiry Interval value that
+	// means the session never expires. It is also the effective value we map a
+	// persistent (non-clean) 3.1.1 session to. Spec5 [3.1.2.11.2].
+	mqttSessionNeverExpire = uint32(0xFFFFFFFF)
+
 	// Connect flags
 	mqttConnFlagReserved     = byte(0x1)
 	mqttConnFlagCleanSession = byte(0x2)
@@ -282,6 +287,9 @@ var (
 	mqttSessJailDur      = mqttSessFlappingJailDur
 	mqttFlapCleanItvl    = mqttSessFlappingCleanupInterval
 	mqttRetainedCacheTTL = mqttDefaultRetainedCacheTTL
+	// How often to re-run the session-expiry sweep for an account. A var so
+	// tests can shorten it.
+	mqttSessionExpirySweepInterval = 15 * time.Minute
 )
 
 var (
@@ -344,10 +352,15 @@ type mqttAccountSessionManager struct {
 	// to the same session can cancel them. MQTT 5.0 Will Delay Interval,
 	// Spec5 [3.1.3.2.2], [MQTT-3.1.2-8]. Guarded by mu.
 	pendingWills map[string]*mqttPendingWill
-	retmsgs      *stree.SubjectTree[mqttRetainedMsgRef] // retained message metadata
-	rmsCache     *sync.Map                              // map[subject]mqttRetainedMsg
-	jsa          mqttJSA
-	domainTk     string // Domain (with trailing "."), or possibly empty. This is added to session subject.
+	// Pending session-expiry timers, keyed by MQTT client ID hash, that clean up a
+	// session once its MQTT 5.0 Session Expiry Interval elapses after the
+	// connection closes. A reconnect (local or remote takeover) cancels them.
+	// Spec5 [3.1.2.11.2]. Guarded by mu.
+	pendingExpiries map[string]*time.Timer
+	retmsgs         *stree.SubjectTree[mqttRetainedMsgRef] // retained message metadata
+	rmsCache        *sync.Map                              // map[subject]mqttRetainedMsg
+	jsa             mqttJSA
+	domainTk        string // Domain (with trailing "."), or possibly empty. This is added to session subject.
 
 	// Degraded mode, set once at creation (read without lock): per-message TTL
 	// could not be enabled on a pre-existing stream, so stored messages must
@@ -430,10 +443,20 @@ type mqttSession struct {
 	// of unacknowledged QoS1/2 PUBLISH the server may have in flight to the
 	// client. 0 means no client-imposed limit (3.1.1, or not sent). The
 	// effective in-flight cap is min(maxp, rmax). Set on each CONNECT.
-	rmax     uint16
-	tmaxack  int
-	clean    bool
-	domainTk string
+	rmax    uint16
+	tmaxack int
+	clean   bool
+	// expiryInterval is the effective MQTT 5.0 Session Expiry Interval in seconds:
+	// 0 means the session ends when the connection closes, mqttSessionNeverExpire
+	// means it never expires, any other value keeps the session for that many
+	// seconds after the connection closes. For 3.1.1 this is derived from the
+	// Clean Session flag (clean => 0, persistent => mqttSessionNeverExpire). Set on
+	// each CONNECT and possibly overridden by a v5 DISCONNECT. Spec5 [3.1.2.11.2].
+	expiryInterval uint32
+	// disconnectedAt is the Unix time the client disconnected with a finite expiry
+	// interval pending (0 while connected). Persisted so the deadline survives a restart.
+	disconnectedAt int64
+	domainTk       string
 
 	// will is the session's pending delayed Will, persisted with the record so
 	// it survives a server restart during the Will Delay Interval. nil when no
@@ -449,6 +472,10 @@ type mqttPersistedSession struct {
 	Cons   map[string]*ConsumerConfig `json:"cons,omitempty"`
 	PubRel *ConsumerConfig            `json:"pubrel,omitempty"`
 	Will   *mqttPersistedWill         `json:"will,omitempty"`
+	// Session Expiry Interval (seconds) and disconnect Unix time (0 while
+	// connected): together the expiry deadline, restart-safe. Spec5 [3.1.2.11.2].
+	ExpiryInterval uint32 `json:"expiry,omitempty"`
+	DisconnectedAt int64  `json:"disconnected,omitempty"`
 }
 
 // mqttPersistedWill is a delayed Will stored in the session record so it still
@@ -763,8 +790,7 @@ func (s *Server) startMQTT() {
 	}
 	s.Noticef("Listening for MQTT clients on %s://%s:%d", scheme, o.Host, o.Port)
 	if s.mqtt.v5Enabled {
-		s.Warnf("MQTT 5.0 support is enabled but experimental: some v5 features " +
-			"(session expiry) are not yet honored")
+		s.Warnf("MQTT 5.0 support is enabled but experimental")
 	}
 	go s.acceptConnections(hl, "MQTT", func(conn net.Conn) { s.createMQTTClient(conn, nil) }, nil)
 	s.mu.Unlock()
@@ -1225,13 +1251,32 @@ func (c *client) mqttParse(buf []byte) error {
 				if rcode, err = r.readByte("disconnect reason code"); err != nil {
 					break
 				}
+				var props *mqttProperties
 				if pl > 1 {
-					if _, err = r.readProperties(mqttPacketDisconnect); err != nil {
+					if props, err = r.readProperties(mqttPacketDisconnect); err != nil {
 						break
 					}
 				}
 				if rcode == mqttReasonDisconnectWithWill {
 					discardWill = false
+				}
+				// Spec5 [3.14.2.2.2]: a DISCONNECT may update the Session Expiry
+				// Interval. Raising it from 0 is a Protocol Error; ignore that
+				// override rather than fail an already-closing connection.
+				if props != nil && props.present[mqttPropSessionExpiry] {
+					c.mu.Lock()
+					sess := c.mqtt.sess
+					c.mu.Unlock()
+					if sess != nil {
+						sess.mu.Lock()
+						// Only if this client still owns the session: after a takeover
+						// sess.c is the new client, and a late DISCONNECT from the old
+						// connection must not clobber the live session's interval.
+						if sess.c == c && (sess.expiryInterval != 0 || props.sessionExpiry == 0) {
+							sess.expiryInterval = props.sessionExpiry
+						}
+						sess.mu.Unlock()
+					}
 				}
 			}
 			if trace {
@@ -1352,10 +1397,15 @@ func (s *Server) mqttHandleClosedClient(c *client) {
 	// Clear the client from the session, but session may stay.
 	sess.mu.Lock()
 	sess.c = nil
-	doClean := sess.clean
+	// The Session Expiry Interval (set at CONNECT, possibly updated by a v5
+	// DISCONNECT) is authoritative here: 0 means the session ends at connection
+	// close. For 3.1.1 this is 0 iff the session is clean, so behavior is unchanged.
+	expiry := sess.expiryInterval
+	idHash := sess.idHash
 	sess.mu.Unlock()
-	// If it was a clean session, then we remove from the account manager,
-	// and we will call clear() outside of any lock.
+	doClean := expiry == 0
+	// If the session ends at connection close, then we remove from the account
+	// manager, and we will call clear() outside of any lock.
 	if doClean {
 		asm.removeSession(sess, false)
 	}
@@ -1368,10 +1418,23 @@ func (s *Server) mqttHandleClosedClient(c *client) {
 		if err := sess.clear(true); err != nil {
 			c.Errorf(err.Error())
 		}
+	} else if expiry != mqttSessionNeverExpire {
+		// Finite Session Expiry Interval: keep the session (so a reconnect can
+		// resume it) and arm a cleanup timer. Persist the disconnect time so the
+		// deadline survives a restart; a failed save only loses restart-survival.
+		// Spec5 [3.1.2.11.2].
+		sess.mu.Lock()
+		sess.disconnectedAt = time.Now().Unix()
+		sess.mu.Unlock()
+		if err := sess.save(); err != nil {
+			c.Debugf("Unable to persist session expiry deadline: %v", err)
+		}
+		asm.scheduleSessionExpiry(s, idHash, time.Duration(expiry)*time.Second)
 	}
 
-	// Now handle the "will". This function will be a no-op if there is no "will" to send.
-	s.mqttHandleWill(c)
+	// Now handle the "will". This function will be a no-op if there is no "will" to
+	// send. The effective Session Expiry Interval bounds any Will Delay.
+	s.mqttHandleWill(c, expiry)
 }
 
 // Updates the MaxAckPending for all MQTT sessions, updating the
@@ -1727,11 +1790,12 @@ func (s *Server) mqttCreateAccountSessionManager(acc *Account, quitCh chan struc
 	}
 	qname := fmt.Sprintf("[ACC:%s] MQTT ", accName)
 	as := &mqttAccountSessionManager{
-		sessions:     make(map[string]*mqttSession),
-		sessByHash:   make(map[string]*mqttSession),
-		sessLocked:   make(map[string]struct{}),
-		flappers:     make(map[string]time.Time),
-		pendingWills: make(map[string]*mqttPendingWill),
+		sessions:        make(map[string]*mqttSession),
+		sessByHash:      make(map[string]*mqttSession),
+		sessLocked:      make(map[string]struct{}),
+		flappers:        make(map[string]time.Time),
+		pendingWills:    make(map[string]*mqttPendingWill),
+		pendingExpiries: make(map[string]*time.Timer),
 		jsa: mqttJSA{
 			id:      id,
 			c:       c,
@@ -2095,8 +2159,27 @@ func (s *Server) mqttCreateAccountSessionManager(acc *Account, quitCh chan struc
 		return nil, fmt.Errorf("create retained messages consumer for account %q: %v", accName, err)
 	}
 
-	// Re-arm delayed Wills that were pending when this server last shut down.
-	as.sweepPendingWills(s)
+	// Re-arm session-expiry timers and delayed Wills persisted before a
+	// restart, without delaying the connecting client. Then re-sweep expiries
+	// periodically: it catches deadlines that never got a timer (e.g. records
+	// orphaned when their owner crashed while the client was connected).
+	s.startGoRoutine(func() {
+		defer s.grWG.Done()
+		as.sweepSessionExpiries(s)
+		as.sweepPendingWills(s)
+		tt := time.NewTicker(mqttSessionExpirySweepInterval)
+		defer tt.Stop()
+		for {
+			select {
+			case <-tt.C:
+				as.sweepSessionExpiries(s)
+			case <-closeCh:
+				return
+			case <-s.quitCh:
+				return
+			}
+		}
+	})
 
 	// Set this so that on defer we don't cleanup.
 	success = true
@@ -2391,8 +2474,8 @@ func (jsa *mqttJSA) loadLastMsgForMulti(streamName string, subjects []string) ([
 	return responses, err
 }
 
-func (jsa *mqttJSA) loadNextMsgFromSeq(streamName string, subject string, seq uint64) (*StoredMsg, error) {
-	mreq := &JSApiMsgGetRequest{Seq: seq, NextFor: subject}
+func (jsa *mqttJSA) loadNextMsgFor(streamName string, subject string) (*StoredMsg, error) {
+	mreq := &JSApiMsgGetRequest{NextFor: subject}
 	req, err := json.Marshal(mreq)
 	if err != nil {
 		return nil, err
@@ -2405,8 +2488,11 @@ func (jsa *mqttJSA) loadNextMsgFromSeq(streamName string, subject string, seq ui
 	return lmr.Message, lmr.ToError()
 }
 
-func (jsa *mqttJSA) loadNextMsgFor(streamName string, subject string) (*StoredMsg, error) {
-	mreq := &JSApiMsgGetRequest{NextFor: subject}
+// loadNextMsgFromSeq returns the first message on the given subject (which may
+// contain wildcards) with a sequence >= seq, allowing a bounded walk over all
+// messages of a subject filter.
+func (jsa *mqttJSA) loadNextMsgFromSeq(streamName, subject string, seq uint64) (*StoredMsg, error) {
+	mreq := &JSApiMsgGetRequest{Seq: seq, NextFor: subject}
 	req, err := json.Marshal(mreq)
 	if err != nil {
 		return nil, err
@@ -2689,16 +2775,22 @@ func (as *mqttAccountSessionManager) processSessionPersist(_ *subscription, pc *
 	as.cancelWillLocked(cIDHash)
 	sess, ok := as.sessByHash[cIDHash]
 	if !ok {
+		// No local session: cancel any (sweep-armed) expiry timer, the remote save
+		// superseded the record it was armed from. Spec5 [3.1.2.11.2].
+		as.cancelSessionExpiryLocked(cIDHash)
 		return
 	}
 	// If our current session's stream sequence is higher, it means that this
-	// update is stale, so we don't do anything here.
+	// update is stale, so we don't do anything here (and keep our expiry timer).
 	sess.mu.Lock()
 	ignore = par.Sequence < sess.seq
 	sess.mu.Unlock()
 	if ignore {
 		return
 	}
+	// The remote connection owns the session now; our expiry timer must not fire
+	// and delete its state. Spec5 [3.1.2.11.2].
+	as.cancelSessionExpiryLocked(cIDHash)
 	as.removeSession(sess, false)
 	sess.mu.Lock()
 	ec := sess.c
@@ -2958,18 +3050,298 @@ func (as *mqttAccountSessionManager) clearPersistedWill(s *Server, idHash string
 		return
 	}
 	ps.Will = nil
+	if err := as.storeSessionRecordCAS(ps, idHash, smsg.Sequence); err != nil {
+		s.Debugf("MQTT: unable to clear persisted Will for session hash %q: %v", idHash, err)
+	}
+}
+
+// storeSessionRecordCAS rewrites a session record expecting the given stream
+// sequence, so a concurrent writer (e.g. a reconnect elsewhere) wins and this
+// rewrite is dropped.
+func (as *mqttAccountSessionManager) storeSessionRecordCAS(ps *mqttPersistedSession, idHash string, seq uint64) error {
 	b, _ := json.Marshal(ps)
 	bb := bytes.Buffer{}
 	bb.WriteString(hdrLine)
 	bb.WriteString(JSExpectedLastSubjSeq)
 	bb.WriteString(":")
-	bb.WriteString(strconv.FormatUint(smsg.Sequence, 10))
+	bb.WriteString(strconv.FormatUint(seq, 10))
 	bb.WriteString(CR_LF)
 	bb.WriteString(CR_LF)
 	hdr := bb.Len()
 	bb.Write(b)
-	if _, err := as.jsa.storeSessionMsg(as.domainTk, idHash, hdr, bb.Bytes()); err != nil {
-		s.Debugf("MQTT: unable to clear persisted Will for session hash %q: %v", idHash, err)
+	_, err := as.jsa.storeSessionMsg(as.domainTk, idHash, hdr, bb.Bytes())
+	return err
+}
+
+// scheduleSessionExpiry arms a timer to clean up a disconnected client's session
+// once its MQTT 5.0 Session Expiry Interval elapses. The timer is keyed by the
+// client ID hash (the same token used in the session-persist stream) so both a
+// local reconnect and a remote takeover on another server can cancel it via
+// cancelSessionExpiry / cancelSessionExpiryLocked. Spec5 [3.1.2.11.2].
+//
+// Deadlines survive a restart via the persisted disconnect time and
+// sweepSessionExpiries. Gap: no other server re-arms the timer if the owner dies
+// while the cluster keeps running; the session lingers until a reconnect or sweep.
+//
+// No lock held on entry.
+func (as *mqttAccountSessionManager) scheduleSessionExpiry(s *Server, idHash string, delay time.Duration) {
+	as.mu.Lock()
+	defer as.mu.Unlock()
+	// nil map => account manager is shutting down; do not schedule.
+	if as.pendingExpiries == nil {
+		return
+	}
+	// Defensive: replace any existing timer for this client ID hash.
+	if old, ok := as.pendingExpiries[idHash]; ok {
+		old.Stop()
+	}
+	as.pendingExpiries[idHash] = time.AfterFunc(delay, func() { as.expireSession(s, idHash) })
+}
+
+// cancelSessionExpiry stops and removes a pending session-expiry timer for the
+// given client ID hash, if any. Called when a new connection resumes the session
+// before the interval elapses. Returns true if one was cancelled. Idempotent.
+//
+// No lock held on entry.
+func (as *mqttAccountSessionManager) cancelSessionExpiry(idHash string) bool {
+	as.mu.Lock()
+	defer as.mu.Unlock()
+	return as.cancelSessionExpiryLocked(idHash)
+}
+
+// cancelSessionExpiryLocked is cancelSessionExpiry for callers already holding
+// as.mu (e.g. the session-persist callback that cancels on a remote takeover).
+func (as *mqttAccountSessionManager) cancelSessionExpiryLocked(idHash string) bool {
+	t, ok := as.pendingExpiries[idHash]
+	if !ok {
+		return false
+	}
+	t.Stop()
+	delete(as.pendingExpiries, idHash)
+	return true
+}
+
+// expireSession removes and clears a session whose Session Expiry Interval has
+// elapsed, unless it was cancelled (reconnect/takeover) or the account manager is
+// shutting down. Reuses the same removeSession + clear path as a clean disconnect.
+// A session not in the in-memory maps (timer re-armed by the startup sweep) is
+// re-verified against the persisted record first. Spec5 [3.1.2.11.2].
+//
+// No lock held on entry.
+func (as *mqttAccountSessionManager) expireSession(s *Server, idHash string) {
+	as.mu.Lock()
+	// nil map => account manager shutdown; the entry (if any) is being torn down.
+	if as.pendingExpiries == nil {
+		as.mu.Unlock()
+		return
+	}
+	t, ok := as.pendingExpiries[idHash]
+	if !ok {
+		// Cancelled between the timer firing and acquiring the lock.
+		as.mu.Unlock()
+		return
+	}
+	// We own this expiry now; drop the timer entry so a concurrent reconnect's
+	// cancelSessionExpiry becomes a no-op.
+	t.Stop()
+	delete(as.pendingExpiries, idHash)
+	sess, inMem := as.sessByHash[idHash]
+	as.mu.Unlock()
+	if !inMem {
+		as.expireSessionFromRecord(s, idHash)
+		return
+	}
+
+	// Guard against a concurrent reconnect: lockSession(sess, nil) fails if a
+	// CONNECT is mid-processing or a client is bound — the reconnect then owns it.
+	if err := as.lockSession(sess, nil); err != nil {
+		return
+	}
+	// Re-check that no client re-bound before we acquired the session lock.
+	sess.mu.Lock()
+	rebound := sess.c != nil
+	seq := sess.seq
+	sess.mu.Unlock()
+	if rebound {
+		as.unlockSession(sess)
+		return
+	}
+	// If the persisted record was bumped past our sequence, our in-memory copy is
+	// stale: a resume (and possibly a re-disconnect) happened on another server and
+	// its best-effort cancel to this server may have been lost. Do NOT act on our
+	// stale state — drop the local copy and let the record-based path decide from
+	// the authoritative record: it skips a still-connected or not-yet-due session
+	// (re-arming as needed) and cleans up a due one using the record's own sequence
+	// and consumers. A record that is not newer (or absent from a failed
+	// best-effort disconnect save) leaves our in-memory view authoritative, so the
+	// fired timer still cleans up and finite expiry is never silently skipped.
+	// Spec5 [3.1.2.11.2].
+	superseded := false
+	if smsg, err := as.jsa.loadSessionMsg(as.domainTk, idHash); err == nil && smsg.Sequence > seq {
+		superseded = true
+	}
+	if superseded {
+		// Our copy is stale: drop it and hand off to the record-based path, which
+		// guards against a concurrent CONNECT itself (its connecting check and a
+		// sequence-CAS'd delete), so we release the session lock before delegating.
+		as.removeSession(sess, true)
+		as.unlockSession(sess)
+		as.expireSessionFromRecord(s, idHash)
+		return
+	}
+
+	// Authoritative cleanup: hold the session lock through clear() so a concurrent
+	// CONNECT cannot restore the (possibly stale) persisted record and race the
+	// teardown. Delete the session state (consumers, record), matching the
+	// clean-disconnect path in mqttHandleClosedClient.
+	defer as.unlockSession(sess)
+	as.removeSession(sess, true)
+	if err := sess.clear(true); err != nil {
+		s.Warnf("MQTT session expiry cleanup for %q failed: %v", sess.id, err)
+	}
+}
+
+// loadExpiringSessionRecord loads and decodes the persisted record for idHash
+// and reports whether its Session Expiry deadline has elapsed (due). A resume
+// anywhere rewrites the record with DisconnectedAt=0, so a stale timer reading it
+// finds nothing due — the record is authoritative. If the deadline has not yet
+// passed (a newer disconnect refreshed it) it re-arms the timer and returns
+// due=false. Returns the decoded record and its stream sequence for the caller.
+//
+// No lock held on entry.
+func (as *mqttAccountSessionManager) loadExpiringSessionRecord(s *Server, idHash string) (ps *mqttPersistedSession, seq uint64, due bool) {
+	smsg, err := as.jsa.loadSessionMsg(as.domainTk, idHash)
+	if err != nil {
+		// Not found => the session was cleared or resumed-then-cleaned; done.
+		if isErrorOtherThan(err, JSNoMessageFoundErr) {
+			s.Warnf("MQTT session expiry: unable to load session record: %v", err)
+		}
+		return nil, 0, false
+	}
+	ps = &mqttPersistedSession{}
+	if err := json.Unmarshal(smsg.Data, ps); err != nil {
+		s.Warnf("MQTT session expiry: unable to decode session record at sequence %v: %v", smsg.Sequence, err)
+		return nil, 0, false
+	}
+	// A connected client (or a session that no longer expires) leaves nothing to do.
+	if ps.DisconnectedAt == 0 || ps.ExpiryInterval == 0 || ps.ExpiryInterval == mqttSessionNeverExpire {
+		return ps, smsg.Sequence, false
+	}
+	// Not due yet (e.g. the record was refreshed by a newer disconnect after this
+	// timer was armed): re-arm for the remainder instead of dropping the cleanup.
+	if remaining := time.Until(time.Unix(ps.DisconnectedAt+int64(ps.ExpiryInterval), 0)); remaining > 0 {
+		as.scheduleSessionExpiry(s, idHash, remaining)
+		return ps, smsg.Sequence, false
+	}
+	return ps, smsg.Sequence, true
+}
+
+// expireSessionFromRecord handles an expiry timer firing for a session not in
+// the in-memory maps (re-armed by the startup sweep). The persisted record is
+// authoritative: a reconnect anywhere rewrites it with a zero disconnect time,
+// so re-reading it right before acting keeps a stale timer harmless.
+//
+// No lock held on entry.
+func (as *mqttAccountSessionManager) expireSessionFromRecord(s *Server, idHash string) {
+	ps, seq, due := as.loadExpiringSessionRecord(s, idHash)
+	if !due {
+		return
+	}
+	// Skip if a CONNECT for this client ID is being processed on this server; its
+	// save will reset the disconnect time (and the record delete below is CAS-ed
+	// on the sequence we just read, so a concurrent remote resume wins).
+	as.mu.Lock()
+	_, connecting := as.sessLocked[ps.ID]
+	as.mu.Unlock()
+	if connecting {
+		return
+	}
+
+	// Build a transient session from the record — enough state for clear() to
+	// delete the consumers and the record itself — and clean up.
+	sess := mqttSessionCreate(&as.jsa, ps.ID, idHash, seq, s.getOpts())
+	sess.domainTk = as.domainTk
+	sess.clean = ps.Clean
+	sess.subs = ps.Subs
+	sess.cons = ps.Cons
+	sess.pubRelConsumer = ps.PubRel
+	if err := sess.clear(true); err != nil {
+		s.Warnf("MQTT session expiry cleanup for %q failed: %v", ps.ID, err)
+	}
+}
+
+// sweepSessionExpiries re-arms expiry timers from the persisted session records,
+// so deadlines survive a restart; overdue sessions get an immediate timer.
+// expireSession re-verifies each record before deleting anything, so racing a
+// reconnect or another server's sweep is safe. Runs from a go routine at account
+// session manager creation (the first MQTT connect for the account after a
+// restart). Spec5 [3.1.2.11.2].
+//
+// No lock held on entry.
+func (as *mqttAccountSessionManager) sweepSessionExpiries(s *Server) {
+	filter := mqttSessStreamSubjectPrefix + as.domainTk + ">"
+	var swept int
+	for seq := uint64(1); ; {
+		smsg, err := as.jsa.loadNextMsgFromSeq(mqttSessStreamName, filter, seq)
+		if err != nil {
+			// No (more) messages, or the stream/server is going away: done.
+			if isErrorOtherThan(err, JSNoMessageFoundErr) {
+				s.Debugf("MQTT session expiry sweep ended: %v", err)
+			}
+			break
+		}
+		seq = smsg.Sequence + 1
+		ps := &mqttPersistedSession{}
+		if err := json.Unmarshal(smsg.Data, ps); err != nil {
+			s.Warnf("MQTT session expiry sweep: unable to decode session record at sequence %v, skipping: %v", smsg.Sequence, err)
+			continue
+		}
+		// Only sessions with a finite interval can expire.
+		if ps.ExpiryInterval == 0 || ps.ExpiryInterval == mqttSessionNeverExpire {
+			continue
+		}
+		idHash := getHash(ps.ID)
+		if ps.DisconnectedAt == 0 {
+			// The record claims a connected client. If we own the record and
+			// have no session for it in memory, the owner (us) went down while
+			// the client was connected and its disconnect was never recorded:
+			// stamp it as of now so the finite interval eventually applies.
+			// The CAS write defers to any concurrent reconnect; an in-memory
+			// session (bound or freshly disconnected) manages its own state.
+			// The ownership gate applies only in a cluster (where every node
+			// sweeps, and server names are explicit): standalone, a generated
+			// node name changes across restarts and would never match.
+			if s.JetStreamIsClustered() && ps.Origin != s.NodeName() {
+				continue
+			}
+			as.mu.RLock()
+			_, inMem := as.sessByHash[idHash]
+			as.mu.RUnlock()
+			if inMem {
+				continue
+			}
+			ps.DisconnectedAt = time.Now().Unix()
+			if err := as.storeSessionRecordCAS(ps, idHash, smsg.Sequence); err != nil {
+				continue
+			}
+		}
+		remaining := time.Until(time.Unix(ps.DisconnectedAt+int64(ps.ExpiryInterval), 0))
+		if remaining < 0 {
+			remaining = 0
+		}
+		// Arm only if absent: a timer armed by a live disconnect (or an earlier
+		// sweep) is at least as up to date as this record snapshot.
+		as.mu.Lock()
+		if as.pendingExpiries != nil {
+			if _, exists := as.pendingExpiries[idHash]; !exists {
+				as.pendingExpiries[idHash] = time.AfterFunc(remaining, func() { as.expireSession(s, idHash) })
+				swept++
+			}
+		}
+		as.mu.Unlock()
+	}
+	if swept > 0 {
+		s.Debugf("MQTT session expiry sweep re-armed %v timer(s)", swept)
 	}
 }
 
@@ -3057,6 +3429,13 @@ func (as *mqttAccountSessionManager) sendJSAPIrequests(s *Server, c *client, acc
 			pw.timer.Stop()
 		}
 		as.pendingWills = nil
+		// Likewise stop any pending session-expiry timers and disable further
+		// scheduling/firing; the nil map makes expireSession a no-op for a timer
+		// already mid-callback. Spec5 [3.1.2.11.2].
+		for _, t := range as.pendingExpiries {
+			t.Stop()
+		}
+		as.pendingExpiries = nil
 		as.mu.Unlock()
 	}()
 
@@ -3967,6 +4346,24 @@ func (as *mqttAccountSessionManager) createOrRestoreSession(clientID string, opt
 		return nil, false, errMQTTSessionCollision
 	}
 
+	// An overdue session must not be resumed, even if this reconnect beats the
+	// startup sweep to it: discard its state and start fresh. Spec5 [3.1.2.11.2].
+	if ps.DisconnectedAt > 0 && ps.ExpiryInterval > 0 && ps.ExpiryInterval != mqttSessionNeverExpire &&
+		time.Now().Unix() >= ps.DisconnectedAt+int64(ps.ExpiryInterval) {
+		sess := mqttSessionCreate(jsa, clientID, hash, smsg.Sequence, opts)
+		sess.domainTk = as.domainTk
+		sess.cons = ps.Cons
+		sess.pubRelConsumer = ps.PubRel
+		// Wait for the deletes (like the clean-start discard): a queued no-wait
+		// delete of the deterministic PUBREL durable could otherwise race the new
+		// session recreating it.
+		if err := sess.clear(false); err != nil {
+			return nil, false, fmt.Errorf("clearing expired session: %w", err)
+		}
+		// clear() reset the state (seq included), so sess is now a fresh session.
+		return sess, false, nil
+	}
+
 	// Restore this session (even if we don't own it), the caller will do the right thing.
 	sess := mqttSessionCreate(jsa, clientID, hash, smsg.Sequence, opts)
 	sess.domainTk = as.domainTk
@@ -3974,6 +4371,8 @@ func (as *mqttAccountSessionManager) createOrRestoreSession(clientID string, opt
 	sess.subs = ps.Subs
 	sess.cons = ps.Cons
 	sess.pubRelConsumer = ps.PubRel
+	sess.expiryInterval = ps.ExpiryInterval
+	sess.disconnectedAt = ps.DisconnectedAt
 	as.addSession(sess, true)
 	return sess, true, nil
 }
@@ -4194,13 +4593,15 @@ func mqttSessionCreate(jsa *mqttJSA, id, idHash string, seq uint64, opts *Option
 func (sess *mqttSession) save() error {
 	sess.mu.Lock()
 	ps := mqttPersistedSession{
-		Origin: sess.jsa.id,
-		ID:     sess.id,
-		Clean:  sess.clean,
-		Subs:   sess.subs,
-		Cons:   sess.cons,
-		PubRel: sess.pubRelConsumer,
-		Will:   sess.will,
+		Origin:         sess.jsa.id,
+		ID:             sess.id,
+		Clean:          sess.clean,
+		Subs:           sess.subs,
+		Cons:           sess.cons,
+		PubRel:         sess.pubRelConsumer,
+		Will:           sess.will,
+		ExpiryInterval: sess.expiryInterval,
+		DisconnectedAt: sess.disconnectedAt,
 	}
 	b, _ := json.Marshal(&ps)
 
@@ -4965,8 +5366,24 @@ CHECK:
 		asm.mu.Unlock()
 	}()
 
-	// Is the client requesting a clean session or not.
+	// Is the client requesting a clean session (v5: Clean Start) or not.
 	cleanSess := cp.flags&mqttConnFlagCleanSession != 0
+	// MQTT 5.0 Session Expiry Interval: how long the session survives after the
+	// connection closes; orthogonal to Clean Start. 3.1.1 maps clean => 0,
+	// persistent => never. A session ends at connection close iff the interval is
+	// 0 — exactly the legacy meaning of `clean` — so sess.clean is derived from the
+	// interval and all existing clean-based branches work unchanged. Spec5 [3.1.2.11.2].
+	var expiry uint32
+	if !cleanSess {
+		expiry = mqttSessionNeverExpire
+	}
+	if c.mqtt.proto == mqttProtoLevel5 {
+		expiry = 0
+		if cp.props != nil {
+			expiry = cp.props.sessionExpiry
+		}
+	}
+	sessClean := expiry == 0
 	// Session present? Assume false, will be set to true only when applicable.
 	sessp := false
 	// Do we have an existing session for this client ID
@@ -4988,9 +5405,17 @@ CHECK:
 		}
 	}
 	if exists {
+		// An overdue session must not be resumed even when this reconnect beat
+		// a late expiry timer to the in-memory copy (the record-restore path
+		// has the same check). Spec5 [3.1.2.11.2].
+		es.mu.Lock()
+		overdue := es.disconnectedAt > 0 && es.expiryInterval > 0 &&
+			es.expiryInterval != mqttSessionNeverExpire &&
+			time.Now().Unix() >= es.disconnectedAt+int64(es.expiryInterval)
+		es.mu.Unlock()
 		// Clear the session if client wants a clean session.
 		// Also, Spec [MQTT-3.2.2-1]: don't report session present
-		if cleanSess || es.clean {
+		if cleanSess || es.clean || overdue {
 			// Spec [MQTT-3.1.2-6]: If CleanSession is set to 1, the Client and
 			// Server MUST discard any previous Session and start a new one.
 			// This Session lasts as long as the Network Connection. State data
@@ -5012,7 +5437,9 @@ CHECK:
 		es.mu.Lock()
 		ec := es.c
 		es.c = c
-		es.clean = cleanSess
+		es.clean = sessClean
+		es.expiryInterval = expiry
+		es.disconnectedAt = 0
 		// Clear this flag so we resubscribe to PUBREL subject is needed.
 		es.pubRelSubscribed = false
 		if sessp {
@@ -5042,7 +5469,9 @@ CHECK:
 		// Spec [MQTT-3.2.2-3]: if the Server does not have stored Session state,
 		// it MUST set Session Present to 0 in the CONNACK packet.
 		es.mu.Lock()
-		es.c, es.clean = c, cleanSess
+		es.c, es.clean = c, sessClean
+		es.expiryInterval = expiry
+		es.disconnectedAt = 0
 		es.mu.Unlock()
 		// Now add this new session into the account sessions
 		asm.addSession(es, true)
@@ -5085,6 +5514,9 @@ CHECK:
 	// session on disconnect). Done only on success so a failed CONNECT does not
 	// suppress the prior Will. Keyed by client ID hash. Spec5 [MQTT-3.1.2-8].
 	asm.cancelWill(getHash(cid))
+	// Likewise cancel any pending session-expiry timer: this connection has resumed
+	// (or replaced) the session before it expired. Spec5 [3.1.2.11.2].
+	asm.cancelSessionExpiry(getHash(cid))
 	c.mu.Lock()
 	c.flags.set(connectReceived)
 	c.mqtt.cp = cp
@@ -5248,7 +5680,7 @@ func mqttConnAckReasonFromConnectErr(err error) byte {
 // MQTT 5.0 client that set a Will Delay Interval on a session that survives the
 // connection, publication is deferred so a timely reconnect can cancel it. Spec5
 // [3.1.3.2.2], [MQTT-3.1.2-8].
-func (s *Server) mqttHandleWill(c *client) {
+func (s *Server) mqttHandleWill(c *client, sessionExpiry uint32) {
 	c.mu.Lock()
 	if c.mqtt.cp == nil {
 		c.mu.Unlock()
@@ -5260,22 +5692,23 @@ func (s *Server) mqttHandleWill(c *client) {
 		return
 	}
 	// MQTT 5.0 Will Delay Interval: defer publication when a delay is set and the
-	// session survives the connection. The session survives iff its Session
-	// Expiry Interval is non-zero; a zero (or absent) interval ends the session
-	// at connection close, so the Will is published immediately. The pending Will
-	// is tracked on the account manager keyed by client ID (not on the session
-	// object, which a clean-start client removes on disconnect) so a reconnect
-	// can cancel it. Spec5 [3.1.3.2.2], [MQTT-3.1.2-8].
-	// TODO(v5 session-expiry): once Session Expiry Interval is honored for
-	// session cleanup, cap the effective delay at min(willDelay, sessionExpiry).
-	var sessionExpiry uint32
-	if c.mqtt.cp.props != nil {
-		sessionExpiry = c.mqtt.cp.props.sessionExpiry
-	}
+	// session survives the connection. The session survives iff its (effective)
+	// Session Expiry Interval is non-zero; a zero interval ends the session at
+	// connection close, so the Will is published immediately. The pending Will is
+	// tracked on the account manager keyed by client ID (not on the session object,
+	// which a clean-start client removes on disconnect) so a reconnect can cancel
+	// it. Spec5 [3.1.3.2.2], [MQTT-3.1.2-8].
 	if c.mqtt.proto == mqttProtoLevel5 && will.props != nil && will.props.willDelay > 0 && sessionExpiry > 0 {
 		asm := c.mqtt.asm
 		sess := c.mqtt.sess
-		delay := time.Duration(will.props.willDelay) * time.Second
+		// Spec5 [3.1.3.2.2]: publish at the Will Delay Interval OR when the session
+		// ends, whichever is first, so cap the delay at the Session Expiry Interval.
+		// (mqttSessionNeverExpire, being the max uint32, never lowers the delay.)
+		effDelay := will.props.willDelay
+		if sessionExpiry < effDelay {
+			effDelay = sessionExpiry
+		}
+		delay := time.Duration(effDelay) * time.Second
 		// Capture the publisher's identity so the deferred publish is still
 		// permission-checked once the client is gone. Keyed by client ID hash so
 		// a remote takeover (session-persist callback) can also cancel it.

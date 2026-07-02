@@ -2456,8 +2456,11 @@ func TestMQTTv5QoS1MessageExpires(t *testing.T) {
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
 
-	// A persistent session subscribes, then goes offline.
-	cs, rs := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "qexp-sub", cleanStart: false}, o.MQTT.Host, o.MQTT.Port)
+	// A persistent session subscribes, then goes offline. In MQTT 5.0 a session
+	// persists past disconnect only with a non-zero Session Expiry Interval (an
+	// absent interval defaults to 0, ending the session at close). Spec5 [3.1.2.11.2].
+	cs, rs := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "qexp-sub", cleanStart: false,
+		props: mqttV5ConnPropsSessionExpiry(300)}, o.MQTT.Host, o.MQTT.Port)
 	testMQTTReadConnAckV5(t, rs)
 	testMQTTSubV5(t, cs, rs, 1, []mqttV5SubFilter{{topic: "qexp/topic", opts: 1}})
 	cs.Close()
@@ -2470,7 +2473,8 @@ func TestMQTTv5QoS1MessageExpires(t *testing.T) {
 	time.Sleep(2200 * time.Millisecond)
 
 	// Reconnect the persistent session: the expired message must not arrive.
-	cs2, rs2 := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "qexp-sub", cleanStart: false}, o.MQTT.Host, o.MQTT.Port)
+	cs2, rs2 := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "qexp-sub", cleanStart: false,
+		props: mqttV5ConnPropsSessionExpiry(300)}, o.MQTT.Host, o.MQTT.Port)
 	defer cs2.Close()
 	if sp, _, _ := testMQTTReadConnAckV5(t, rs2); !sp {
 		t.Fatal("expected the session to be present on reconnect")
@@ -2883,4 +2887,637 @@ func TestMQTTv5WillDelaySurvivesRestart(t *testing.T) {
 			})
 		})
 	}
+}
+
+// testMQTTHasPendingExpiry reports whether a session-expiry timer is armed for
+// targetClientID on the account session manager (reached via a live client sharing
+// the account). Checking a specific client, rather than a total count, keeps the
+// assertion robust against sessions left pending by other subtests.
+func testMQTTHasPendingExpiry(t testing.TB, s *Server, liveClientID, targetClientID string) bool {
+	t.Helper()
+	c := testMQTTGetClient(t, s, liveClientID)
+	asm := c.mqtt.asm
+	asm.mu.Lock()
+	defer asm.mu.Unlock()
+	_, ok := asm.pendingExpiries[getHash(targetClientID)]
+	return ok
+}
+
+// testMQTTSessionExpiry returns the effective Session Expiry Interval and the
+// derived clean flag recorded on the session of a connected client.
+func testMQTTSessionExpiry(t testing.TB, s *Server, clientID string) (uint32, bool) {
+	t.Helper()
+	c := testMQTTGetClient(t, s, clientID)
+	sess := c.mqtt.sess
+	sess.mu.Lock()
+	defer sess.mu.Unlock()
+	return sess.expiryInterval, sess.clean
+}
+
+// mqttV5DisconnectSessionExpiry crafts a v5 DISCONNECT carrying a Session Expiry
+// Interval property, used to update the session expiry at disconnect time.
+func mqttV5DisconnectSessionExpiry(reason byte, secs uint32) []byte {
+	props := newMQTTWriter(0)
+	props.WriteByte(mqttPropSessionExpiry)
+	props.WriteUint32(secs)
+	vh := newMQTTWriter(0)
+	vh.WriteByte(reason)
+	vh.WriteVarInt(props.Len())
+	vh.Write(props.Bytes())
+	w := newMQTTWriter(0)
+	w.WriteByte(mqttPacketDisconnect)
+	w.WriteVarInt(vh.Len())
+	w.Write(vh.Bytes())
+	return w.Bytes()
+}
+
+// testMQTTSessionRecordExists reports whether a session record for
+// targetClientID is present in the sessions stream, via the account session
+// manager of a live client sharing the account.
+func testMQTTSessionRecordExists(t testing.TB, s *Server, liveClientID, targetClientID string) bool {
+	t.Helper()
+	c := testMQTTGetClient(t, s, liveClientID)
+	asm := c.mqtt.asm
+	_, err := asm.jsa.loadSessionMsg(asm.domainTk, getHash(targetClientID))
+	if err != nil {
+		if isErrorOtherThan(err, JSNoMessageFoundErr) {
+			t.Fatalf("Error loading session record for %q: %v", targetClientID, err)
+		}
+		return false
+	}
+	return true
+}
+
+// A finite Session Expiry Interval must survive a server restart: the disconnect
+// time is persisted with the session record and the deadlines are re-armed (or
+// executed, if overdue) by a sweep when the account session manager is recreated.
+// Sessions that never expire are left untouched. Spec5 [3.1.2.11.2].
+func TestMQTTv5SessionExpiryPersistedAcrossRestart(t *testing.T) {
+	o := testMQTTDefaultOptionsV5()
+	s := testMQTTRunServer(t, o)
+	defer testMQTTShutdownRestartedServer(&s)
+
+	connectAndSub := func(id string, props []byte) {
+		t.Helper()
+		c, r := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: id, cleanStart: true, props: props},
+			o.MQTT.Host, o.MQTT.Port)
+		testMQTTReadConnAckV5(t, r)
+		testMQTTSubV5(t, c, r, 1, []mqttV5SubFilter{{topic: "sepr/" + id, opts: 1}})
+		c.Close()
+	}
+	// Long finite interval: must be re-armed after the restart.
+	connectAndSub("seprl", mqttV5ConnPropsSessionExpiry(300))
+	// Short finite interval: overdue by the time the server is back up.
+	connectAndSub("seprs", mqttV5ConnPropsSessionExpiry(2))
+	// Never expires: must not be swept.
+	connectAndSub("seprn", mqttV5ConnPropsSessionExpiry(mqttSessionNeverExpire))
+
+	// A live probe to reach the account session manager. Confirm both finite
+	// timers are armed, which also means the disconnect deadlines were persisted.
+	cp, rp := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "seprobe", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
+	testMQTTReadConnAckV5(t, rp)
+	checkFor(t, 2*time.Second, 15*time.Millisecond, func() error {
+		for _, id := range []string{"seprl", "seprs"} {
+			if !testMQTTHasPendingExpiry(t, s, "seprobe", id) {
+				return fmt.Errorf("expected a pending expiry for %q", id)
+			}
+		}
+		return nil
+	})
+	cp.Close()
+
+	// Restart the server on the same store: all in-memory timers are lost.
+	dir := strings.TrimSuffix(s.JetStreamConfig().StoreDir, JetStreamStoreDir)
+	s.Shutdown()
+	o.Port = -1
+	o.MQTT.Port = -1
+	o.StoreDir = dir
+	s = testMQTTRunServer(t, o)
+
+	// The sweep runs when the first MQTT connect recreates the account session
+	// manager.
+	cp2, rp2 := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "seprobe", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
+	defer cp2.Close()
+	testMQTTReadConnAckV5(t, rp2)
+
+	// The long session's timer is re-armed; the overdue one is cleaned up (its
+	// record deleted); the never-expiring one is left alone.
+	checkFor(t, 4*time.Second, 15*time.Millisecond, func() error {
+		if !testMQTTHasPendingExpiry(t, s, "seprobe", "seprl") {
+			return fmt.Errorf("expected the pending expiry for seprl to be re-armed")
+		}
+		if testMQTTSessionRecordExists(t, s, "seprobe", "seprs") {
+			return fmt.Errorf("expected the overdue seprs session record to be deleted")
+		}
+		return nil
+	})
+	if testMQTTHasPendingExpiry(t, s, "seprobe", "seprn") {
+		t.Fatal("did not expect a pending expiry for the never-expiring session")
+	}
+	if !testMQTTSessionRecordExists(t, s, "seprobe", "seprn") {
+		t.Fatal("expected the never-expiring session record to be present")
+	}
+
+	// And the client-visible outcome: the long and never-expiring sessions resume,
+	// the overdue one is gone.
+	for _, tc := range []struct {
+		id    string
+		props []byte
+		sp    bool
+	}{
+		{"seprl", mqttV5ConnPropsSessionExpiry(300), true},
+		{"seprs", nil, false},
+		{"seprn", mqttV5ConnPropsSessionExpiry(mqttSessionNeverExpire), true},
+	} {
+		c, r := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: tc.id, props: tc.props}, o.MQTT.Host, o.MQTT.Port)
+		sp, _, _ := testMQTTReadConnAckV5(t, r)
+		c.Close()
+		if sp != tc.sp {
+			t.Fatalf("expected session-present=%v for %q, got %v", tc.sp, tc.id, sp)
+		}
+	}
+}
+
+// A stale remote session-persist ack (an older stream sequence than the local
+// session's) must not cancel the local expiry timer; a newer one is a takeover
+// and must.
+func TestMQTTv5SessionExpiryStalePersistAck(t *testing.T) {
+	o := testMQTTDefaultOptionsV5()
+	s := testMQTTRunServer(t, o)
+	defer testMQTTShutdownServer(s)
+
+	cp, rp := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "seprobe3", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
+	defer cp.Close()
+	testMQTTReadConnAckV5(t, rp)
+
+	c, r := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "sestale", cleanStart: true,
+		props: mqttV5ConnPropsSessionExpiry(30)}, o.MQTT.Host, o.MQTT.Port)
+	testMQTTReadConnAckV5(t, r)
+	c.Close()
+	checkFor(t, 2*time.Second, 15*time.Millisecond, func() error {
+		if !testMQTTHasPendingExpiry(t, s, "seprobe3", "sestale") {
+			return fmt.Errorf("expected a pending expiry for sestale")
+		}
+		return nil
+	})
+
+	asm := testMQTTGetAccountSessionManager(t, s, "seprobe3")
+	hash := getHash("sestale")
+	asm.mu.RLock()
+	sess := asm.sessByHash[hash]
+	asm.mu.RUnlock()
+	require_NotNil(t, sess)
+	sess.mu.Lock()
+	seq := sess.seq
+	sess.mu.Unlock()
+
+	// Deliver a crafted remote persist ack to the callback.
+	deliverAck := func(ackSeq uint64) {
+		t.Helper()
+		b, err := json.Marshal(&JSPubAckResponse{PubAck: &PubAck{Stream: mqttSessStreamName, Sequence: ackSeq}})
+		require_NoError(t, err)
+		subject := mqttJSARepliesPrefix + "remoteid." + mqttJSASessPersist + "." + hash + ".reply"
+		// pc is only used for msgParts; a fresh client has no header parse state.
+		asm.processSessionPersist(nil, &client{}, nil, subject, _EMPTY_, append(b, CR_LF...))
+	}
+
+	// Stale ack: timer and session must survive.
+	deliverAck(seq - 1)
+	if !testMQTTHasPendingExpiry(t, s, "seprobe3", "sestale") {
+		t.Fatal("expected the pending expiry to survive a stale persist ack")
+	}
+
+	// Newer ack: remote takeover, timer cancelled and session dropped.
+	deliverAck(seq + 1)
+	if testMQTTHasPendingExpiry(t, s, "seprobe3", "sestale") {
+		t.Fatal("expected the pending expiry cancelled by a newer persist ack")
+	}
+	asm.mu.RLock()
+	_, still := asm.sessByHash[hash]
+	asm.mu.RUnlock()
+	if still {
+		t.Fatal("expected the session removed by a newer persist ack")
+	}
+}
+
+// When a stale in-memory expiry timer fires and the persisted record has been
+// bumped past our sequence, our copy is stale, so expireSession drops it and lets
+// the authoritative record-based path decide: a connected record
+// (DisconnectedAt==0, a takeover elsewhere) is left intact; a disconnected but
+// not-yet-due record is re-armed rather than cleaned early; a due one is cleaned
+// up (using the record's own sequence). Spec5 [3.1.2.11.2].
+func TestMQTTv5SessionExpiryStaleTimerRecordState(t *testing.T) {
+	for _, test := range []struct {
+		name        string
+		disconnAt   func() int64 // newer record's DisconnectedAt (0 == connected)
+		wantRecord  bool         // record still present after the timer fired
+		wantReArmed bool         // a new expiry timer was armed
+	}{
+		{"connected takeover keeps state", func() int64 { return 0 }, true, false},
+		{"not-yet-due record is re-armed", func() int64 { return time.Now().Unix() }, true, true},
+		{"due record is cleaned up", func() int64 { return time.Now().Unix() - 200 }, false, false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			o := testMQTTDefaultOptionsV5()
+			s := testMQTTRunServer(t, o)
+			defer testMQTTShutdownServer(s)
+
+			// Probe keeps the account session manager alive.
+			cp, rp := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "seh4probe", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
+			defer cp.Close()
+			testMQTTReadConnAckV5(t, rp)
+
+			// Persistent session with a long Session Expiry Interval; subscribe
+			// (creates a consumer), then disconnect so an expiry timer is armed and
+			// the session is kept with sess.c == nil.
+			c, r := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "seh4", cleanStart: false,
+				props: mqttV5ConnPropsSessionExpiry(100)}, o.MQTT.Host, o.MQTT.Port)
+			testMQTTReadConnAckV5(t, r)
+			testMQTTSubV5(t, c, r, 1, []mqttV5SubFilter{{topic: "seh4/t", opts: 1}})
+			c.Close()
+			checkFor(t, 2*time.Second, 15*time.Millisecond, func() error {
+				if !testMQTTHasPendingExpiry(t, s, "seh4probe", "seh4") {
+					return fmt.Errorf("expected a pending expiry for seh4")
+				}
+				return nil
+			})
+
+			asm := testMQTTGetAccountSessionManager(t, s, "seh4probe")
+			hash := getHash("seh4")
+
+			// Rewrite the record (bumping the stream sequence past ours) as another
+			// server would, while this server still holds the session and its timer.
+			ps := mqttPersistedSession{Origin: "remote", ID: "seh4", ExpiryInterval: 100, DisconnectedAt: test.disconnAt()}
+			b, err := json.Marshal(&ps)
+			require_NoError(t, err)
+			_, err = asm.jsa.storeSessionMsg(asm.domainTk, hash, 0, b)
+			require_NoError(t, err)
+
+			// The stale timer fires.
+			asm.expireSession(s, hash)
+
+			recordPresent := func() bool {
+				_, err := asm.jsa.loadSessionMsg(asm.domainTk, hash)
+				return err == nil
+			}
+			if test.wantRecord {
+				require_True(t, recordPresent())
+			} else {
+				// Cleanup deletes the record asynchronously.
+				checkFor(t, 2*time.Second, 15*time.Millisecond, func() error {
+					if recordPresent() {
+						return fmt.Errorf("expected the session record to be deleted")
+					}
+					return nil
+				})
+			}
+			if got := testMQTTHasPendingExpiry(t, s, "seh4probe", "seh4"); got != test.wantReArmed {
+				t.Fatalf("re-armed=%v, want %v", got, test.wantReArmed)
+			}
+		})
+	}
+}
+
+// An overdue session must not be resumed even when its own client is the first
+// MQTT connect after a restart, i.e. when the reconnect races (and beats) the
+// async startup sweep: the restore path checks the deadline synchronously.
+func TestMQTTv5SessionExpiryExpiredFirstReconnect(t *testing.T) {
+	o := testMQTTDefaultOptionsV5()
+	s := testMQTTRunServer(t, o)
+	defer testMQTTShutdownRestartedServer(&s)
+
+	// QoS2 subscriber-side receive: PUBLISH -> PUBREC -> PUBREL -> PUBCOMP. The
+	// handshake makes the server create the session's PUBREL durable.
+	recvQoS2 := func(c net.Conn, r *mqttReader, payload []byte) {
+		t.Helper()
+		qos, pi := testMQTTReadPublishV5(t, r, "se/first", payload)
+		if qos != 2 {
+			t.Fatalf("expected QoS2 delivery, got %v", qos)
+		}
+		testMQTTSendPIPacket(mqttPacketPubRec, t, c, pi)
+		testMQTTReadPIPacket(mqttPacketPubRel, t, r, pi)
+		testMQTTSendPIPacket(mqttPacketPubComp, t, c, pi)
+	}
+
+	cpub, rpub := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "sefpub", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
+	defer cpub.Close()
+	testMQTTReadConnAckV5(t, rpub)
+
+	c, r := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "sefirst", cleanStart: true,
+		props: mqttV5ConnPropsSessionExpiry(1)}, o.MQTT.Host, o.MQTT.Port)
+	testMQTTReadConnAckV5(t, r)
+	testMQTTSubV5(t, c, r, 1, []mqttV5SubFilter{{topic: "se/first", opts: 2}})
+	// Receive one QoS2 message so the PUBREL durable exists in the old session.
+	testMQTTPubV5Props(t, cpub, rpub, 2, false, 10, "se/first", []byte("m1"), nil)
+	recvQoS2(c, r, []byte("m1"))
+	c.Close()
+
+	// Wait for the disconnect deadline to be persisted (the timer is armed after
+	// the save) before shutting down.
+	cp, rp := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "seprobe2", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
+	testMQTTReadConnAckV5(t, rp)
+	checkFor(t, 2*time.Second, 15*time.Millisecond, func() error {
+		if !testMQTTHasPendingExpiry(t, s, "seprobe2", "sefirst") {
+			return fmt.Errorf("expected a pending expiry for sefirst")
+		}
+		return nil
+	})
+	cp.Close()
+	cpub.Close()
+
+	// Restart on the same store, and make sure the session is overdue.
+	dir := strings.TrimSuffix(s.JetStreamConfig().StoreDir, JetStreamStoreDir)
+	s.Shutdown()
+	time.Sleep(1500 * time.Millisecond)
+	o.Port = -1
+	o.MQTT.Port = -1
+	o.StoreDir = dir
+	s = testMQTTRunServer(t, o)
+
+	// First MQTT connect is the expired client itself: no session present.
+	c2, r2 := testMQTTConnectRetryV5(t, &mqttV5ConnInfo{clientID: "sefirst",
+		props: mqttV5ConnPropsSessionExpiry(1)}, o.MQTT.Host, o.MQTT.Port, 3)
+	defer c2.Close()
+	if sp, _, _ := testMQTTReadConnAckV5(t, r2); sp {
+		t.Fatal("expected session-present=false for an expired session on first reconnect")
+	}
+
+	// Immediately exercise QoS2 again: the fresh session recreates the same
+	// deterministic PUBREL durable; the expired cleanup must not delete it.
+	testMQTTSubV5(t, c2, r2, 1, []mqttV5SubFilter{{topic: "se/first", opts: 2}})
+	cpub2, rpub2 := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "sefpub", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
+	defer cpub2.Close()
+	testMQTTReadConnAckV5(t, rpub2)
+	testMQTTPubV5Props(t, cpub2, rpub2, 2, false, 11, "se/first", []byte("m2"), nil)
+	recvQoS2(c2, r2, []byte("m2"))
+}
+
+// The MQTT 5.0 Session Expiry Interval controls how long a session survives after
+// the network connection closes: 0 ends it at close, a finite value keeps it for
+// that many seconds (then it is cleaned up), and it is orthogonal to Clean Start.
+// A DISCONNECT may update the interval. Spec5 [3.1.2.11.2], [3.14.2.2.2].
+func TestMQTTv5SessionExpiry(t *testing.T) {
+	o := testMQTTDefaultOptionsV5()
+	s := testMQTTRunServer(t, o)
+	defer testMQTTShutdownServer(s)
+
+	// A probe client kept connected for the whole test so the account session
+	// manager is reachable via testMQTTGetClient after a target disconnects.
+	cp, rp := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "seprobe", cleanStart: true,
+		props: mqttV5ConnPropsSessionExpiry(0)}, o.MQTT.Host, o.MQTT.Port)
+	defer cp.Close()
+	testMQTTReadConnAckV5(t, rp)
+
+	t.Run("zero expiry ends session at close", func(t *testing.T) {
+		c, r := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "sez", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
+		testMQTTReadConnAckV5(t, r)
+		testMQTTSubV5(t, c, r, 1, []mqttV5SubFilter{{topic: "se/z", opts: 1}})
+		if exp, clean := testMQTTSessionExpiry(t, s, "sez"); exp != 0 || !clean {
+			t.Fatalf("expected expiry=0 clean=true, got expiry=%d clean=%v", exp, clean)
+		}
+		c.Close()
+		// Reconnect (clean start=0): the session must be gone (session present=0).
+		c2, r2 := testMQTTConnectRetryV5(t, &mqttV5ConnInfo{clientID: "sez"}, o.MQTT.Host, o.MQTT.Port, 3)
+		defer c2.Close()
+		if sp, _, _ := testMQTTReadConnAckV5(t, r2); sp {
+			t.Fatal("expected session-present=false after a zero-expiry session closed")
+		}
+	})
+
+	t.Run("finite expiry survives and reconnect resumes", func(t *testing.T) {
+		c, r := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "sef", cleanStart: true,
+			props: mqttV5ConnPropsSessionExpiry(30)}, o.MQTT.Host, o.MQTT.Port)
+		testMQTTReadConnAckV5(t, r)
+		testMQTTSubV5(t, c, r, 1, []mqttV5SubFilter{{topic: "se/f", opts: 0}})
+		c.Close()
+
+		// The session outlives the connection: a timer is armed and the session is
+		// still tracked.
+		checkFor(t, 2*time.Second, 15*time.Millisecond, func() error {
+			if !testMQTTHasPendingExpiry(t, s, "seprobe", "sef") {
+				return fmt.Errorf("expected a pending expiry for sef")
+			}
+			return nil
+		})
+
+		// Reconnect within the window: session present and the pending expiry
+		// cancelled.
+		c2, r2 := testMQTTConnectRetryV5(t, &mqttV5ConnInfo{clientID: "sef",
+			props: mqttV5ConnPropsSessionExpiry(30)}, o.MQTT.Host, o.MQTT.Port, 3)
+		defer c2.Close()
+		if sp, _, _ := testMQTTReadConnAckV5(t, r2); !sp {
+			t.Fatal("expected session-present=true on reconnect within the expiry window")
+		}
+		checkFor(t, 2*time.Second, 15*time.Millisecond, func() error {
+			if testMQTTHasPendingExpiry(t, s, "seprobe", "sef") {
+				return fmt.Errorf("expected pending expiry for sef cancelled")
+			}
+			return nil
+		})
+	})
+
+	t.Run("expiry fires and cleans up the session", func(t *testing.T) {
+		c, r := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "seexp", cleanStart: true,
+			props: mqttV5ConnPropsSessionExpiry(1)}, o.MQTT.Host, o.MQTT.Port)
+		testMQTTReadConnAckV5(t, r)
+		testMQTTSubV5(t, c, r, 1, []mqttV5SubFilter{{topic: "se/exp", opts: 1}})
+		c.Close()
+		checkFor(t, 2*time.Second, 15*time.Millisecond, func() error {
+			if !testMQTTHasPendingExpiry(t, s, "seprobe", "seexp") {
+				return fmt.Errorf("expected a pending expiry for seexp")
+			}
+			return nil
+		})
+
+		// The 1s timer fires and cleans up the session state: the record is
+		// deleted and the pending timer is consumed.
+		checkFor(t, 4*time.Second, 50*time.Millisecond, func() error {
+			if testMQTTSessionRecordExists(t, s, "seprobe", "seexp") {
+				return fmt.Errorf("expected the seexp session record to be deleted")
+			}
+			return nil
+		})
+		if testMQTTHasPendingExpiry(t, s, "seprobe", "seexp") {
+			t.Fatal("expected pending expiry for seexp removed after firing")
+		}
+
+		// The session state is gone: a clean-start=0 reconnect reports no session.
+		c2, r2 := testMQTTConnectRetryV5(t, &mqttV5ConnInfo{clientID: "seexp"}, o.MQTT.Host, o.MQTT.Port, 3)
+		defer c2.Close()
+		if sp, _, _ := testMQTTReadConnAckV5(t, r2); sp {
+			t.Fatal("expected session-present=false after the session expired")
+		}
+	})
+
+	t.Run("clean start with non-zero expiry is durable", func(t *testing.T) {
+		// Clean Start=1 (fresh session now) but Session Expiry>0 (keep it after
+		// disconnect): the session must be durable, not ephemeral.
+		c, r := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "sed", cleanStart: true,
+			props: mqttV5ConnPropsSessionExpiry(30)}, o.MQTT.Host, o.MQTT.Port)
+		testMQTTReadConnAckV5(t, r)
+		testMQTTSubV5(t, c, r, 1, []mqttV5SubFilter{{topic: "se/d", opts: 0}})
+		if exp, clean := testMQTTSessionExpiry(t, s, "sed"); exp != 30 || clean {
+			t.Fatalf("expected expiry=30 clean=false (durable), got expiry=%d clean=%v", exp, clean)
+		}
+		c.Close()
+		// Reconnect with clean start=0 resumes the durable session.
+		c2, r2 := testMQTTConnectRetryV5(t, &mqttV5ConnInfo{clientID: "sed",
+			props: mqttV5ConnPropsSessionExpiry(30)}, o.MQTT.Host, o.MQTT.Port, 3)
+		defer c2.Close()
+		if sp, _, _ := testMQTTReadConnAckV5(t, r2); !sp {
+			t.Fatal("expected session-present=true resuming a clean-start durable session")
+		}
+	})
+
+	t.Run("disconnect overrides expiry to zero", func(t *testing.T) {
+		c, r := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "seo", cleanStart: true,
+			props: mqttV5ConnPropsSessionExpiry(30)}, o.MQTT.Host, o.MQTT.Port)
+		testMQTTReadConnAckV5(t, r)
+		testMQTTSubV5(t, c, r, 1, []mqttV5SubFilter{{topic: "se/o", opts: 1}})
+		// A DISCONNECT lowering the interval to 0 ends the session at close.
+		if _, err := testMQTTWrite(c, mqttV5DisconnectSessionExpiry(mqttReasonSuccess, 0)); err != nil {
+			t.Fatalf("Error writing DISCONNECT: %v", err)
+		}
+		c.Close()
+		c2, r2 := testMQTTConnectRetryV5(t, &mqttV5ConnInfo{clientID: "seo"}, o.MQTT.Host, o.MQTT.Port, 3)
+		defer c2.Close()
+		if sp, _, _ := testMQTTReadConnAckV5(t, r2); sp {
+			t.Fatal("expected session-present=false after DISCONNECT lowered expiry to 0")
+		}
+	})
+
+	t.Run("disconnect cannot raise expiry from zero", func(t *testing.T) {
+		// Spec5 [3.14.2.2.2]: raising a zero CONNECT interval on DISCONNECT is a
+		// Protocol Error; we ignore the override and still end the session at close.
+		c, r := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "seg", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
+		testMQTTReadConnAckV5(t, r)
+		testMQTTSubV5(t, c, r, 1, []mqttV5SubFilter{{topic: "se/g", opts: 1}})
+		if _, err := testMQTTWrite(c, mqttV5DisconnectSessionExpiry(mqttReasonSuccess, 30)); err != nil {
+			t.Fatalf("Error writing DISCONNECT: %v", err)
+		}
+		c.Close()
+		c2, r2 := testMQTTConnectRetryV5(t, &mqttV5ConnInfo{clientID: "seg"}, o.MQTT.Host, o.MQTT.Port, 3)
+		defer c2.Close()
+		if sp, _, _ := testMQTTReadConnAckV5(t, r2); sp {
+			t.Fatal("expected session-present=false: a 0->non-zero DISCONNECT override must be ignored")
+		}
+	})
+
+	t.Run("will delay is capped by session expiry", func(t *testing.T) {
+		cs, rs := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "sewsub", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
+		defer cs.Close()
+		testMQTTReadConnAckV5(t, rs)
+		testMQTTSubV5(t, cs, rs, 1, []mqttV5SubFilter{{topic: "se/will", opts: 0}})
+
+		// Will Delay Interval 10s but Session Expiry Interval 1s: the Will must fire
+		// when the session ends (~1s), not at 10s. Spec5 [3.1.3.2.2].
+		will := &mqttWill{topic: []byte("se/will"), message: []byte("bye"), qos: 0}
+		cw, rw := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "sewill", cleanStart: true, will: will,
+			willProps: mqttV5WillDelayProps(10), props: mqttV5ConnPropsSessionExpiry(1)}, o.MQTT.Host, o.MQTT.Port)
+		testMQTTReadConnAckV5(t, rw)
+		cw.Close()
+
+		// Bound the wait well under the 10s Will Delay so an uncapped delay fails.
+		cs.SetReadDeadline(time.Now().Add(5 * time.Second))
+		testMQTTReadPublishV5(t, rs, "se/will", []byte("bye"))
+		cs.SetReadDeadline(time.Time{})
+	})
+}
+
+// A reconnect that beats a late expiry timer to an overdue in-memory session
+// must not resume it: the session is discarded, like on the record-restore
+// path. Spec5 [3.1.2.11.2].
+func TestMQTTv5SessionExpiryOverdueInMemoryResume(t *testing.T) {
+	o := testMQTTDefaultOptionsV5()
+	s := testMQTTRunServer(t, o)
+	defer testMQTTShutdownServer(s)
+
+	// Auxiliary connected client to reach the account session manager.
+	ca, ra := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "odraux", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
+	defer ca.Close()
+	testMQTTReadConnAckV5(t, ra)
+
+	// Durable v5 session with a subscription and a finite expiry.
+	c1, r1 := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "odr", props: mqttV5ConnPropsSessionExpiry(120)}, o.MQTT.Host, o.MQTT.Port)
+	testMQTTReadConnAckV5(t, r1)
+	testMQTTSubV5(t, c1, r1, 1, []mqttV5SubFilter{{topic: "odr/t", opts: 1}})
+	c1.Close()
+
+	// Wait for the disconnect to be recorded, then simulate a late expiry
+	// timer: backdate the deadline past due and drop the armed timer.
+	asm := testMQTTGetAccountSessionManager(t, s, "odraux")
+	idHash := getHash("odr")
+	var sess *mqttSession
+	checkFor(t, 2*time.Second, 15*time.Millisecond, func() error {
+		asm.mu.RLock()
+		sess = asm.sessByHash[idHash]
+		asm.mu.RUnlock()
+		if sess == nil {
+			return fmt.Errorf("session not in memory")
+		}
+		sess.mu.Lock()
+		defer sess.mu.Unlock()
+		if sess.disconnectedAt == 0 {
+			return fmt.Errorf("disconnect not recorded yet")
+		}
+		return nil
+	})
+	sess.mu.Lock()
+	sess.disconnectedAt = time.Now().Unix() - 500
+	sess.mu.Unlock()
+	asm.cancelSessionExpiry(idHash)
+
+	// The reconnect must get a fresh session, not the overdue one.
+	c2, r2 := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "odr", props: mqttV5ConnPropsSessionExpiry(120)}, o.MQTT.Host, o.MQTT.Port)
+	defer c2.Close()
+	sp, reason, _ := testMQTTReadConnAckV5(t, r2)
+	if reason != mqttReasonSuccess {
+		t.Fatalf("Expected successful CONNACK, got reason 0x%x", reason)
+	}
+	if sp {
+		t.Fatal("Expected session-present=0 for an overdue session")
+	}
+}
+
+// A session record left with DisconnectedAt=0 by an owner that crashed while
+// the client was connected is stamped by the periodic sweep and expired, so a
+// finite Session Expiry Interval is eventually honored.
+func TestMQTTv5SessionExpiryOwnerCrashSweep(t *testing.T) {
+	old := mqttSessionExpirySweepInterval
+	mqttSessionExpirySweepInterval = 250 * time.Millisecond
+	defer func() { mqttSessionExpirySweepInterval = old }()
+
+	o := testMQTTDefaultOptionsV5()
+	s := testMQTTRunServer(t, o)
+	defer testMQTTShutdownServer(s)
+
+	// First MQTT connect creates the account session manager (and its sweeper).
+	c, r := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "crashaux", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
+	defer c.Close()
+	testMQTTReadConnAckV5(t, r)
+
+	// Plant an orphaned record: finite expiry, never marked disconnected —
+	// what a crash mid-connection leaves behind. The Origin deliberately does
+	// not match this process: standalone node names are generated, so after a
+	// real restart the crashed owner's name never matches, and the sweep must
+	// still reclaim the record.
+	nc, js := jsClientConnect(t, s)
+	defer nc.Close()
+	rec, err := json.Marshal(&mqttPersistedSession{ID: "ghost", Origin: "crashed-node", ExpiryInterval: 1})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	ghostSubj := mqttSessStreamSubjectPrefix + getHash("ghost")
+	if _, err := js.Publish(ghostSubj, rec); err != nil {
+		t.Fatalf("plant ghost record: %v", err)
+	}
+
+	// The periodic sweep stamps the disconnect, arms the 1s deadline, and the
+	// expiry deletes the record.
+	checkFor(t, 10*time.Second, 100*time.Millisecond, func() error {
+		if _, err := js.GetLastMsg(mqttSessStreamName, ghostSubj); err == nil {
+			return fmt.Errorf("ghost session record still present")
+		}
+		return nil
+	})
 }
