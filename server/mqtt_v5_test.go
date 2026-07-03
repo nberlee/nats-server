@@ -310,6 +310,48 @@ func testMQTTPubV5SelfEcho(t testing.TB, c net.Conn, r *mqttReader, pi uint16, t
 	}
 }
 
+// testMQTTReadPubCheckRetainV5 reads a delivered v5 PUBLISH, validates its
+// topic, payload and RETAIN flag, and acks a QoS1 delivery.
+func testMQTTReadPubCheckRetainV5(t testing.TB, c net.Conn, r *mqttReader, expTopic string, expPayload []byte, expRetain bool) {
+	t.Helper()
+	b, pl := testMQTTReadPacket(t, r)
+	if pt := b & mqttPacketMask; pt != mqttPacketPub {
+		t.Fatalf("Expected PUBLISH (%x), got %x", mqttPacketPub, pt)
+	}
+	if got := b&mqttPubFlagRetain != 0; got != expRetain {
+		t.Fatalf("Expected RETAIN=%v for %q, got %v", expRetain, expTopic, got)
+	}
+	start := r.pos
+	qos := mqttGetQoS(b & mqttPacketFlagMask)
+	topic, err := r.readBytes("topic", false)
+	if err != nil {
+		t.Fatalf("Error reading topic: %v", err)
+	}
+	if string(topic) != expTopic {
+		t.Fatalf("Expected topic %q, got %q", expTopic, topic)
+	}
+	var pi uint16
+	if qos > 0 {
+		if pi, err = r.readUint16("pi"); err != nil {
+			t.Fatalf("Error reading pi: %v", err)
+		}
+	}
+	if _, err := r.readProperties(mqttPacketPub); err != nil {
+		t.Fatalf("Error reading PUBLISH properties: %v", err)
+	}
+	got := r.buf[r.pos : start+pl]
+	if string(got) != string(expPayload) {
+		t.Fatalf("Expected payload %q, got %q", expPayload, got)
+	}
+	r.pos = start + pl
+	if qos == 1 {
+		pa := [4]byte{mqttPacketPubAck, 0x2, byte(pi >> 8), byte(pi)}
+		if _, err := testMQTTWrite(c, pa[:]); err != nil {
+			t.Fatalf("Error writing PUBACK: %v", err)
+		}
+	}
+}
+
 // testMQTTReadPublishV5 reads a PUBLISH delivered by the server to a v5 client
 // and validates the topic and payload. It returns the QoS and packet id.
 func testMQTTReadPublishV5(t testing.TB, r *mqttReader, expTopic string, expPayload []byte) (byte, uint16) {
@@ -1223,12 +1265,11 @@ func TestMQTTv5InteropWith311Publisher(t *testing.T) {
 	testMQTTReadPublishV5(t, rs, "interop", []byte("from-311"))
 }
 
-// A SUBSCRIBE must be rejected (not silently ACKed) when it sets a v5
-// subscription option this server does not honor: Retain As Published is not
-// yet implemented, a Retain Handling value of 3 is reserved (Protocol Error),
-// and the options byte's reserved bits 6-7 are a Malformed Packet. Retain
-// Handling 0/1/2 are covered by TestMQTTv5RetainHandling and No Local by
-// TestMQTTv5NoLocal.
+// A SUBSCRIBE must be rejected (not silently ACKed) for an invalid v5
+// subscription options byte: a Retain Handling value of 3 is reserved (Protocol
+// Error), and the reserved bits 6-7 are a Malformed Packet. The honored options
+// are covered by TestMQTTv5RetainHandling, TestMQTTv5NoLocal and
+// TestMQTTv5RetainAsPublished.
 func TestMQTTv5RejectsUnsupportedSubOptions(t *testing.T) {
 	o := testMQTTDefaultOptionsV5()
 	s := testMQTTRunServer(t, o)
@@ -1239,9 +1280,8 @@ func TestMQTTv5RejectsUnsupportedSubOptions(t *testing.T) {
 		opts      byte
 		expReason byte
 	}{
-		{"retain as published", 0x08, mqttReasonUnspecifiedError},
 		{"retain handling 3 reserved", 0x30, mqttReasonProtocolError},
-		{"retain handling 3 with retain as published", 0x38, mqttReasonProtocolError},
+		{"retain handling 3 with other option bits", 0x3C, mqttReasonProtocolError},
 		{"reserved bit 6", 0x40, mqttReasonMalformedPacket},
 		{"reserved bit 7", 0x80, mqttReasonMalformedPacket},
 	} {
@@ -1390,6 +1430,123 @@ func TestMQTTv5RetainHandling(t *testing.T) {
 		// Exactly one retained delivery (via ov/+), then nothing more.
 		testMQTTReadPubV5Props(t, c, r, "ov/topic", []byte("retained-ov"))
 		testMQTTExpectNothing(t, r)
+	})
+}
+
+// The v5 Retain As Published subscription option (bit 3) controls the RETAIN
+// flag on a live-forwarded message: kept as published when set, cleared when
+// not. A retained replay to a new subscription always has RETAIN=1 regardless.
+// Spec5 [3.8.3.1].
+func TestMQTTv5RetainAsPublished(t *testing.T) {
+	o := testMQTTDefaultOptionsV5()
+	s := testMQTTRunServer(t, o)
+	defer testMQTTShutdownServer(s)
+
+	const rapBit = byte(0x08)
+
+	// runRAP: with both subscriptions established, a retained publish is forwarded
+	// live keeping RETAIN only for the Retain As Published subscriber.
+	runRAP := func(t *testing.T, qos byte, prefix string) {
+		topic := prefix + "/t"
+
+		a, ra := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: prefix + "-rap", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
+		defer a.Close()
+		testMQTTReadConnAckV5(t, ra)
+		testMQTTSubV5(t, a, ra, 1, []mqttV5SubFilter{{topic: topic, opts: qos | rapBit}})
+
+		b, rb := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: prefix + "-plain", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
+		defer b.Close()
+		testMQTTReadConnAckV5(t, rb)
+		testMQTTSubV5(t, b, rb, 1, []mqttV5SubFilter{{topic: topic, opts: qos}})
+
+		p, rp := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: prefix + "-pub", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
+		defer p.Close()
+		testMQTTReadConnAckV5(t, rp)
+		testMQTTPubV5Props(t, p, rp, qos, true, 1, topic, []byte("m"), nil)
+
+		// RAP subscriber keeps RETAIN=1; the default subscriber gets RETAIN=0.
+		testMQTTReadPubCheckRetainV5(t, a, ra, topic, []byte("m"), true)
+		testMQTTReadPubCheckRetainV5(t, b, rb, topic, []byte("m"), false)
+	}
+
+	t.Run("QoS0", func(t *testing.T) { runRAP(t, 0, "rap0") })
+	t.Run("QoS1", func(t *testing.T) { runRAP(t, 1, "rap1") })
+
+	// A retained message replayed to a NEW subscription always has RETAIN=1, even
+	// when that subscription did not request Retain As Published.
+	t.Run("retained replay always sets RETAIN", func(t *testing.T) {
+		p, rp := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "rapr-pub", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
+		defer p.Close()
+		testMQTTReadConnAckV5(t, rp)
+		testMQTTPubV5Props(t, p, rp, 1, true, 1, "rapr/t", []byte("kept"), nil)
+
+		c, r := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "rapr-sub", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
+		defer c.Close()
+		testMQTTReadConnAckV5(t, r)
+		testMQTTSubV5(t, c, r, 1, []mqttV5SubFilter{{topic: "rapr/t", opts: 1}}) // no RAP
+		testMQTTReadPubCheckRetainV5(t, c, r, "rapr/t", []byte("kept"), true)
+	})
+
+	// A QoS2 retained publish keeps RETAIN through the hold/PUBREL release: the
+	// original RETAIN is restored from the stored marker on release. Subscribe at
+	// QoS1 so the capped delivery is a simple PUBACK.
+	t.Run("QoS2 publish keeps RETAIN via PUBREL", func(t *testing.T) {
+		a, ra := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "rap2-rap", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
+		defer a.Close()
+		testMQTTReadConnAckV5(t, ra)
+		testMQTTSubV5(t, a, ra, 1, []mqttV5SubFilter{{topic: "rap2/t", opts: 1 | rapBit}})
+
+		p, rp := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "rap2-pub", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
+		defer p.Close()
+		testMQTTReadConnAckV5(t, rp)
+		testMQTTPubV5Props(t, p, rp, 2, true, 1, "rap2/t", []byte("q2"), nil)
+		testMQTTReadPubCheckRetainV5(t, a, ra, "rap2/t", []byte("q2"), true)
+	})
+
+	// The Nmqtt-Ret marker is honored only when its value is exactly "1"; an
+	// explicit "0" (or junk) from a NATS publisher must not make a Retain As
+	// Published subscriber see RETAIN=1.
+	t.Run("Nmqtt-Ret not exactly 1 is not retained", func(t *testing.T) {
+		a, ra := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "rap-neg", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
+		defer a.Close()
+		testMQTTReadConnAckV5(t, ra)
+		testMQTTSubV5(t, a, ra, 1, []mqttV5SubFilter{{topic: "rapn/t", opts: rapBit}}) // QoS0 + RAP
+
+		nc := natsConnect(t, s.ClientURL())
+		defer nc.Close()
+		hdr := nats.Header{}
+		hdr.Set(mqttNatsHeader, "0")
+		hdr.Set(mqttNatsHeaderRetain, "0") // not "1": must not be treated as retained
+		if err := nc.PublishMsg(&nats.Msg{Subject: "rapn.t", Header: hdr, Data: []byte("z")}); err != nil {
+			t.Fatalf("nats publish: %v", err)
+		}
+		nc.Flush()
+		testMQTTReadPubCheckRetainV5(t, a, ra, "rapn/t", []byte("z"), false)
+	})
+
+	// Retain As Published is part of the session state and must survive a
+	// reconnect of a persistent session.
+	t.Run("survives reconnect", func(t *testing.T) {
+		ci := &mqttV5ConnInfo{clientID: "rap-persist", props: mqttV5ConnPropsSessionExpiry(30)}
+		c, r := testMQTTConnectV5(t, ci, o.MQTT.Host, o.MQTT.Port)
+		testMQTTReadConnAckV5(t, r)
+		testMQTTSubV5(t, c, r, 1, []mqttV5SubFilter{{topic: "rapp/t", opts: 1 | rapBit}})
+		if _, err := testMQTTWrite(c, []byte{mqttPacketDisconnect, 0}); err != nil {
+			t.Fatalf("Error writing DISCONNECT: %v", err)
+		}
+		c.Close()
+
+		c2, r2 := testMQTTConnectV5(t, ci, o.MQTT.Host, o.MQTT.Port)
+		defer c2.Close()
+		if sp, _, _ := testMQTTReadConnAckV5(t, r2); !sp {
+			t.Fatal("Expected session present on reconnect")
+		}
+		p, rp := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "rapp-pub", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
+		defer p.Close()
+		testMQTTReadConnAckV5(t, rp)
+		testMQTTPubV5Props(t, p, rp, 1, true, 1, "rapp/t", []byte("after"), nil)
+		// The restored subscription still keeps RETAIN as published.
+		testMQTTReadPubCheckRetainV5(t, c2, r2, "rapp/t", []byte("after"), true)
 	})
 }
 
@@ -3240,8 +3397,9 @@ func TestMQTTv5MessageExpiryMaxPayload(t *testing.T) {
 	// fixed-length HMAC tag, so its size is the same for every client here). The
 	// QoS2 dedup-hold copy carries none. Match production so the boundary is exact.
 	origin := mqttOriginMarker([]byte("k"), "id", "subj", []byte("p"))
-	delivery := mqttComputeNatsMsgSize(pp, false, mqttMessageExpiryTTL(props), origin) // QoS0/1 store form, QoS2 delivery form
-	hold := mqttComputeNatsMsgSize(pp, true, 0, _EMPTY_)                               // QoS2 dedup-hold form
+	// This publish is not retained, so no Nmqtt-Ret header on either form.
+	delivery := mqttComputeNatsMsgSize(pp, false, mqttMessageExpiryTTL(props), origin, false) // QoS0/1 store form, QoS2 delivery form
+	hold := mqttComputeNatsMsgSize(pp, true, 0, _EMPTY_, false)                               // QoS2 dedup-hold form
 
 	sendPub := func(t *testing.T, c net.Conn, qos byte) {
 		vh := newMQTTWriter(0)

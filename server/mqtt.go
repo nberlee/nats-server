@@ -432,6 +432,7 @@ type mqttSession struct {
 	jsa         *mqttJSA
 	subs        map[string]byte     // Key is MQTT SUBSCRIBE filter, value is the subscription QoS
 	noLocalSubs map[string]struct{} // Set of SUBSCRIBE filters that carry the v5 No Local option
+	rapSubs     map[string]struct{} // Set of SUBSCRIBE filters that carry the v5 Retain As Published option
 
 	cons                   map[string]*ConsumerConfig
 	pubRelConsumer         *ConsumerConfig
@@ -488,14 +489,15 @@ type mqttPersistedSession struct {
 	ID     string          `json:"id,omitempty"`
 	Clean  bool            `json:"clean,omitempty"`
 	Subs   map[string]byte `json:"subs,omitempty"`
-	// NoLocal is the set of Subs filters that carry the v5 No Local option. Kept
-	// separate from Subs (rather than packed into its QoS byte) so an older
-	// server reading this record still sees a valid 0..2 QoS and simply ignores
-	// this field. Spec5 [3.8.3.1].
-	NoLocal []string                   `json:"no_local,omitempty"`
-	Cons    map[string]*ConsumerConfig `json:"cons,omitempty"`
-	PubRel  *ConsumerConfig            `json:"pubrel,omitempty"`
-	Will    *mqttPersistedWill         `json:"will,omitempty"`
+	// NoLocal and RetainAsPublished are the sets of Subs filters that carry the
+	// v5 No Local / Retain As Published options. Kept separate from Subs (rather
+	// than packed into its QoS byte) so an older server reading this record still
+	// sees a valid 0..2 QoS and simply ignores these fields. Spec5 [3.8.3.1].
+	NoLocal           []string                   `json:"no_local,omitempty"`
+	RetainAsPublished []string                   `json:"retain_as_published,omitempty"`
+	Cons              map[string]*ConsumerConfig `json:"cons,omitempty"`
+	PubRel            *ConsumerConfig            `json:"pubrel,omitempty"`
+	Will              *mqttPersistedWill         `json:"will,omitempty"`
 	// Session Expiry Interval (seconds) and disconnect Unix time (0 while
 	// connected): together the expiry deadline, restart-safe. Spec5 [3.1.2.11.2].
 	ExpiryInterval uint32 `json:"expiry,omitempty"`
@@ -583,6 +585,12 @@ type mqttSub struct {
 	// subscription. Read in the delivery callbacks under sess.subsMu/sess.mu,
 	// like qos. Spec5 [3.8.3.1].
 	noLocal bool
+
+	// retainAsPublished is the v5 Retain As Published subscription option: when
+	// set, a live-forwarded message keeps the RETAIN flag it was published with
+	// instead of having it cleared. Read in the delivery callbacks like noLocal.
+	// Spec5 [3.8.3.1].
+	retainAsPublished bool
 }
 
 type mqtt struct {
@@ -739,6 +747,10 @@ type mqttFilter struct {
 	// v5 No Local subscription option (bit 2): when set, a message must not be
 	// delivered back to the connection that published it. Spec5 [3.8.3.1].
 	noLocal bool
+	// v5 Retain As Published subscription option (bit 3): when set, a
+	// live-forwarded message keeps the RETAIN flag it was published with. Spec5
+	// [3.8.3.1].
+	retainAsPublished bool
 	// v5 (UN)SUBACK reason code for this filter (zero value is success).
 	reason byte
 	// Used only for tracing and should not be used after parsing of (un)sub protocols.
@@ -818,14 +830,22 @@ const (
 	// when the publisher
 	// has no session (e.g. an internal Will client) or v5 is off. Spec5 [3.8.3.1].
 	mqttNatsHeaderOrigin = "Nmqtt-Origin"
+
+	// NATS header (value "1") marking that the message was published with the
+	// RETAIN flag set, so the v5 Retain As Published subscription option can keep
+	// that flag on a live forward after the original flag is cleared for normal
+	// delivery. Present only for retained publishes when v5 is enabled. Spec5
+	// [3.8.3.1].
+	mqttNatsHeaderRetain = "Nmqtt-Ret"
 )
 
 type mqttParsedPublishNATSHeader struct {
-	qos     byte
-	subject []byte
-	mapped  []byte
-	props   []byte // raw MQTT 5.0 properties block (decoded from Nmqtt-Props)
-	origin  []byte // authenticated No Local origin marker (from Nmqtt-Origin)
+	qos      byte
+	subject  []byte
+	mapped   []byte
+	retained bool   // published with RETAIN set (from Nmqtt-Ret), for Retain As Published
+	props    []byte // raw MQTT 5.0 properties block (decoded from Nmqtt-Props)
+	origin   []byte // authenticated No Local origin marker (from Nmqtt-Origin)
 }
 
 func (s *Server) startMQTT() {
@@ -1593,6 +1613,12 @@ func mqttParsePublishNATSHeader(headerBytes []byte) *mqttParsedPublishNATSHeader
 		subject: getHeader(mqttNatsHeaderSubject, headerBytes),
 		mapped:  getHeader(mqttNatsHeaderMapped, headerBytes),
 		origin:  getHeader(mqttNatsHeaderOrigin, headerBytes),
+	}
+	// Retain As Published marker: the contract is exactly "1"; anything else
+	// (absent, or a forged Nmqtt-Ret:0 / junk from a NATS publisher) is not
+	// retained. Spec5 [3.8.3.1].
+	if ret := getHeader(mqttNatsHeaderRetain, headerBytes); len(ret) == 1 && ret[0] == '1' {
+		h.retained = true
 	}
 	// MQTT 5.0 properties block, carried base64-encoded. This header can come
 	// from an untrusted source (a NATS publisher can set Nmqtt-Pub/Nmqtt-Props
@@ -3710,14 +3736,14 @@ func (as *mqttAccountSessionManager) removeSession(sess *mqttSession, lock bool)
 // waiting.
 func (sess *mqttSession) processQOS12Sub(
 	c *client, // subscribing client.
-	subject, sid []byte, isReserved bool, qos byte, noLocal bool, jsDurName string, h msgHandler, // subscription parameters.
+	subject, sid []byte, isReserved bool, qos byte, noLocal, retainAsPublished bool, jsDurName string, h msgHandler, // subscription parameters.
 ) (*subscription, error) {
-	return sess.processSub(c, subject, sid, isReserved, qos, noLocal, jsDurName, h, false, nil, false, nil)
+	return sess.processSub(c, subject, sid, isReserved, qos, noLocal, retainAsPublished, jsDurName, h, false, nil, false, nil)
 }
 
 func (sess *mqttSession) processSub(
 	c *client, // subscribing client.
-	subject, sid []byte, isReserved bool, qos byte, noLocal bool, jsDurName string, h msgHandler, // subscription parameters.
+	subject, sid []byte, isReserved bool, qos byte, noLocal, retainAsPublished bool, jsDurName string, h msgHandler, // subscription parameters.
 	initShadow bool, // do we need to scan for shadow subscriptions? (not for QOS1+)
 	rms map[string]*mqttRetainedMsg, // preloaded rms (can be empty, or missing items if errors)
 	trace bool, // trace serialized retained messages in the log?
@@ -3757,6 +3783,7 @@ func (sess *mqttSession) processSub(
 		// accessing it later requires a lock.
 		ss.mqtt.qos = qos
 		ss.mqtt.noLocal = noLocal
+		ss.mqtt.retainAsPublished = retainAsPublished
 		ss.mqtt.jsDur = jsDurName
 		// A (re)configured subscription is live; clear any prior teardown mark.
 		ss.mqtt.closed = false
@@ -3771,9 +3798,27 @@ func (sess *mqttSession) processSub(
 	return sub, nil
 }
 
-// mqttNoLocalList returns the No Local filter set as a slice for persistence
-// (nil when empty, to omit the JSON field).
-func mqttNoLocalList(set map[string]struct{}) []string {
+// mqttUpdateFilterOptSet adds or removes filter from a per-option filter set to
+// match want, allocating the set on first add. Returns the (possibly new) set
+// and whether it changed, so the caller can flag the session for persistence.
+func mqttUpdateFilterOptSet(set map[string]struct{}, filter string, want bool) (map[string]struct{}, bool) {
+	if _, has := set[filter]; want && !has {
+		if set == nil {
+			set = make(map[string]struct{})
+		}
+		set[filter] = struct{}{}
+		return set, true
+	} else if !want && has {
+		delete(set, filter)
+		return set, true
+	}
+	return set, false
+}
+
+// mqttFilterSetToList returns a subscription-filter set as a slice for
+// persistence (nil when empty, to omit the JSON field). Used for the per-option
+// filter sets (No Local, Retain As Published).
+func mqttFilterSetToList(set map[string]struct{}) []string {
 	if len(set) == 0 {
 		return nil
 	}
@@ -3784,9 +3829,9 @@ func mqttNoLocalList(set map[string]struct{}) []string {
 	return l
 }
 
-// mqttNoLocalSet rebuilds the No Local filter set from a persisted slice (nil
-// when empty).
-func mqttNoLocalSet(l []string) map[string]struct{} {
+// mqttFilterSetFromList rebuilds a subscription-filter set from a persisted
+// slice (nil when empty).
+func mqttFilterSetFromList(l []string) map[string]struct{} {
 	if len(l) == 0 {
 		return nil
 	}
@@ -3950,7 +3995,7 @@ func (as *mqttAccountSessionManager) processSubs(sess *mqttSession, c *client,
 		as.mu.Lock()
 		sess.mu.Lock()
 		sub, err = sess.processSub(c,
-			bsubject, bsid, isReserved, f.qos, f.noLocal, // main subject
+			bsubject, bsid, isReserved, f.qos, f.noLocal, f.retainAsPublished, // main subject
 			_EMPTY_, mqttDeliverMsgCbQoS0, // no jsDur for QOS0
 			processShadowSubs,
 			subRMS, trace, as)
@@ -3967,7 +4012,7 @@ func (as *mqttAccountSessionManager) processSubs(sess *mqttSession, c *client,
 		// subscriptions of QoS >= 1. But if a JS consumer already exists and
 		// the subscription for same subject is now a QoS==0, then the JS
 		// consumer will be deleted.
-		jscons, jssub, err = sess.processJSConsumer(c, subject, sid, f.qos, f.noLocal, fromSubProto)
+		jscons, jssub, err = sess.processJSConsumer(c, subject, sid, f.qos, f.noLocal, f.retainAsPublished, fromSubProto)
 		if err != nil {
 			f.qos = mqttSubAckFailure
 			sess.cleanupFailedSub(c, sub, jscons, jssub)
@@ -3984,7 +4029,7 @@ func (as *mqttAccountSessionManager) processSubs(sess *mqttSession, c *client,
 			as.mu.Lock()
 			sess.mu.Lock()
 			fwcsub, err = sess.processSub(c,
-				[]byte(fwcsubject), []byte(fwcsid), isReserved, f.qos, f.noLocal, // FWC (top-level wildcard) subject
+				[]byte(fwcsubject), []byte(fwcsid), isReserved, f.qos, f.noLocal, f.retainAsPublished, // FWC (top-level wildcard) subject
 				_EMPTY_, mqttDeliverMsgCbQoS0, // no jsDur for QOS0
 				processShadowSubs,
 				subRMS, trace, as)
@@ -3997,7 +4042,7 @@ func (as *mqttAccountSessionManager) processSubs(sess *mqttSession, c *client,
 				continue
 			}
 
-			fwjscons, fwjssub, err = sess.processJSConsumer(c, fwcsubject, fwcsid, f.qos, f.noLocal, fromSubProto)
+			fwjscons, fwjssub, err = sess.processJSConsumer(c, fwcsubject, fwcsid, f.qos, f.noLocal, f.retainAsPublished, fromSubProto)
 			if err != nil {
 				// c.processSub already called c.Errorf(), so no need here.
 				f.qos = mqttSubAckFailure
@@ -4535,7 +4580,8 @@ func (as *mqttAccountSessionManager) createOrRestoreSession(clientID string, opt
 	sess.domainTk = as.domainTk
 	sess.clean = ps.Clean
 	sess.subs = ps.Subs
-	sess.noLocalSubs = mqttNoLocalSet(ps.NoLocal)
+	sess.noLocalSubs = mqttFilterSetFromList(ps.NoLocal)
+	sess.rapSubs = mqttFilterSetFromList(ps.RetainAsPublished)
 	sess.cons = ps.Cons
 	sess.pubRelConsumer = ps.PubRel
 	sess.expiryInterval = ps.ExpiryInterval
@@ -4760,16 +4806,17 @@ func mqttSessionCreate(jsa *mqttJSA, id, idHash string, seq uint64, opts *Option
 func (sess *mqttSession) save() error {
 	sess.mu.Lock()
 	ps := mqttPersistedSession{
-		Origin:         sess.jsa.id,
-		ID:             sess.id,
-		Clean:          sess.clean,
-		Subs:           sess.subs,
-		NoLocal:        mqttNoLocalList(sess.noLocalSubs),
-		Cons:           sess.cons,
-		PubRel:         sess.pubRelConsumer,
-		Will:           sess.will,
-		ExpiryInterval: sess.expiryInterval,
-		DisconnectedAt: sess.disconnectedAt,
+		Origin:            sess.jsa.id,
+		ID:                sess.id,
+		Clean:             sess.clean,
+		Subs:              sess.subs,
+		NoLocal:           mqttFilterSetToList(sess.noLocalSubs),
+		RetainAsPublished: mqttFilterSetToList(sess.rapSubs),
+		Cons:              sess.cons,
+		PubRel:            sess.pubRelConsumer,
+		Will:              sess.will,
+		ExpiryInterval:    sess.expiryInterval,
+		DisconnectedAt:    sess.disconnectedAt,
 	}
 	b, _ := json.Marshal(&ps)
 
@@ -4825,6 +4872,7 @@ func (sess *mqttSession) clear(noWait bool) error {
 
 	sess.subs = nil
 	sess.noLocalSubs = nil
+	sess.rapSubs = nil
 	sess.pendingPublish = nil
 	sess.pendingPubRel = nil
 	sess.cpending = nil
@@ -4881,17 +4929,14 @@ func (sess *mqttSession) update(filters []*mqttFilter, add bool) error {
 				sess.subs[f.filter] = f.qos
 				needUpdate = true
 			}
-			// Track No Local in a separate set so the persisted QoS byte stays in
-			// the 0..2 range older servers understand. Spec5 [3.8.3.1].
-			_, hadNoLocal := sess.noLocalSubs[f.filter]
-			if f.noLocal && !hadNoLocal {
-				if sess.noLocalSubs == nil {
-					sess.noLocalSubs = make(map[string]struct{})
-				}
-				sess.noLocalSubs[f.filter] = struct{}{}
+			// Track No Local and Retain As Published in separate sets so the
+			// persisted QoS byte stays in the 0..2 range older servers understand.
+			// Spec5 [3.8.3.1].
+			var changed bool
+			if sess.noLocalSubs, changed = mqttUpdateFilterOptSet(sess.noLocalSubs, f.filter, f.noLocal); changed {
 				needUpdate = true
-			} else if !f.noLocal && hadNoLocal {
-				delete(sess.noLocalSubs, f.filter)
+			}
+			if sess.rapSubs, changed = mqttUpdateFilterOptSet(sess.rapSubs, f.filter, f.retainAsPublished); changed {
 				needUpdate = true
 			}
 		} else {
@@ -4899,8 +4944,11 @@ func (sess *mqttSession) update(filters []*mqttFilter, add bool) error {
 				delete(sess.subs, f.filter)
 				needUpdate = true
 			}
-			if _, ok := sess.noLocalSubs[f.filter]; ok {
-				delete(sess.noLocalSubs, f.filter)
+			var changed bool
+			if sess.noLocalSubs, changed = mqttUpdateFilterOptSet(sess.noLocalSubs, f.filter, false); changed {
+				needUpdate = true
+			}
+			if sess.rapSubs, changed = mqttUpdateFilterOptSet(sess.rapSubs, f.filter, false); changed {
 				needUpdate = true
 			}
 		}
@@ -5851,7 +5899,8 @@ CHECK:
 		filters := make([]*mqttFilter, 0, l)
 		for subject, qos := range es.subs {
 			_, noLocal := es.noLocalSubs[subject]
-			filters = append(filters, &mqttFilter{filter: subject, qos: qos, noLocal: noLocal})
+			_, rap := es.rapSubs[subject]
+			filters = append(filters, &mqttFilter{filter: subject, qos: qos, noLocal: noLocal, retainAsPublished: rap})
 		}
 		if _, err := asm.processSubs(es, c, filters, false, trace); err != nil {
 			return err
@@ -6302,6 +6351,15 @@ func (c *client) mqttStampedOrigin(subject string, payload []byte) string {
 	return mqttOriginMarker(c.srv.mqtt.originKey, c.mqtt.sess.idHash, subject, payload)
 }
 
+// mqttOriginRetained reports whether pp was published with the RETAIN flag and
+// v5 is enabled on this server, so its original RETAIN should be recorded (in
+// the Nmqtt-Ret header) for the Retain As Published subscription option. Must be
+// called while pp.flags still carries the original RETAIN (before fan-out clears
+// it). A 3.1.1-only server records nothing. Spec5 [3.8.3.1].
+func (c *client) mqttOriginRetained(pp *mqttPublish) bool {
+	return c.srv != nil && c.srv.mqtt.v5Enabled && mqttIsRetained(pp.flags)
+}
+
 // mqttNoLocalSuppress reports whether a No Local subscription must drop this
 // delivery: the message was published by the same session (its ID hash matches
 // the subscriber's). An unknown origin (empty hash) never suppresses. Spec5
@@ -6315,7 +6373,7 @@ func mqttNoLocalSuppress(noLocal bool, originHash, subHash string) bool {
 // encodePP: whether to encode complete MQTT PUBLISH packet header information
 //   - false: initial delivery (QoS 0/1) needs only base header
 //   - true: QoS2 storage needs to encode Nmqtt-Subject and Nmqtt-Mapped
-func mqttComputeNatsMsgSize(pp *mqttPublish, encodePP bool, ttl uint32, origin string) int {
+func mqttComputeNatsMsgSize(pp *mqttPublish, encodePP bool, ttl uint32, origin string, retained bool) int {
 	size := len(hdrLine) +
 		len(mqttNatsHeader) + 2 + 2 + // 2 for ':<qos>', and 2 for CRLF
 		2 + // end-of-header CRLF
@@ -6323,6 +6381,9 @@ func mqttComputeNatsMsgSize(pp *mqttPublish, encodePP bool, ttl uint32, origin s
 	if len(origin) > 0 {
 		size += len(mqttNatsHeaderOrigin) + 1 + // +1 for ':'
 			len(origin) + 2 // 2 for CRLF
+	}
+	if retained {
+		size += len(mqttNatsHeaderRetain) + 1 + 1 + 2 // ':' + "1" + CRLF
 	}
 	if encodePP {
 		size += len(mqttNatsHeaderSubject) + 1 + // +1 for ':'
@@ -6357,8 +6418,8 @@ func mqttComputeNatsMsgSize(pp *mqttPublish, encodePP bool, ttl uint32, origin s
 //	NATS/1.0\r\n
 //	Nmqtt-Pub:2foo.bar\r\n
 //	\r\n
-func mqttNewDeliverableMessage(pp *mqttPublish, encodePP bool, ttl uint32, origin string) (natsMsg []byte, headerLen int) {
-	size := mqttComputeNatsMsgSize(pp, encodePP, ttl, origin)
+func mqttNewDeliverableMessage(pp *mqttPublish, encodePP bool, ttl uint32, origin string, retained bool) (natsMsg []byte, headerLen int) {
+	size := mqttComputeNatsMsgSize(pp, encodePP, ttl, origin, retained)
 
 	buf := bytes.NewBuffer(make([]byte, 0, size))
 
@@ -6376,6 +6437,15 @@ func mqttNewDeliverableMessage(pp *mqttPublish, encodePP bool, ttl uint32, origi
 		buf.WriteString(mqttNatsHeaderOrigin)
 		buf.WriteByte(':')
 		buf.WriteString(origin)
+		buf.WriteString(_CRLF_)
+	}
+
+	// Original RETAIN flag, for the Retain As Published subscription option.
+	// Spec5 [3.8.3.1].
+	if retained {
+		buf.WriteString(mqttNatsHeaderRetain)
+		buf.WriteByte(':')
+		buf.WriteByte('1')
 		buf.WriteString(_CRLF_)
 	}
 
@@ -6467,10 +6537,13 @@ func (s *Server) mqttProcessPub(c *client, pp *mqttPublish, trace bool) error {
 	// sets never coexist, so we compare the two actual forms rather than sum them.
 	if maxPayload := atomic.LoadInt32(&c.mpay); maxPayload != jwt.NoLimit {
 		// The delivered form carries the Nmqtt-Origin header; the QoS2 hold copy
-		// does not (origin is re-derived from the client on PUBREL release).
-		total := mqttComputeNatsMsgSize(pp, false, c.mqttStoredMsgTTL(pp), origin)
+		// does not (origin is re-derived from the client on PUBREL release). Both
+		// carry the Nmqtt-Ret marker for a retained publish (the hold copy so it
+		// survives to PUBREL).
+		retained := c.mqttOriginRetained(pp)
+		total := mqttComputeNatsMsgSize(pp, false, c.mqttStoredMsgTTL(pp), origin, retained)
 		if qos == 2 {
-			if hold := mqttComputeNatsMsgSize(pp, true, 0, _EMPTY_); hold > total {
+			if hold := mqttComputeNatsMsgSize(pp, true, 0, _EMPTY_, retained); hold > total {
 				total = hold
 			}
 		}
@@ -6545,7 +6618,12 @@ func (s *Server) mqttInitiateMsgDeliveryJSA(c *client, jsa *mqttJSA, pp *mqttPub
 	// given a matching JetStream per-message TTL so it is dropped from the
 	// delivery stream once its lifetime elapses. Spec5 [3.3.2.3.3]. Degraded
 	// mode drops the header; delivery-side expiry checks still apply.
-	natsMsg, headerLen := mqttNewDeliverableMessage(pp, false, c.mqttStoredMsgTTL(pp), origin)
+	//
+	// pp.flags still carries the original RETAIN flag here (it is cleared later,
+	// during fan-out); record it for the Retain As Published option when v5 is
+	// enabled. Spec5 [3.8.3.1].
+	retained := c.mqttOriginRetained(pp)
+	natsMsg, headerLen := mqttNewDeliverableMessage(pp, false, c.mqttStoredMsgTTL(pp), origin, retained)
 
 	// Set the client's pubarg for processing.
 	c.pa.subject = pp.subject
@@ -6599,7 +6677,9 @@ func (s *Server) mqttStoreQoS2MsgOnce(c *client, pp *mqttPublish) error {
 	// `true` means encode the MQTT PUBLISH packet in the NATS message header. No
 	// TTL here: this is the QoS2 dedup hold stream (no AllowMsgTTL); the expiry
 	// TTL is applied when the message is moved to the delivery stream on PUBREL.
-	natsMsg, headerLen := mqttNewDeliverableMessage(pp, true, 0, _EMPTY_)
+	// The original RETAIN flag is recorded so Retain As Published survives the
+	// hold and is restored on PUBREL. Spec5 [3.8.3.1].
+	natsMsg, headerLen := mqttNewDeliverableMessage(pp, true, 0, _EMPTY_, c.mqttOriginRetained(pp))
 
 	// Do not broadcast the message until it has been deduplicated and released
 	// by the sender. Instead store this QoS2 message as
@@ -6662,6 +6742,12 @@ func (s *Server) mqttProcessPubRel(c *client, pi uint16, trace bool) error {
 		pi:      pi,
 		flags:   h.qos << 1,
 		props:   h.props, // forward v5 properties captured at store time
+	}
+	// Restore the original RETAIN flag recorded at store time so Retain As
+	// Published works for a QoS2 retained publish released on PUBREL. Spec5
+	// [3.8.3.1].
+	if h.retained {
+		pp.flags |= mqttPubFlagRetain
 	}
 
 	// MQTT 5.0 Message Expiry Interval: a QoS2 message ages while it waits in the
@@ -7211,6 +7297,7 @@ func (c *client) mqttParseSubsOrUnsubs(r *mqttReader, b byte, pl int, sub bool) 
 		var qos, reason byte
 		var retainHandling byte
 		var noLocal bool
+		var retainAsPublished bool
 		// We are going to report if we had an error during the conversion,
 		// but we don't fail the parsing. When processing the sub, we will
 		// have an error then, and the processing of subs code will send
@@ -7241,13 +7328,8 @@ func (c *client) mqttParseSubsOrUnsubs(r *mqttReader, b byte, pl int, sub bool) 
 				if retainHandling == 3 {
 					return 0, nil, fmt.Errorf("%w: retain handling value 3 is reserved", errMQTTProtocolError)
 				}
-				// Retain As Published (bit 3) is not yet honored; reject rather
-				// than ACK success for an option we would then silently ignore. A
-				// client using only defaults (bits 0) is unaffected. Spec5 [3.8.3.1].
-				if opts&0x08 != 0 {
-					return 0, nil, fmt.Errorf("%w: options byte 0x%x sets Retain As Published", errMQTTUnsupportedSubOption, opts)
-				}
 				noLocal = opts&0x04 != 0
+				retainAsPublished = opts&0x08 != 0
 				// No Local on a Shared Subscription is a Protocol Error
 				// [MQTT-3.8.3-4]: fail the whole packet, stricter than the
 				// per-filter 0x9E rejection below.
@@ -7273,7 +7355,7 @@ func (c *client) mqttParseSubsOrUnsubs(r *mqttReader, b byte, pl int, sub bool) 
 				return 0, nil, fmt.Errorf("subscribe QoS value must be 0, 1 or 2, got %v", qos)
 			}
 		}
-		f := &mqttFilter{ttopic: topic, filter: string(filter), qos: qos, retainHandling: retainHandling, noLocal: noLocal, reason: reason}
+		f := &mqttFilter{ttopic: topic, filter: string(filter), qos: qos, retainHandling: retainHandling, noLocal: noLocal, retainAsPublished: retainAsPublished, reason: reason}
 		filters = append(filters, f)
 	}
 	// Spec [MQTT-3.8.3-3], [MQTT-3.10.3-2]
@@ -7337,6 +7419,7 @@ func mqttDeliverMsgCbQoS0(sub *subscription, pc *client, _ *Account, subject, re
 	sess.subsMu.RLock()
 	subQoS := sub.mqtt.qos
 	noLocal := sub.mqtt.noLocal
+	retainAsPublished := sub.mqtt.retainAsPublished
 	ignore := mqttMustIgnoreForReservedSub(sub, subject)
 	sess.subsMu.RUnlock()
 
@@ -7352,6 +7435,11 @@ func mqttDeliverMsgCbQoS0(sub *subscription, pc *client, _ *Account, subject, re
 	// taken from the message header on this direct path (see the non-MQTT branch
 	// below for why a stamped header is not trusted here). Spec5 [3.8.3.1].
 	var originHash string
+	// origRetain is the original RETAIN flag, for the Retain As Published option.
+	// It always comes from the stamped Nmqtt-Ret header (the publisher's live
+	// pp.flags RETAIN is cleared before fan-out); parsed only when the sub wants
+	// it, since a retained publish is uncommon.
+	var origRetain bool
 	if pc.isMqtt() {
 		// This is an MQTT publisher directly connected to this server.
 
@@ -7371,6 +7459,11 @@ func mqttDeliverMsgCbQoS0(sub *subscription, pc *client, _ *Account, subject, re
 		}
 		if noLocal && pc.mqtt.sess != nil {
 			originHash = pc.mqtt.sess.idHash
+		}
+		if retainAsPublished {
+			if h := mqttParsePublishNATSHeader(hdr); h != nil {
+				origRetain = h.retained
+			}
 		}
 
 	} else {
@@ -7392,6 +7485,7 @@ func mqttDeliverMsgCbQoS0(sub *subscription, pc *client, _ *Account, subject, re
 		topic = natsSubjectStrToMQTTTopic(subject)
 		if h != nil {
 			props = h.props
+			origRetain = h.retained
 		}
 		// No Local origin is deliberately NOT taken from the message header here.
 		// A stamped Nmqtt-Origin is forgeable by any NATS client (locally or on a
@@ -7423,7 +7517,7 @@ func mqttDeliverMsgCbQoS0(sub *subscription, pc *client, _ *Account, subject, re
 	// Message never has a packet identifier nor is marked as duplicate. A QoS0
 	// message dropped for exceeding the client's Maximum Packet Size needs no
 	// completion (it is not JetStream-backed here), so the result is ignored.
-	pc.mqttEnqueuePublishMsgTo(cc, sub, 0, 0, false, topic, msg, props)
+	pc.mqttEnqueuePublishMsgTo(cc, sub, 0, 0, false, retainAsPublished && origRetain, topic, msg, props)
 }
 
 // This is the callback attached to a JS durable subscription for a MQTT QoS 1+
@@ -7518,6 +7612,11 @@ func mqttDeliverMsgCbQoS12(sub *subscription, pc *client, _ *Account, subject, r
 		}
 	}
 
+	// Retain As Published: capture the option under the lock; the delivered
+	// message keeps the original RETAIN flag (from the stored Nmqtt-Ret header)
+	// only when the subscription set it. Spec5 [3.8.3.1].
+	retainAsPub := sub.mqtt.retainAsPublished && h != nil && h.retained
+
 	pi, dup, started := sess.trackPublish(sub.mqtt.jsDur, reply)
 	sess.mu.Unlock()
 
@@ -7553,7 +7652,7 @@ func mqttDeliverMsgCbQoS12(sub *subscription, pc *client, _ *Account, subject, r
 			return
 		}
 	}
-	if !pc.mqttEnqueuePublishMsgTo(cc, sub, pi, qos, dup, originalTopic, msg, props) {
+	if !pc.mqttEnqueuePublishMsgTo(cc, sub, pi, qos, dup, retainAsPub, originalTopic, msg, props) {
 		// The PUBLISH exceeds the client's MQTT 5.0 Maximum Packet Size. Discard
 		// it and complete the delivery so JetStream does not redeliver it forever:
 		// release the packet identifier and ack the JS message. Spec5 [3.1.2.11.4].
@@ -7671,7 +7770,7 @@ func sparkbReplaceDeathTimestamp(msg []byte) []byte {
 // returns false without sending when the packet would exceed the client's MQTT
 // 5.0 Maximum Packet Size; the caller is then responsible for completing the
 // message (for QoS1/2, acking the JS delivery so it is not redelivered).
-func (c *client) mqttEnqueuePublishMsgTo(cc *client, sub *subscription, pi uint16, qos byte, dup bool, topic, msg, props []byte) bool {
+func (c *client) mqttEnqueuePublishMsgTo(cc *client, sub *subscription, pi uint16, qos byte, dup, retainAsPub bool, topic, msg, props []byte) bool {
 	// [tck-id-conformance-mqtt-aware-nbirth-mqtt-retain] A Sparkplug Aware
 	// MQTT Server MUST make NBIRTH messages available on the topic:
 	// $sparkplug/certificates/namespace/group_id/NBIRTH/edge_node_id with
@@ -7685,10 +7784,12 @@ func (c *client) mqttEnqueuePublishMsgTo(cc *client, sub *subscription, pi uint1
 	// $sparkplug/certificates messages are sent as NATS messages, so we
 	// need to add the retain flag when sending them to MQTT clients.
 
-	retain := false
+	// retainAsPub keeps the original RETAIN flag for a v5 Retain As Published
+	// subscription. Spec5 [3.8.3.1].
+	retain := retainAsPub
 	isBirth, isDeath, isCertificate := sparkbParseBirthDeathTopic(topic)
 	if isBirth && qos == 0 {
-		retain = isCertificate
+		retain = retain || isCertificate
 	} else if isDeath && !isCertificate {
 		msg = sparkbReplaceDeathTimestamp(msg)
 	}
@@ -7921,7 +8022,7 @@ func (sess *mqttSession) ensurePubRelConsumerSubscription(c *client) error {
 // Session lock is acquired and released as needed. Session is in the locked
 // map.
 func (sess *mqttSession) processJSConsumer(c *client, subject, sid string,
-	qos byte, noLocal, fromSubProto bool) (*ConsumerConfig, *subscription, error) {
+	qos byte, noLocal, retainAsPublished, fromSubProto bool) (*ConsumerConfig, *subscription, error) {
 
 	sess.mu.Lock()
 	cc, exists := sess.cons[sid]
@@ -7993,6 +8094,7 @@ func (sess *mqttSession) processJSConsumer(c *client, subject, sid string,
 				if sub.mqtt != nil {
 					sub.mqtt.qos = qos
 					sub.mqtt.noLocal = noLocal
+					sub.mqtt.retainAsPublished = retainAsPublished
 				}
 				sess.subsMu.Unlock()
 				sess.mu.Unlock()
@@ -8064,7 +8166,7 @@ func (sess *mqttSession) processJSConsumer(c *client, subject, sid string,
 	sess.mu.Lock()
 	sess.tmaxack = tmaxack
 	sub, err := sess.processQOS12Sub(c, []byte(inbox), []byte(inbox),
-		isMQTTReservedSubscription(subject), qos, noLocal, cc.Durable, mqttDeliverMsgCbQoS12)
+		isMQTTReservedSubscription(subject), qos, noLocal, retainAsPublished, cc.Durable, mqttDeliverMsgCbQoS12)
 	sess.mu.Unlock()
 
 	if err != nil {
