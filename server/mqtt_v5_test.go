@@ -1157,30 +1157,34 @@ func TestMQTTv5InteropWith311Publisher(t *testing.T) {
 	testMQTTReadPublishV5(t, rs, "interop", []byte("from-311"))
 }
 
-// The foundation honors only the QoS bits of the v5 subscription options byte.
-// It must reject (not silently ACK) a SUBSCRIBE that sets No Local, Retain As
-// Published or a non-zero Retain Handling, rather than acknowledging an option
-// it would then ignore (e.g. still replaying retained messages for RH=2).
+// A SUBSCRIBE must be rejected (not silently ACKed) when it sets a v5
+// subscription option this server does not honor: No Local and Retain As
+// Published are not yet implemented, a Retain Handling value of 3 is reserved
+// (Protocol Error), and the options byte's reserved bits 6-7 are a Malformed
+// Packet. Retain Handling 0/1/2 are supported and tested in TestMQTTv5RetainHandling.
 func TestMQTTv5RejectsUnsupportedSubOptions(t *testing.T) {
 	o := testMQTTDefaultOptionsV5()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
 
 	for _, test := range []struct {
-		name string
-		opts byte
+		name      string
+		opts      byte
+		expReason byte
 	}{
-		{"no local", 0x04},
-		{"retain as published", 0x08},
-		{"retain handling 1", 0x10},
-		{"retain handling 2", 0x20},
+		{"no local", 0x04, mqttReasonUnspecifiedError},
+		{"retain as published", 0x08, mqttReasonUnspecifiedError},
+		{"retain handling 3 reserved", 0x30, mqttReasonProtocolError},
+		{"retain handling 3 with no local", 0x34, mqttReasonProtocolError},
+		{"reserved bit 6", 0x40, mqttReasonMalformedPacket},
+		{"reserved bit 7", 0x80, mqttReasonMalformedPacket},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			c, r := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "subopt", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
 			defer c.Close()
 			testMQTTReadConnAckV5(t, r)
 
-			// Craft a v5 SUBSCRIBE with QoS 1 plus the unsupported option bit.
+			// Craft a v5 SUBSCRIBE with QoS 1 plus the rejected option bit(s).
 			vh := newMQTTWriter(0)
 			vh.WriteUint16(1)
 			vh.WriteVarInt(0) // empty properties
@@ -1194,14 +1198,18 @@ func TestMQTTv5RejectsUnsupportedSubOptions(t *testing.T) {
 				t.Fatalf("Error writing SUBSCRIBE: %v", err)
 			}
 
-			// The server must NOT send a SUBACK; it closes the connection
-			// (optionally preceded by a v5 DISCONNECT).
-			buf, err := testMQTTRead(c)
-			if err != nil {
-				return // connection closed, as expected
+			// The server must NOT send a SUBACK; it sends a v5 DISCONNECT with the
+			// classified reason code before closing.
+			b, _ := testMQTTReadPacket(t, r)
+			if pt := b & mqttPacketMask; pt != mqttPacketDisconnect {
+				t.Fatalf("Expected DISCONNECT (%x), got %x", mqttPacketDisconnect, pt)
 			}
-			if pt := buf[0] & mqttPacketMask; pt == mqttPacketSubAck {
-				t.Fatalf("server acknowledged an unsupported subscription option (got SUBACK)")
+			reason, err := r.readByte("disconnect reason")
+			if err != nil {
+				t.Fatalf("Error reading disconnect reason: %v", err)
+			}
+			if reason != test.expReason {
+				t.Fatalf("Expected disconnect reason 0x%x, got 0x%x", test.expReason, reason)
 			}
 		})
 	}
@@ -1240,6 +1248,83 @@ func TestMQTTv5SharedSubscriptionRejected(t *testing.T) {
 	// The granted filter still works.
 	testMQTTPublishV5(t, cp, 0, 0, "foo", []byte("msg"))
 	testMQTTReadPublishV5(t, r, "foo", []byte("msg"))
+}
+
+// The v5 Retain Handling subscription option controls whether retained messages
+// are replayed at subscribe time: 0 always, 1 only when the subscription is new,
+// 2 never. Spec5 [3.8.3.1].
+func TestMQTTv5RetainHandling(t *testing.T) {
+	o := testMQTTDefaultOptionsV5()
+	s := testMQTTRunServer(t, o)
+	defer testMQTTShutdownServer(s)
+
+	// Publish a retained message the subscribers below will (or won't) receive.
+	cp, rp := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "rhpub", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
+	defer cp.Close()
+	testMQTTReadConnAckV5(t, rp)
+	testMQTTPubV5Props(t, cp, rp, 1, true, 1, "rh/topic", []byte("retained"), nil)
+
+	// opts byte: QoS in bits 0-1, Retain Handling in bits 4-5.
+	rhOpts := func(qos, rh byte) byte { return qos | (rh << 4) }
+
+	t.Run("RH=0 sends retained", func(t *testing.T) {
+		c, r := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "rh0", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
+		defer c.Close()
+		testMQTTReadConnAckV5(t, r)
+		testMQTTSubV5(t, c, r, 1, []mqttV5SubFilter{{topic: "rh/topic", opts: rhOpts(1, 0)}})
+		testMQTTReadPubV5Props(t, c, r, "rh/topic", []byte("retained"))
+	})
+
+	t.Run("RH=2 never sends retained", func(t *testing.T) {
+		c, r := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "rh2", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
+		defer c.Close()
+		testMQTTReadConnAckV5(t, r)
+		testMQTTSubV5(t, c, r, 1, []mqttV5SubFilter{{topic: "rh/topic", opts: rhOpts(1, 2)}})
+		testMQTTExpectNothing(t, r)
+		// A live publish still reaches the subscription, proving it is active and
+		// only the retained replay was suppressed.
+		testMQTTPubV5Props(t, cp, rp, 1, false, 2, "rh/topic", []byte("live"), nil)
+		testMQTTReadPubV5Props(t, c, r, "rh/topic", []byte("live"))
+	})
+
+	t.Run("RH=1 sends only for a new subscription", func(t *testing.T) {
+		// The retained message must already exist before the first subscribe so
+		// that a "new subscription" replay is actually exercised.
+		testMQTTPubV5Props(t, cp, rp, 1, true, 3, "rh1/topic", []byte("retained1"), nil)
+
+		c, r := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "rh1", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
+		defer c.Close()
+		testMQTTReadConnAckV5(t, r)
+		// First subscribe: the subscription is new, so retained is replayed.
+		testMQTTSubV5(t, c, r, 1, []mqttV5SubFilter{{topic: "rh1/topic", opts: rhOpts(1, 1)}})
+		testMQTTReadPubV5Props(t, c, r, "rh1/topic", []byte("retained1"))
+		// Re-subscribe to the same filter: the subscription already exists, so no
+		// retained replay. A live publish confirms the sub is still active.
+		testMQTTSubV5(t, c, r, 1, []mqttV5SubFilter{{topic: "rh1/topic", opts: rhOpts(1, 1)}})
+		testMQTTExpectNothing(t, r)
+		testMQTTPubV5Props(t, cp, rp, 1, false, 4, "rh1/topic", []byte("live1"), nil)
+		testMQTTReadPubV5Props(t, c, r, "rh1/topic", []byte("live1"))
+	})
+
+	// Retain Handling is per-subscription: an RH=2 filter in the same SUBSCRIBE
+	// as an overlapping RH=0 wildcard must not itself replay retained messages,
+	// even though the shared preload loads the subject for the wildcard.
+	t.Run("RH=2 not leaked by overlapping RH=0 filter", func(t *testing.T) {
+		testMQTTPubV5Props(t, cp, rp, 1, true, 5, "ov/topic", []byte("retained-ov"), nil)
+
+		c, r := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "rhov", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
+		defer c.Close()
+		testMQTTReadConnAckV5(t, r)
+		// ov/+ (RH=0) matches the retained ov/topic; ov/topic (RH=2) must not add
+		// a second copy. Both are QoS1 so ordering within the SUBACK is stable.
+		testMQTTSubV5(t, c, r, 1, []mqttV5SubFilter{
+			{topic: "ov/+", opts: rhOpts(1, 0)},
+			{topic: "ov/topic", opts: rhOpts(1, 2)},
+		})
+		// Exactly one retained delivery (via ov/+), then nothing more.
+		testMQTTReadPubV5Props(t, c, r, "ov/topic", []byte("retained-ov"))
+		testMQTTExpectNothing(t, r)
+	})
 }
 
 // MaxProtocolVersion must be range-checked for programmatic Options too, not

@@ -323,6 +323,7 @@ var (
 	errMQTTPropertyNotAllowed         = errors.New("property not allowed for this packet type")
 	errMQTTAuthMethodNotSupported     = errors.New("enhanced authentication (auth method) is not supported")
 	errMQTTUnsupportedSubOption       = errors.New("unsupported MQTT 5.0 subscription option")
+	errMQTTMalformedSubOption         = errors.New("malformed MQTT 5.0 subscription option")
 )
 
 type srvMQTT struct {
@@ -686,6 +687,10 @@ var mqttSharedSubPrefix = []byte("$share/")
 type mqttFilter struct {
 	filter string
 	qos    byte
+	// v5 Retain Handling subscription option (bits 4-5 of the options byte):
+	// 0 = send retained at subscribe, 1 = send only if the subscription is new,
+	// 2 = never. Zero value (0) matches 3.1.1 behavior. Spec5 [3.8.3.1].
+	retainHandling byte
 	// v5 (UN)SUBACK reason code for this filter (zero value is success).
 	reason byte
 	// Used only for tracing and should not be used after parsing of (un)sub protocols.
@@ -3692,6 +3697,22 @@ func (sess *mqttSession) processSub(
 	return sub, nil
 }
 
+// mqttShouldSendRetained reports whether retained messages must be replayed for
+// a new subscription with the given v5 Retain Handling option. Spec5 [3.8.3.1]:
+// 0 always sends, 1 sends only when the filter has no current subscription, 2
+// never sends. subs is the session's pre-SUBSCRIBE filter set.
+func mqttShouldSendRetained(retainHandling byte, subs map[string]byte, filter string) bool {
+	switch retainHandling {
+	case 2:
+		return false
+	case 1:
+		_, existed := subs[filter]
+		return !existed
+	default:
+		return true
+	}
+}
+
 // Process subscriptions for the given session/client.
 //
 // When `fromSubProto` is false, it means that this is invoked from the CONNECT
@@ -3760,8 +3781,11 @@ func (as *mqttAccountSessionManager) processSubs(sess *mqttSession, c *client,
 			}
 		}
 
-		// Find retained messages.
-		if fromSubProto {
+		// Find retained messages. The v5 Retain Handling option controls whether
+		// they are replayed at subscribe time. sess.subs still holds the
+		// pre-SUBSCRIBE state here (sess.update runs at the end), so it is the
+		// right source for the "subscription already exists" test. Spec5 [3.8.3.1].
+		if fromSubProto && mqttShouldSendRetained(f.retainHandling, sess.subs, f.filter) {
 			as.addRetainedSubjectsForSubject(rmSubjects, f.filter)
 			if need, subject, _ := fwc(f.filter); need {
 				as.addRetainedSubjectsForSubject(rmSubjects, subject)
@@ -3800,6 +3824,19 @@ func (as *mqttAccountSessionManager) processSubs(sess *mqttSession, c *client,
 		bsid := bsubject
 		isReserved := isMQTTReservedSubscription(subject)
 
+		// Retain Handling is per-subscription, but the preloaded rms is shared
+		// across all filters in this SUBSCRIBE and matched against each sub's
+		// subject at serialization time. Gating only the preload would still leak
+		// a retained message into an RH=1/2 filter when an overlapping filter
+		// (e.g. a wildcard with RH=0) caused that subject to be loaded. So pass
+		// rms only to filters that must replay; nil otherwise. sess.subs is
+		// unchanged until sess.update at the end, so this matches the preload
+		// decision. Spec5 [3.8.3.1].
+		subRMS := rms
+		if !mqttShouldSendRetained(f.retainHandling, sess.subs, f.filter) {
+			subRMS = nil
+		}
+
 		var jscons *ConsumerConfig
 		var jssub *subscription
 
@@ -3816,7 +3853,7 @@ func (as *mqttAccountSessionManager) processSubs(sess *mqttSession, c *client,
 			bsubject, bsid, isReserved, f.qos, // main subject
 			_EMPTY_, mqttDeliverMsgCbQoS0, // no jsDur for QOS0
 			processShadowSubs,
-			rms, trace, as)
+			subRMS, trace, as)
 		sess.mu.Unlock()
 		as.mu.Unlock()
 
@@ -3850,7 +3887,7 @@ func (as *mqttAccountSessionManager) processSubs(sess *mqttSession, c *client,
 				[]byte(fwcsubject), []byte(fwcsid), isReserved, f.qos, // FWC (top-level wildcard) subject
 				_EMPTY_, mqttDeliverMsgCbQoS0, // no jsDur for QOS0
 				processShadowSubs,
-				rms, trace, as)
+				subRMS, trace, as)
 			sess.mu.Unlock()
 			as.mu.Unlock()
 			if err != nil {
@@ -5800,7 +5837,8 @@ func (c *client) mqttEnqueueDisconnect(reason byte) {
 // processing error. Spec5 [3.14.2.1].
 func mqttDisconnectReasonFromErr(err error) byte {
 	switch {
-	case errors.Is(err, errMQTTMalformedVarInt), errors.Is(err, errMQTTMalformedProperties):
+	case errors.Is(err, errMQTTMalformedVarInt), errors.Is(err, errMQTTMalformedProperties),
+		errors.Is(err, errMQTTMalformedSubOption):
 		return mqttReasonMalformedPacket
 	case errors.Is(err, errMQTTUnknownProperty), errors.Is(err, errMQTTPropertyNotAllowed),
 		errors.Is(err, errMQTTDuplicateProperty), errors.Is(err, errMQTTProtocolError):
@@ -6939,6 +6977,7 @@ func (c *client) mqttParseSubsOrUnsubs(r *mqttReader, b byte, pl int, sub bool) 
 			return 0, nil, err
 		}
 		var qos, reason byte
+		var retainHandling byte
 		// We are going to report if we had an error during the conversion,
 		// but we don't fail the parsing. When processing the sub, we will
 		// have an error then, and the processing of subs code will send
@@ -6950,22 +6989,31 @@ func (c *client) mqttParseSubsOrUnsubs(r *mqttReader, b byte, pl int, sub bool) 
 		if sub {
 			if c.mqtt.proto == mqttProtoLevel5 {
 				// v5 replaces the single QoS byte with a Subscription Options
-				// byte. Spec5 [3.8.3.1].
+				// byte: bits 0-1 QoS, 2 No Local, 3 Retain As Published, 4-5
+				// Retain Handling, 6-7 reserved. Spec5 [3.8.3.1].
 				var opts byte
 				opts, err = r.readByte("subscription options")
 				if err != nil {
 					return 0, nil, err
 				}
-				// Only the QoS bits (0-1) are honored by this foundation. No
-				// Local (bit 2), Retain As Published (bit 3), Retain Handling
-				// (bits 4-5) and the reserved bits (6-7) are not implemented.
-				// Rather than ACK a SUBACK success for options we would then
-				// silently ignore (e.g. still replaying retained messages for a
-				// client that requested Retain Handling=2), reject the
-				// SUBSCRIBE. A compliant client using only defaults (all these
-				// bits 0) is unaffected. Spec5 [3.8.3.1].
-				if opts&0xFC != 0 {
-					return 0, nil, fmt.Errorf("%w: options byte 0x%x sets No Local, Retain As Published, Retain Handling or reserved bits", errMQTTUnsupportedSubOption, opts)
+				// Reserved bits set is a Malformed Packet [MQTT-3-8.3-5].
+				if opts&0xC0 != 0 {
+					return 0, nil, fmt.Errorf("%w: reserved bits set in options byte 0x%x", errMQTTMalformedSubOption, opts)
+				}
+				retainHandling = (opts >> 4) & 0x03
+				// Retain Handling 3 is reserved; sending it is a Protocol Error.
+				// Checked before the No Local / Retain As Published rejection so a
+				// reserved value is always classified as a Protocol Error, even
+				// when those bits are also set. Spec5 [3.8.3.1].
+				if retainHandling == 3 {
+					return 0, nil, fmt.Errorf("%w: retain handling value 3 is reserved", errMQTTProtocolError)
+				}
+				// No Local (bit 2) and Retain As Published (bit 3) are not yet
+				// honored; reject rather than ACK success for an option we would
+				// then silently ignore. A client using only defaults (bits 0) is
+				// unaffected. Spec5 [3.8.3.1].
+				if opts&0x0C != 0 {
+					return 0, nil, fmt.Errorf("%w: options byte 0x%x sets No Local or Retain As Published", errMQTTUnsupportedSubOption, opts)
 				}
 				qos = opts & 0x03
 				// Shared Subscriptions are advertised as unavailable in
@@ -6986,7 +7034,7 @@ func (c *client) mqttParseSubsOrUnsubs(r *mqttReader, b byte, pl int, sub bool) 
 				return 0, nil, fmt.Errorf("subscribe QoS value must be 0, 1 or 2, got %v", qos)
 			}
 		}
-		f := &mqttFilter{ttopic: topic, filter: string(filter), qos: qos, reason: reason}
+		f := &mqttFilter{ttopic: topic, filter: string(filter), qos: qos, retainHandling: retainHandling, reason: reason}
 		filters = append(filters, f)
 	}
 	// Spec [MQTT-3.8.3-3], [MQTT-3.10.3-2]
