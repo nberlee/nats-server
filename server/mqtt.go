@@ -15,6 +15,9 @@ package server
 
 import (
 	"bytes"
+	"crypto/hmac"
+	"crypto/rand"
+	"crypto/sha256"
 	"crypto/tls"
 	"encoding/base64"
 	"encoding/binary"
@@ -335,6 +338,19 @@ type srvMQTT struct {
 	// == 5), set once at startup and read lock-free thereafter. It lets v5-only
 	// machinery be skipped entirely on a 3.1.1-only server.
 	v5Enabled bool
+	// originKey is a per-server-run random secret keying the HMAC that
+	// authenticates the No Local origin marker stamped on stored QoS 1/2 (and
+	// retained) messages. It is never sent to clients, so a client that can write
+	// the MQTT stream subjects still cannot forge a marker for a victim's session;
+	// an unauthenticated or unverifiable origin is simply not suppressed (No Local
+	// fails open, never dropping a legitimate message). Because the key is not
+	// persisted or shared across the cluster, a self-published message that
+	// outlives its stamping server-run — a retained/QoS message replayed after a
+	// restart, or delivered after the persistent session reconnects to another
+	// node — no longer verifies and is delivered rather than suppressed. That is
+	// an accepted, safe degradation of No Local for persisted messages across a
+	// restart/failover, not a security gap. Spec5 [3.8.3.1].
+	originKey []byte
 }
 
 type mqttSessionManager struct {
@@ -410,11 +426,13 @@ type mqttSession struct {
 	mu     sync.Mutex
 	subsMu sync.RWMutex
 
-	id                     string // client ID
-	idHash                 string // client ID hash
-	c                      *client
-	jsa                    *mqttJSA
-	subs                   map[string]byte // Key is MQTT SUBSCRIBE filter, value is the subscription QoS
+	id          string // client ID
+	idHash      string // client ID hash
+	c           *client
+	jsa         *mqttJSA
+	subs        map[string]byte     // Key is MQTT SUBSCRIBE filter, value is the subscription QoS
+	noLocalSubs map[string]struct{} // Set of SUBSCRIBE filters that carry the v5 No Local option
+
 	cons                   map[string]*ConsumerConfig
 	pubRelConsumer         *ConsumerConfig
 	pubRelSubscribed       bool
@@ -466,13 +484,18 @@ type mqttSession struct {
 }
 
 type mqttPersistedSession struct {
-	Origin string                     `json:"origin,omitempty"`
-	ID     string                     `json:"id,omitempty"`
-	Clean  bool                       `json:"clean,omitempty"`
-	Subs   map[string]byte            `json:"subs,omitempty"`
-	Cons   map[string]*ConsumerConfig `json:"cons,omitempty"`
-	PubRel *ConsumerConfig            `json:"pubrel,omitempty"`
-	Will   *mqttPersistedWill         `json:"will,omitempty"`
+	Origin string          `json:"origin,omitempty"`
+	ID     string          `json:"id,omitempty"`
+	Clean  bool            `json:"clean,omitempty"`
+	Subs   map[string]byte `json:"subs,omitempty"`
+	// NoLocal is the set of Subs filters that carry the v5 No Local option. Kept
+	// separate from Subs (rather than packed into its QoS byte) so an older
+	// server reading this record still sees a valid 0..2 QoS and simply ignores
+	// this field. Spec5 [3.8.3.1].
+	NoLocal []string                   `json:"no_local,omitempty"`
+	Cons    map[string]*ConsumerConfig `json:"cons,omitempty"`
+	PubRel  *ConsumerConfig            `json:"pubrel,omitempty"`
+	Will    *mqttPersistedWill         `json:"will,omitempty"`
 	// Session Expiry Interval (seconds) and disconnect Unix time (0 while
 	// connected): together the expiry deadline, restart-safe. Spec5 [3.1.2.11.2].
 	ExpiryInterval uint32 `json:"expiry,omitempty"`
@@ -505,6 +528,14 @@ type mqttRetainedMsg struct {
 	// PUBLISH, forwarded to v5 subscribers when the message is replayed. Empty
 	// for messages published by 3.1.1 clients or without properties.
 	Props []byte `json:"props,omitempty"`
+
+	// SessionHash is the authenticated No Local origin marker (HMAC of the
+	// publishing session hash, subject, and payload under a per-server secret)
+	// for the session that published this retained message, so No Local can
+	// suppress replaying it to that same session without trusting a forgeable
+	// header. Empty when v5 is disabled or there is no publishing session. Spec5
+	// [3.8.3.1].
+	SessionHash string `json:"session_hash,omitempty"`
 
 	// expires is the absolute deadline after which this retained message must no
 	// longer be delivered, when it was published with an MQTT 5.0 Message Expiry
@@ -546,6 +577,12 @@ type mqttSub struct {
 	// '*' or '*/'.  It is set up at the time of subscription and is immutable
 	// after that.
 	reserved bool
+
+	// noLocal is the v5 No Local subscription option: when set, a message
+	// published by this same session's connection must not be delivered to this
+	// subscription. Read in the delivery callbacks under sess.subsMu/sess.mu,
+	// like qos. Spec5 [3.8.3.1].
+	noLocal bool
 }
 
 type mqtt struct {
@@ -561,6 +598,14 @@ type mqtt struct {
 	// It outlives individual packets so that ACK/DISCONNECT handlers running
 	// long after CONNECT can select the proper wire framing.
 	proto byte
+
+	// pubOrigin is the authenticated No Local origin marker (or empty) resolved
+	// for the message currently being delivered. Set by
+	// mqttInitiateMsgDeliveryJSA before onward processing so mqttHandlePubRetain
+	// stamps a retained copy with the same value the live delivery used — in
+	// particular empty for a server-originated Will, whatever path delivers it.
+	// Valid only for the duration of that call. Spec5 [3.8.3.1].
+	pubOrigin string
 
 	// maxPacketSize is the current connection's MQTT 5.0 Maximum Packet Size:
 	// the largest PUBLISH (whole control packet) the client is willing to
@@ -691,6 +736,9 @@ type mqttFilter struct {
 	// 0 = send retained at subscribe, 1 = send only if the subscription is new,
 	// 2 = never. Zero value (0) matches 3.1.1 behavior. Spec5 [3.8.3.1].
 	retainHandling byte
+	// v5 No Local subscription option (bit 2): when set, a message must not be
+	// delivered back to the connection that published it. Spec5 [3.8.3.1].
+	noLocal bool
 	// v5 (UN)SUBACK reason code for this filter (zero value is success).
 	reason byte
 	// Used only for tracing and should not be used after parsing of (un)sub protocols.
@@ -732,6 +780,10 @@ const (
 	mqttNatsRetainedMessageOrigin = "Nmqtt-ROrigin"
 	mqttNatsRetainedMessageFlags  = "Nmqtt-RFlags"
 	mqttNatsRetainedMessageSource = "Nmqtt-RSource"
+	// Authenticated No Local origin marker for the session that published the
+	// retained message (see mqttNatsHeaderOrigin). Absent for older stored
+	// messages or when v5 is disabled.
+	mqttNatsRetainedMessageSessionHash = "Nmqtt-RSession"
 	// Raw MQTT 5.0 properties block for a retained message (base64), so v5
 	// properties are replayed to subscribers. Absent for older stored messages.
 	mqttNatsRetainedMessageProps = "Nmqtt-RProps"
@@ -756,6 +808,16 @@ const (
 	// CRLF-delimited text) so end-to-end properties survive the NATS/JetStream
 	// hop and can be re-emitted to v5 subscribers.
 	mqttNatsHeaderProps = "Nmqtt-Props"
+
+	// NATS header carrying an authenticated No Local origin marker (an HMAC of
+	// the publishing session hash, subject, and payload under a per-server
+	// secret), so the v5 No Local option can suppress delivering a QoS 1/2
+	// message back to the connection that published it after it crosses the
+	// JetStream store, where the origin client is otherwise lost. Because it is
+	// an HMAC, a client that can write the stream subjects cannot forge it. Absent
+	// when the publisher
+	// has no session (e.g. an internal Will client) or v5 is off. Spec5 [3.8.3.1].
+	mqttNatsHeaderOrigin = "Nmqtt-Origin"
 )
 
 type mqttParsedPublishNATSHeader struct {
@@ -763,6 +825,7 @@ type mqttParsedPublishNATSHeader struct {
 	subject []byte
 	mapped  []byte
 	props   []byte // raw MQTT 5.0 properties block (decoded from Nmqtt-Props)
+	origin  []byte // authenticated No Local origin marker (from Nmqtt-Origin)
 }
 
 func (s *Server) startMQTT() {
@@ -784,6 +847,14 @@ func (s *Server) startMQTT() {
 	s.mu.Lock()
 	s.mqtt.sessmgr.sessions = make(map[string]*mqttAccountSessionManager)
 	s.mqtt.v5Enabled = o.MaxProtocolVersion >= mqttProtoLevel5
+	// Per-server secret keying the No Local origin HMAC. Best-effort: if the read
+	// fails the key stays nil and No Local simply never suppresses (fail-open).
+	if s.mqtt.originKey == nil {
+		key := make([]byte, 32)
+		if _, err := rand.Read(key); err == nil {
+			s.mqtt.originKey = key
+		}
+	}
 	hl, err = natsListen("tcp", hp)
 	s.mqtt.listenerErr = err
 	if err != nil {
@@ -1521,6 +1592,7 @@ func mqttParsePublishNATSHeader(headerBytes []byte) *mqttParsedPublishNATSHeader
 		qos:     pubValue[0] - '0',
 		subject: getHeader(mqttNatsHeaderSubject, headerBytes),
 		mapped:  getHeader(mqttNatsHeaderMapped, headerBytes),
+		origin:  getHeader(mqttNatsHeaderOrigin, headerBytes),
 	}
 	// MQTT 5.0 properties block, carried base64-encoded. This header can come
 	// from an untrusted source (a NATS publisher can set Nmqtt-Pub/Nmqtt-Props
@@ -2962,7 +3034,8 @@ func (as *mqttAccountSessionManager) fireWill(s *Server, idHash string, expected
 	// last two payload bytes are stripped as a protocol CRLF). asm is needed for
 	// a retained Will; proto marks this as v5. Spec5 [3.1.3.2.2].
 	c.mqtt = &mqtt{pp: pp, asm: as, proto: mqttProtoLevel5}
-	if err := s.mqttInitiateMsgDeliveryJSA(c, &as.jsa, pp); err != nil {
+	// A Will is server-originated: no No Local origin. Spec5 [3.8.3.1].
+	if err := s.mqttInitiateMsgDeliveryJSA(c, &as.jsa, pp, _EMPTY_); err != nil {
 		s.Warnf("MQTT: failed to deliver delayed Will for client %q: %v", idHash, err)
 	}
 	c.flushClients(0)
@@ -3637,14 +3710,14 @@ func (as *mqttAccountSessionManager) removeSession(sess *mqttSession, lock bool)
 // waiting.
 func (sess *mqttSession) processQOS12Sub(
 	c *client, // subscribing client.
-	subject, sid []byte, isReserved bool, qos byte, jsDurName string, h msgHandler, // subscription parameters.
+	subject, sid []byte, isReserved bool, qos byte, noLocal bool, jsDurName string, h msgHandler, // subscription parameters.
 ) (*subscription, error) {
-	return sess.processSub(c, subject, sid, isReserved, qos, jsDurName, h, false, nil, false, nil)
+	return sess.processSub(c, subject, sid, isReserved, qos, noLocal, jsDurName, h, false, nil, false, nil)
 }
 
 func (sess *mqttSession) processSub(
 	c *client, // subscribing client.
-	subject, sid []byte, isReserved bool, qos byte, jsDurName string, h msgHandler, // subscription parameters.
+	subject, sid []byte, isReserved bool, qos byte, noLocal bool, jsDurName string, h msgHandler, // subscription parameters.
 	initShadow bool, // do we need to scan for shadow subscriptions? (not for QOS1+)
 	rms map[string]*mqttRetainedMsg, // preloaded rms (can be empty, or missing items if errors)
 	trace bool, // trace serialized retained messages in the log?
@@ -3683,6 +3756,7 @@ func (sess *mqttSession) processSub(
 		// QOS and jsDurName can be changed on an existing subscription, so
 		// accessing it later requires a lock.
 		ss.mqtt.qos = qos
+		ss.mqtt.noLocal = noLocal
 		ss.mqtt.jsDur = jsDurName
 		// A (re)configured subscription is live; clear any prior teardown mark.
 		ss.mqtt.closed = false
@@ -3695,6 +3769,32 @@ func (sess *mqttSession) processSub(
 	}
 
 	return sub, nil
+}
+
+// mqttNoLocalList returns the No Local filter set as a slice for persistence
+// (nil when empty, to omit the JSON field).
+func mqttNoLocalList(set map[string]struct{}) []string {
+	if len(set) == 0 {
+		return nil
+	}
+	l := make([]string, 0, len(set))
+	for f := range set {
+		l = append(l, f)
+	}
+	return l
+}
+
+// mqttNoLocalSet rebuilds the No Local filter set from a persisted slice (nil
+// when empty).
+func mqttNoLocalSet(l []string) map[string]struct{} {
+	if len(l) == 0 {
+		return nil
+	}
+	set := make(map[string]struct{}, len(l))
+	for _, f := range l {
+		set[f] = struct{}{}
+	}
+	return set
 }
 
 // mqttShouldSendRetained reports whether retained messages must be replayed for
@@ -3850,7 +3950,7 @@ func (as *mqttAccountSessionManager) processSubs(sess *mqttSession, c *client,
 		as.mu.Lock()
 		sess.mu.Lock()
 		sub, err = sess.processSub(c,
-			bsubject, bsid, isReserved, f.qos, // main subject
+			bsubject, bsid, isReserved, f.qos, f.noLocal, // main subject
 			_EMPTY_, mqttDeliverMsgCbQoS0, // no jsDur for QOS0
 			processShadowSubs,
 			subRMS, trace, as)
@@ -3867,7 +3967,7 @@ func (as *mqttAccountSessionManager) processSubs(sess *mqttSession, c *client,
 		// subscriptions of QoS >= 1. But if a JS consumer already exists and
 		// the subscription for same subject is now a QoS==0, then the JS
 		// consumer will be deleted.
-		jscons, jssub, err = sess.processJSConsumer(c, subject, sid, f.qos, fromSubProto)
+		jscons, jssub, err = sess.processJSConsumer(c, subject, sid, f.qos, f.noLocal, fromSubProto)
 		if err != nil {
 			f.qos = mqttSubAckFailure
 			sess.cleanupFailedSub(c, sub, jscons, jssub)
@@ -3884,7 +3984,7 @@ func (as *mqttAccountSessionManager) processSubs(sess *mqttSession, c *client,
 			as.mu.Lock()
 			sess.mu.Lock()
 			fwcsub, err = sess.processSub(c,
-				[]byte(fwcsubject), []byte(fwcsid), isReserved, f.qos, // FWC (top-level wildcard) subject
+				[]byte(fwcsubject), []byte(fwcsid), isReserved, f.qos, f.noLocal, // FWC (top-level wildcard) subject
 				_EMPTY_, mqttDeliverMsgCbQoS0, // no jsDur for QOS0
 				processShadowSubs,
 				subRMS, trace, as)
@@ -3897,7 +3997,7 @@ func (as *mqttAccountSessionManager) processSubs(sess *mqttSession, c *client,
 				continue
 			}
 
-			fwjscons, fwjssub, err = sess.processJSConsumer(c, fwcsubject, fwcsid, f.qos, fromSubProto)
+			fwjscons, fwjssub, err = sess.processJSConsumer(c, fwcsubject, fwcsid, f.qos, f.noLocal, fromSubProto)
 			if err != nil {
 				// c.processSub already called c.Errorf(), so no need here.
 				f.qos = mqttSubAckFailure
@@ -3948,6 +4048,16 @@ func (as *mqttAccountSessionManager) serializeRetainedMsgsForSub(rms map[string]
 		// [3.3.2.3.3].
 		if !rm.expires.IsZero() && !time.Now().Before(rm.expires) {
 			return
+		}
+		// No Local: do not replay a retained message this same session published.
+		// The stored SessionHash is the authenticated origin marker; recompute it
+		// for this session+subject+payload and suppress only on an authentic
+		// match. Spec5 [3.8.3.1].
+		if sub.mqtt.noLocal {
+			expected := mqttOriginMarker(c.srv.mqtt.originKey, sess.idHash, string(subj), rm.Msg)
+			if mqttNoLocalSuppress(true, rm.SessionHash, expected) {
+				return
+			}
 		}
 		// A broad wildcard subscription can overlap a subscribe deny clause.
 		c.mu.Lock()
@@ -4156,6 +4266,9 @@ func mqttEncodeRetainedMessageTTL(rm *mqttRetainedMsg, withTTL bool) (natsMsg []
 	if rm.Source != _EMPTY_ {
 		l += len(mqttNatsRetainedMessageSource) + 1 + len(rm.Source) + 2 // 1 byte for ':', 2 bytes for CRLF
 	}
+	if rm.SessionHash != _EMPTY_ {
+		l += len(mqttNatsRetainedMessageSessionHash) + 1 + len(rm.SessionHash) + 2 // 1 byte for ':', 2 bytes for CRLF
+	}
 	if len(rm.Props) > 0 {
 		l += len(mqttNatsRetainedMessageProps) + 1 + base64.StdEncoding.EncodedLen(len(rm.Props)) + 2 // 1 byte for ':', 2 bytes for CRLF
 	}
@@ -4200,6 +4313,12 @@ func mqttEncodeRetainedMessageTTL(rm *mqttRetainedMsg, withTTL bool) (natsMsg []
 		buf.WriteString(mqttNatsRetainedMessageSource)
 		buf.WriteByte(':')
 		buf.WriteString(rm.Source)
+		buf.WriteString(_CRLF_)
+	}
+	if rm.SessionHash != _EMPTY_ {
+		buf.WriteString(mqttNatsRetainedMessageSessionHash)
+		buf.WriteByte(':')
+		buf.WriteString(rm.SessionHash)
 		buf.WriteString(_CRLF_)
 	}
 	if len(rm.Props) > 0 {
@@ -4285,11 +4404,12 @@ func mqttSliceHeaders(headers map[string][]byte, hdr []byte) {
 // responsibility to make a copy of the byte slice.
 func mqttDecodeRetainedMessage(subject string, h, m []byte) (*mqttRetainedMsg, error) {
 	headers := map[string][]byte{
-		mqttNatsRetainedMessageOrigin: nil,
-		mqttNatsRetainedMessageFlags:  nil,
-		mqttNatsRetainedMessageSource: nil,
-		mqttNatsRetainedMessageProps:  nil,
-		mqttNatsRetainedMessageExpiry: nil,
+		mqttNatsRetainedMessageOrigin:      nil,
+		mqttNatsRetainedMessageFlags:       nil,
+		mqttNatsRetainedMessageSource:      nil,
+		mqttNatsRetainedMessageProps:       nil,
+		mqttNatsRetainedMessageExpiry:      nil,
+		mqttNatsRetainedMessageSessionHash: nil,
 	}
 	var rm *mqttRetainedMsg
 	// Retrieve the values for the above headers.
@@ -4309,10 +4429,11 @@ func mqttDecodeRetainedMessage(subject string, h, m []byte) (*mqttRetainedMsg, e
 			return nil, errMQTTInvalidRetainFlags
 		}
 		rm = &mqttRetainedMsg{
-			Flags:  byte(flagsUint),
-			Origin: string(headers[mqttNatsRetainedMessageOrigin]),
-			Source: string(headers[mqttNatsRetainedMessageSource]),
-			Msg:    m,
+			Flags:       byte(flagsUint),
+			Origin:      string(headers[mqttNatsRetainedMessageOrigin]),
+			Source:      string(headers[mqttNatsRetainedMessageSource]),
+			SessionHash: string(headers[mqttNatsRetainedMessageSessionHash]),
+			Msg:         m,
 		}
 		// MQTT 5.0 properties block (base64). Absent for older stored messages.
 		// Validate before keeping it: the retained stream could contain a
@@ -4414,6 +4535,7 @@ func (as *mqttAccountSessionManager) createOrRestoreSession(clientID string, opt
 	sess.domainTk = as.domainTk
 	sess.clean = ps.Clean
 	sess.subs = ps.Subs
+	sess.noLocalSubs = mqttNoLocalSet(ps.NoLocal)
 	sess.cons = ps.Cons
 	sess.pubRelConsumer = ps.PubRel
 	sess.expiryInterval = ps.ExpiryInterval
@@ -4642,6 +4764,7 @@ func (sess *mqttSession) save() error {
 		ID:             sess.id,
 		Clean:          sess.clean,
 		Subs:           sess.subs,
+		NoLocal:        mqttNoLocalList(sess.noLocalSubs),
 		Cons:           sess.cons,
 		PubRel:         sess.pubRelConsumer,
 		Will:           sess.will,
@@ -4701,6 +4824,7 @@ func (sess *mqttSession) clear(noWait bool) error {
 	}
 
 	sess.subs = nil
+	sess.noLocalSubs = nil
 	sess.pendingPublish = nil
 	sess.pendingPubRel = nil
 	sess.cpending = nil
@@ -4757,9 +4881,26 @@ func (sess *mqttSession) update(filters []*mqttFilter, add bool) error {
 				sess.subs[f.filter] = f.qos
 				needUpdate = true
 			}
+			// Track No Local in a separate set so the persisted QoS byte stays in
+			// the 0..2 range older servers understand. Spec5 [3.8.3.1].
+			_, hadNoLocal := sess.noLocalSubs[f.filter]
+			if f.noLocal && !hadNoLocal {
+				if sess.noLocalSubs == nil {
+					sess.noLocalSubs = make(map[string]struct{})
+				}
+				sess.noLocalSubs[f.filter] = struct{}{}
+				needUpdate = true
+			} else if !f.noLocal && hadNoLocal {
+				delete(sess.noLocalSubs, f.filter)
+				needUpdate = true
+			}
 		} else {
 			if _, ok := sess.subs[f.filter]; ok {
 				delete(sess.subs, f.filter)
+				needUpdate = true
+			}
+			if _, ok := sess.noLocalSubs[f.filter]; ok {
+				delete(sess.noLocalSubs, f.filter)
 				needUpdate = true
 			}
 		}
@@ -5709,7 +5850,8 @@ CHECK:
 	if l := len(es.subs); l > 0 {
 		filters := make([]*mqttFilter, 0, l)
 		for subject, qos := range es.subs {
-			filters = append(filters, &mqttFilter{filter: subject, qos: qos})
+			_, noLocal := es.noLocalSubs[subject]
+			filters = append(filters, &mqttFilter{filter: subject, qos: qos, noLocal: noLocal})
 		}
 		if _, err := asm.processSubs(es, c, filters, false, trace); err != nil {
 			return err
@@ -5945,7 +6087,9 @@ func (s *Server) mqttHandleWill(c *client, sessionExpiry uint32) {
 	// the client's last PUBLISH with the Will's own. Spec5 [3.1.3.2].
 	pp.props = mqttWillForwardProps(will.props)
 	c.mu.Unlock()
-	s.mqttInitiateMsgDelivery(c, pp)
+	// A Will is server-originated: no No Local origin, matching the delayed Will
+	// path so suppression does not depend on the Will Delay Interval. Spec5 [3.8.3.1].
+	s.mqttInitiateMsgDelivery(c, pp, _EMPTY_)
 	c.flushClients(0)
 }
 
@@ -6116,16 +6260,70 @@ func mqttPubTrace(pp *mqttPublish) string {
 		pp.topic, dup, qos, retain, pp.sz, piStr)
 }
 
+// mqttOriginMarker returns the authenticated No Local origin marker for a
+// message published by session idHash on subject with the given payload: an
+// HMAC of (idHash, subject, payload) under the server's per-run secret.
+//
+// It authenticates only a narrow claim used by the No Local decision — "this
+// subscriber's own session published this subject+payload" — not that the whole
+// stored message is server-created or fresh. Because the secret never leaves the
+// server, a client cannot forge a marker for a session it does not control. The
+// marker is deterministic (hence emitted in a readable header and observable),
+// so it can be replayed; that is not a weakness here, because the marker is
+// keyed by the origin idHash: replaying a victim's marker can only re-assert the
+// victim's own origin for that same subject+payload, which No Local suppresses
+// anyway, while an independently-authored message carries a different origin's
+// marker and is delivered. Empty when there is no key or no session (nothing to
+// authenticate). idHash and subject contain no NUL, so the NUL separators
+// delimit the fields unambiguously. Spec5 [3.8.3.1].
+func mqttOriginMarker(key []byte, idHash, subject string, payload []byte) string {
+	if len(key) == 0 || idHash == _EMPTY_ {
+		return _EMPTY_
+	}
+	mac := hmac.New(sha256.New, key)
+	mac.Write([]byte(idHash))
+	mac.Write([]byte{0})
+	mac.Write([]byte(subject))
+	mac.Write([]byte{0})
+	mac.Write(payload)
+	// 16 bytes of tag is ample against forgery and keeps the header small.
+	return base64.RawStdEncoding.EncodeToString(mac.Sum(nil)[:16])
+}
+
+// mqttStampedOrigin is the origin marker to stamp on a message this client is
+// publishing on subject with payload, or empty when the server does not run v5
+// (no No Local subscription can exist) or the client has no session (e.g. an
+// internal Will-delivery client, so a Will is never treated as self-published).
+// Spec5 [3.8.3.1].
+func (c *client) mqttStampedOrigin(subject string, payload []byte) string {
+	if c.mqtt == nil || c.mqtt.sess == nil || c.srv == nil || !c.srv.mqtt.v5Enabled {
+		return _EMPTY_
+	}
+	return mqttOriginMarker(c.srv.mqtt.originKey, c.mqtt.sess.idHash, subject, payload)
+}
+
+// mqttNoLocalSuppress reports whether a No Local subscription must drop this
+// delivery: the message was published by the same session (its ID hash matches
+// the subscriber's). An unknown origin (empty hash) never suppresses. Spec5
+// [3.8.3.1].
+func mqttNoLocalSuppress(noLocal bool, originHash, subHash string) bool {
+	return noLocal && originHash != _EMPTY_ && originHash == subHash
+}
+
 // mqttComputeNatsMsgSize computes the size the NATS message to be delivered
 // based on a MQTT PUBLISH packet.
 // encodePP: whether to encode complete MQTT PUBLISH packet header information
 //   - false: initial delivery (QoS 0/1) needs only base header
 //   - true: QoS2 storage needs to encode Nmqtt-Subject and Nmqtt-Mapped
-func mqttComputeNatsMsgSize(pp *mqttPublish, encodePP bool, ttl uint32) int {
+func mqttComputeNatsMsgSize(pp *mqttPublish, encodePP bool, ttl uint32, origin string) int {
 	size := len(hdrLine) +
 		len(mqttNatsHeader) + 2 + 2 + // 2 for ':<qos>', and 2 for CRLF
 		2 + // end-of-header CRLF
 		pp.sz
+	if len(origin) > 0 {
+		size += len(mqttNatsHeaderOrigin) + 1 + // +1 for ':'
+			len(origin) + 2 // 2 for CRLF
+	}
 	if encodePP {
 		size += len(mqttNatsHeaderSubject) + 1 + // +1 for ':'
 			len(pp.subject) + 2 // 2 for CRLF
@@ -6159,8 +6357,8 @@ func mqttComputeNatsMsgSize(pp *mqttPublish, encodePP bool, ttl uint32) int {
 //	NATS/1.0\r\n
 //	Nmqtt-Pub:2foo.bar\r\n
 //	\r\n
-func mqttNewDeliverableMessage(pp *mqttPublish, encodePP bool, ttl uint32) (natsMsg []byte, headerLen int) {
-	size := mqttComputeNatsMsgSize(pp, encodePP, ttl)
+func mqttNewDeliverableMessage(pp *mqttPublish, encodePP bool, ttl uint32, origin string) (natsMsg []byte, headerLen int) {
+	size := mqttComputeNatsMsgSize(pp, encodePP, ttl, origin)
 
 	buf := bytes.NewBuffer(make([]byte, 0, size))
 
@@ -6171,6 +6369,15 @@ func mqttNewDeliverableMessage(pp *mqttPublish, encodePP bool, ttl uint32) (nats
 	buf.WriteByte(':')
 	buf.WriteByte(qos + '0')
 	buf.WriteString(_CRLF_)
+
+	// Authenticated No Local origin marker. Absent when the publisher has no
+	// session or v5 is off. Spec5 [3.8.3.1].
+	if len(origin) > 0 {
+		buf.WriteString(mqttNatsHeaderOrigin)
+		buf.WriteByte(':')
+		buf.WriteString(origin)
+		buf.WriteString(_CRLF_)
+	}
 
 	if encodePP {
 		buf.WriteString(mqttNatsHeaderSubject)
@@ -6242,6 +6449,16 @@ func mqttNewDeliverablePubRel(pi uint16) (natsMsg []byte, headerLen int) {
 func (s *Server) mqttProcessPub(c *client, pp *mqttPublish, trace bool) error {
 	qos := mqttGetQoS(pp.flags)
 
+	// Authenticated No Local origin marker for this publish, stamped on the
+	// delivered/stored message. Only QoS>0 (JetStream-stored) and retained
+	// messages are read back for No Local, so a plain QoS0 message skips the
+	// (payload-hashing) computation and carries no marker. Empty for 3.1.1 or
+	// when v5 is off. Spec5 [3.8.3.1].
+	var origin string
+	if qos > 0 || mqttIsRetained(pp.flags) {
+		origin = c.mqttStampedOrigin(string(pp.subject), pp.msg)
+	}
+
 	// Enforce max_payload using existing client max payload logic (mpay) by
 	// checking the largest NATS message size that would be processed, including
 	// the Nats-TTL header that a Message Expiry Interval adds to the stored
@@ -6249,9 +6466,11 @@ func (s *Server) mqttProcessPub(c *client, pp *mqttPublish, trace bool) error {
 	// later delivered with the TTL header (no subject headers); the two header
 	// sets never coexist, so we compare the two actual forms rather than sum them.
 	if maxPayload := atomic.LoadInt32(&c.mpay); maxPayload != jwt.NoLimit {
-		total := mqttComputeNatsMsgSize(pp, false, c.mqttStoredMsgTTL(pp))
+		// The delivered form carries the Nmqtt-Origin header; the QoS2 hold copy
+		// does not (origin is re-derived from the client on PUBREL release).
+		total := mqttComputeNatsMsgSize(pp, false, c.mqttStoredMsgTTL(pp), origin)
 		if qos == 2 {
-			if hold := mqttComputeNatsMsgSize(pp, true, 0); hold > total {
+			if hold := mqttComputeNatsMsgSize(pp, true, 0, _EMPTY_); hold > total {
 				total = hold
 			}
 		}
@@ -6263,7 +6482,7 @@ func (s *Server) mqttProcessPub(c *client, pp *mqttPublish, trace bool) error {
 
 	switch qos {
 	case 0:
-		return s.mqttInitiateMsgDelivery(c, pp)
+		return s.mqttInitiateMsgDelivery(c, pp, origin)
 
 	case 1:
 		// [MQTT-4.3.2-2]. Initiate onward delivery of the Application Message,
@@ -6273,7 +6492,7 @@ func (s *Server) mqttProcessPub(c *client, pp *mqttPublish, trace bool) error {
 		// Message before sending the PUBACK. When its original sender receives
 		// the PUBACK packet, ownership of the Application Message is
 		// transferred to the receiver.
-		err := s.mqttInitiateMsgDelivery(c, pp)
+		err := s.mqttInitiateMsgDelivery(c, pp, origin)
 		if err == nil {
 			c.mqttEnqueuePubResponse(mqttPacketPubAck, pp.pi, trace)
 		}
@@ -6307,8 +6526,8 @@ func (c *client) mqttStoredMsgTTL(pp *mqttPublish) uint32 {
 	return mqttMessageExpiryTTL(pp.props)
 }
 
-func (s *Server) mqttInitiateMsgDelivery(c *client, pp *mqttPublish) error {
-	return s.mqttInitiateMsgDeliveryJSA(c, c.mqtt.sess.jsa, pp)
+func (s *Server) mqttInitiateMsgDelivery(c *client, pp *mqttPublish, origin string) error {
+	return s.mqttInitiateMsgDeliveryJSA(c, c.mqtt.sess.jsa, pp, origin)
 }
 
 // mqttInitiateMsgDeliveryJSA is mqttInitiateMsgDelivery with an explicit
@@ -6316,12 +6535,17 @@ func (s *Server) mqttInitiateMsgDelivery(c *client, pp *mqttPublish) error {
 // c.mqtt.sess. This lets a delayed Will (MQTT 5.0 Will Delay Interval,
 // [MQTT-3.1.2-8]) be published after its originating client is gone, using the
 // account's internal client and JSA.
-func (s *Server) mqttInitiateMsgDeliveryJSA(c *client, jsa *mqttJSA, pp *mqttPublish) error {
+//
+// origin is the authenticated No Local origin marker stamped for the No Local
+// option, passed explicitly so it does not depend on which client (real or
+// internal) drives delivery: a normal PUBLISH passes c.mqttStampedOrigin(subj),
+// while a Will is server-originated and passes _EMPTY_. Spec5 [3.8.3.1].
+func (s *Server) mqttInitiateMsgDeliveryJSA(c *client, jsa *mqttJSA, pp *mqttPublish, origin string) error {
 	// A stored (QoS 1/2) PUBLISH carrying an MQTT 5.0 Message Expiry Interval is
 	// given a matching JetStream per-message TTL so it is dropped from the
 	// delivery stream once its lifetime elapses. Spec5 [3.3.2.3.3]. Degraded
 	// mode drops the header; delivery-side expiry checks still apply.
-	natsMsg, headerLen := mqttNewDeliverableMessage(pp, false, c.mqttStoredMsgTTL(pp))
+	natsMsg, headerLen := mqttNewDeliverableMessage(pp, false, c.mqttStoredMsgTTL(pp), origin)
 
 	// Set the client's pubarg for processing.
 	c.pa.subject = pp.subject
@@ -6331,6 +6555,10 @@ func (s *Server) mqttInitiateMsgDeliveryJSA(c *client, jsa *mqttJSA, pp *mqttPub
 	c.pa.hdb = []byte(strconv.FormatInt(int64(c.pa.hdr), 10))
 	c.pa.size = len(natsMsg)
 	c.pa.szb = []byte(strconv.FormatInt(int64(c.pa.size), 10))
+	// Expose the resolved No Local origin so mqttHandlePubRetain (invoked inside
+	// processInboundClientMsg for a retained PUBLISH) stamps the stored copy with
+	// the same value as the live delivery header. Spec5 [3.8.3.1].
+	c.mqtt.pubOrigin = origin
 	defer func() {
 		c.pa.subject = nil
 		c.pa.mapped = nil
@@ -6339,6 +6567,7 @@ func (s *Server) mqttInitiateMsgDeliveryJSA(c *client, jsa *mqttJSA, pp *mqttPub
 		c.pa.hdb = nil
 		c.pa.size = 0
 		c.pa.szb = nil
+		c.mqtt.pubOrigin = _EMPTY_
 	}()
 
 	_, permIssue := c.processInboundClientMsg(natsMsg)
@@ -6370,7 +6599,7 @@ func (s *Server) mqttStoreQoS2MsgOnce(c *client, pp *mqttPublish) error {
 	// `true` means encode the MQTT PUBLISH packet in the NATS message header. No
 	// TTL here: this is the QoS2 dedup hold stream (no AllowMsgTTL); the expiry
 	// TTL is applied when the message is moved to the delivery stream on PUBREL.
-	natsMsg, headerLen := mqttNewDeliverableMessage(pp, true, 0)
+	natsMsg, headerLen := mqttNewDeliverableMessage(pp, true, 0, _EMPTY_)
 
 	// Do not broadcast the message until it has been deduplicated and released
 	// by the sender. Instead store this QoS2 message as
@@ -6445,7 +6674,7 @@ func (s *Server) mqttProcessPubRel(c *client, pi uint16, trace bool) error {
 		return nil
 	}
 
-	return s.mqttInitiateMsgDelivery(c, pp)
+	return s.mqttInitiateMsgDelivery(c, pp, c.mqttStampedOrigin(string(pp.subject), pp.msg))
 }
 
 // Invoked when processing an inbound client message. If the "retain" flag is
@@ -6497,6 +6726,9 @@ func (c *client) mqttHandlePubRetain() {
 		Flags:  pp.flags,
 		Source: c.opts.Username,
 		Props:  pp.props, // v5 properties to replay to subscribers
+		// Same No Local origin the live delivery used (empty for a Will), so
+		// retained replay is suppressed under No Local consistently. Spec5 [3.8.3.1].
+		SessionHash: c.mqtt.pubOrigin,
 	}
 
 	// MQTT 5.0 Message Expiry Interval on a retained message: record the absolute
@@ -6978,6 +7210,7 @@ func (c *client) mqttParseSubsOrUnsubs(r *mqttReader, b byte, pl int, sub bool) 
 		}
 		var qos, reason byte
 		var retainHandling byte
+		var noLocal bool
 		// We are going to report if we had an error during the conversion,
 		// but we don't fail the parsing. When processing the sub, we will
 		// have an error then, and the processing of subs code will send
@@ -7008,12 +7241,18 @@ func (c *client) mqttParseSubsOrUnsubs(r *mqttReader, b byte, pl int, sub bool) 
 				if retainHandling == 3 {
 					return 0, nil, fmt.Errorf("%w: retain handling value 3 is reserved", errMQTTProtocolError)
 				}
-				// No Local (bit 2) and Retain As Published (bit 3) are not yet
-				// honored; reject rather than ACK success for an option we would
-				// then silently ignore. A client using only defaults (bits 0) is
-				// unaffected. Spec5 [3.8.3.1].
-				if opts&0x0C != 0 {
-					return 0, nil, fmt.Errorf("%w: options byte 0x%x sets No Local or Retain As Published", errMQTTUnsupportedSubOption, opts)
+				// Retain As Published (bit 3) is not yet honored; reject rather
+				// than ACK success for an option we would then silently ignore. A
+				// client using only defaults (bits 0) is unaffected. Spec5 [3.8.3.1].
+				if opts&0x08 != 0 {
+					return 0, nil, fmt.Errorf("%w: options byte 0x%x sets Retain As Published", errMQTTUnsupportedSubOption, opts)
+				}
+				noLocal = opts&0x04 != 0
+				// No Local on a Shared Subscription is a Protocol Error
+				// [MQTT-3.8.3-4]: fail the whole packet, stricter than the
+				// per-filter 0x9E rejection below.
+				if noLocal && bytes.HasPrefix(topic, mqttSharedSubPrefix) {
+					return 0, nil, fmt.Errorf("%w: No Local set on a shared subscription", errMQTTProtocolError)
 				}
 				qos = opts & 0x03
 				// Shared Subscriptions are advertised as unavailable in
@@ -7034,7 +7273,7 @@ func (c *client) mqttParseSubsOrUnsubs(r *mqttReader, b byte, pl int, sub bool) 
 				return 0, nil, fmt.Errorf("subscribe QoS value must be 0, 1 or 2, got %v", qos)
 			}
 		}
-		f := &mqttFilter{ttopic: topic, filter: string(filter), qos: qos, retainHandling: retainHandling, reason: reason}
+		f := &mqttFilter{ttopic: topic, filter: string(filter), qos: qos, retainHandling: retainHandling, noLocal: noLocal, reason: reason}
 		filters = append(filters, f)
 	}
 	// Spec [MQTT-3.8.3-3], [MQTT-3.10.3-2]
@@ -7097,6 +7336,7 @@ func mqttDeliverMsgCbQoS0(sub *subscription, pc *client, _ *Account, subject, re
 	// [MQTT-4.7.2-1].
 	sess.subsMu.RLock()
 	subQoS := sub.mqtt.qos
+	noLocal := sub.mqtt.noLocal
 	ignore := mqttMustIgnoreForReservedSub(sub, subject)
 	sess.subsMu.RUnlock()
 
@@ -7107,6 +7347,11 @@ func mqttDeliverMsgCbQoS0(sub *subscription, pc *client, _ *Account, subject, re
 	hdr, msg := pc.msgParts(rmsg)
 	var topic []byte
 	var props []byte
+	// originHash identifies the publishing session for the No Local option, set
+	// only when the publisher is a local MQTT client on this server. It is never
+	// taken from the message header on this direct path (see the non-MQTT branch
+	// below for why a stamped header is not trusted here). Spec5 [3.8.3.1].
+	var originHash string
 	if pc.isMqtt() {
 		// This is an MQTT publisher directly connected to this server.
 
@@ -7123,6 +7368,9 @@ func mqttDeliverMsgCbQoS0(sub *subscription, pc *client, _ *Account, subject, re
 		// mapping/transform occurred and we need to recreate the topic.
 		if subject != bytesToString(pc.mqtt.pp.subject) {
 			topic = natsSubjectStrToMQTTTopic(subject)
+		}
+		if noLocal && pc.mqtt.sess != nil {
+			originHash = pc.mqtt.sess.idHash
 		}
 
 	} else {
@@ -7145,6 +7393,21 @@ func mqttDeliverMsgCbQoS0(sub *subscription, pc *client, _ *Account, subject, re
 		if h != nil {
 			props = h.props
 		}
+		// No Local origin is deliberately NOT taken from the message header here.
+		// A stamped Nmqtt-Origin is forgeable by any NATS client (locally or on a
+		// remote server, arriving over a route/gateway/leaf), so trusting it would
+		// let an attacker set a victim's deterministic session hash and silently
+		// drop its No Local subscription's messages. This is safe: No Local only
+		// suppresses delivery back to the *same connection* that published, and a
+		// client ID is connected at most once, so that connection — and its
+		// suppression — is always on this server via the isMqtt branch above. A
+		// routed/foreign publisher is by definition a different connection and
+		// must not be suppressed. Spec5 [3.8.3.1].
+	}
+
+	// No Local: drop a message published by this same session. Spec5 [3.8.3.1].
+	if mqttNoLocalSuppress(noLocal, originHash, sess.idHash) {
+		return
 	}
 
 	// MQTT 5.0 Message Expiry Interval of 0 expires the message immediately, so
@@ -7233,6 +7496,26 @@ func mqttDeliverMsgCbQoS12(sub *subscription, pc *client, _ *Account, subject, r
 		sess.mu.Unlock()
 		sess.jsa.sendAck(reply)
 		return
+	}
+
+	// No Local: a message published by this same session must not be delivered
+	// to this subscription. Ack it so the JS consumer does not redeliver it.
+	if sub.mqtt.noLocal {
+		// The stored origin is an HMAC authenticating "this session published this
+		// payload on this subject". Recompute it for the subscribing session; a
+		// match proves authenticity (a forged/replayed header cannot reproduce the
+		// server secret for a different payload) and self-authorship. A mismatch or
+		// absent marker delivers. Spec5 [3.8.3.1].
+		var marker string
+		if h != nil {
+			marker = string(h.origin)
+		}
+		expected := mqttOriginMarker(cc.srv.mqtt.originKey, sess.idHash, strippedSubj, msg)
+		if mqttNoLocalSuppress(true, marker, expected) {
+			sess.mu.Unlock()
+			sess.jsa.sendAck(reply)
+			return
+		}
 	}
 
 	pi, dup, started := sess.trackPublish(sub.mqtt.jsDur, reply)
@@ -7638,7 +7921,7 @@ func (sess *mqttSession) ensurePubRelConsumerSubscription(c *client) error {
 // Session lock is acquired and released as needed. Session is in the locked
 // map.
 func (sess *mqttSession) processJSConsumer(c *client, subject, sid string,
-	qos byte, fromSubProto bool) (*ConsumerConfig, *subscription, error) {
+	qos byte, noLocal, fromSubProto bool) (*ConsumerConfig, *subscription, error) {
 
 	sess.mu.Lock()
 	cc, exists := sess.cons[sid]
@@ -7693,6 +7976,27 @@ func (sess *mqttSession) processJSConsumer(c *client, subject, sid string,
 		// the JS consumer already exists, we are done (it was created
 		// during the processing of CONNECT).
 		if fromSubProto {
+			// A re-SUBSCRIBE to an existing QoS 1/2 filter can change the QoS and
+			// the No Local option, both read by the QoS 1/2 delivery callback off
+			// the delivery subscription. The durable consumer itself is unchanged,
+			// so refresh those fields here so the new values take effect. Spec5
+			// [MQTT-3.8.4-3], [3.8.3.1].
+			c.mu.Lock()
+			sub := c.subs[cc.DeliverSubject]
+			c.mu.Unlock()
+			if sub != nil {
+				// The QoS 1/2 callback reads these under sess.mu; the QoS0
+				// callback (on the shadow sub) under subsMu. Write under both, as
+				// processSub does, so both readers see a consistent value.
+				sess.mu.Lock()
+				sess.subsMu.Lock()
+				if sub.mqtt != nil {
+					sub.mqtt.qos = qos
+					sub.mqtt.noLocal = noLocal
+				}
+				sess.subsMu.Unlock()
+				sess.mu.Unlock()
+			}
 			return nil, nil, nil
 		}
 	}
@@ -7760,7 +8064,7 @@ func (sess *mqttSession) processJSConsumer(c *client, subject, sid string,
 	sess.mu.Lock()
 	sess.tmaxack = tmaxack
 	sub, err := sess.processQOS12Sub(c, []byte(inbox), []byte(inbox),
-		isMQTTReservedSubscription(subject), qos, cc.Durable, mqttDeliverMsgCbQoS12)
+		isMQTTReservedSubscription(subject), qos, noLocal, cc.Durable, mqttDeliverMsgCbQoS12)
 	sess.mu.Unlock()
 
 	if err != nil {

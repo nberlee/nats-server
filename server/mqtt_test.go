@@ -134,6 +134,51 @@ func testMQTTReadPacket(t testing.TB, r *mqttReader) (byte, int) {
 	return b, pl
 }
 
+// testMQTTReadPacketReady is testMQTTReadPacket but returns ok=false on a read
+// timeout instead of failing the test, for polling loops (e.g. waiting for an
+// asynchronously-stored retained message to become replayable).
+func testMQTTReadPacketReady(r *mqttReader, timeout time.Duration) (byte, int, bool) {
+	rd := r.reader
+	fill := func() ([]byte, bool) {
+		var buf [512]byte
+		n, err := rd.Read(buf[:])
+		if err != nil {
+			return nil, false
+		}
+		return copyBytes(buf[:n]), true
+	}
+	rd.SetReadDeadline(time.Now().Add(timeout))
+	defer rd.SetReadDeadline(time.Time{})
+	for {
+		r.pstart = r.pos
+		if !r.hasMore() {
+			b, ok := fill()
+			if !ok {
+				return 0, 0, false
+			}
+			r.reset(b)
+			continue
+		}
+		b, err := r.readByte("packet type")
+		if err != nil {
+			return 0, 0, false
+		}
+		pl, complete, err := r.readPacketLen(MAX_PAYLOAD_SIZE)
+		if err != nil {
+			return 0, 0, false
+		}
+		if !complete {
+			fb, ok := fill()
+			if !ok {
+				return 0, 0, false
+			}
+			r.reset(fb)
+			continue
+		}
+		return b, pl, true
+	}
+}
+
 func testMQTTReadPIPacket(expectedType byte, t testing.TB, r *mqttReader, expectedPI uint16) {
 	t.Helper()
 	b, _ := testMQTTReadPacket(t, r)

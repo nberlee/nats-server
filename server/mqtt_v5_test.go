@@ -244,6 +244,72 @@ func testMQTTPublishV5(t testing.TB, c net.Conn, qos byte, pi uint16, topic stri
 	}
 }
 
+// testMQTTPubV5SelfEcho publishes a QoS1 message on a topic the same connection
+// is subscribed to without No Local, then consumes both the PUBACK for the
+// publish and the echoed PUBLISH (acking it) in whichever order they arrive: the
+// server may begin onward delivery before it enqueues the PUBACK, so the order
+// is not deterministic. It asserts the echo's topic and payload.
+func testMQTTPubV5SelfEcho(t testing.TB, c net.Conn, r *mqttReader, pi uint16, topic string, payload []byte) {
+	t.Helper()
+	vh := newMQTTWriter(0)
+	vh.WriteBytes([]byte(topic))
+	vh.WriteUint16(pi)
+	vh.WriteVarInt(0) // empty properties
+	vh.Write(payload)
+	w := newMQTTWriter(0)
+	w.WriteByte(mqttPacketPub | (1 << 1))
+	w.WriteVarInt(vh.Len())
+	w.Write(vh.Bytes())
+	if _, err := testMQTTWrite(c, w.Bytes()); err != nil {
+		t.Fatalf("Error writing PUBLISH: %v", err)
+	}
+
+	var gotAck, gotEcho bool
+	for !(gotAck && gotEcho) {
+		b, pl := testMQTTReadPacket(t, r)
+		start := r.pos
+		switch b & mqttPacketMask {
+		case mqttPacketPubAck:
+			if gotAck {
+				t.Fatal("received two PUBACKs")
+			}
+			rpi, err := r.readUint16("puback pi")
+			if err != nil || rpi != pi {
+				t.Fatalf("Expected PUBACK pi=%v, got %v (err=%v)", pi, rpi, err)
+			}
+			gotAck = true
+		case mqttPacketPub:
+			if gotEcho {
+				t.Fatal("received two PUBLISHes")
+			}
+			etopic, err := r.readBytes("topic", false)
+			if err != nil {
+				t.Fatalf("Error reading topic: %v", err)
+			}
+			epi, err := r.readUint16("pi")
+			if err != nil {
+				t.Fatalf("Error reading pi: %v", err)
+			}
+			if _, err := r.readProperties(mqttPacketPub); err != nil {
+				t.Fatalf("Error reading PUBLISH properties: %v", err)
+			}
+			egot := r.buf[r.pos : start+pl]
+			if string(etopic) != topic || string(egot) != string(payload) {
+				t.Fatalf("Expected echo %q=%q, got %q=%q", topic, payload, etopic, egot)
+			}
+			pa := [4]byte{mqttPacketPubAck, 0x2, byte(epi >> 8), byte(epi)}
+			if _, err := testMQTTWrite(c, pa[:]); err != nil {
+				t.Fatalf("Error writing PUBACK: %v", err)
+			}
+			gotEcho = true
+		default:
+			t.Fatalf("Expected PUBACK or PUBLISH, got %x", b&mqttPacketMask)
+		}
+		// Consume the whole packet so the reader stays aligned for the next one.
+		r.pos = start + pl
+	}
+}
+
 // testMQTTReadPublishV5 reads a PUBLISH delivered by the server to a v5 client
 // and validates the topic and payload. It returns the QoS and packet id.
 func testMQTTReadPublishV5(t testing.TB, r *mqttReader, expTopic string, expPayload []byte) (byte, uint16) {
@@ -1158,10 +1224,11 @@ func TestMQTTv5InteropWith311Publisher(t *testing.T) {
 }
 
 // A SUBSCRIBE must be rejected (not silently ACKed) when it sets a v5
-// subscription option this server does not honor: No Local and Retain As
-// Published are not yet implemented, a Retain Handling value of 3 is reserved
-// (Protocol Error), and the options byte's reserved bits 6-7 are a Malformed
-// Packet. Retain Handling 0/1/2 are supported and tested in TestMQTTv5RetainHandling.
+// subscription option this server does not honor: Retain As Published is not
+// yet implemented, a Retain Handling value of 3 is reserved (Protocol Error),
+// and the options byte's reserved bits 6-7 are a Malformed Packet. Retain
+// Handling 0/1/2 are covered by TestMQTTv5RetainHandling and No Local by
+// TestMQTTv5NoLocal.
 func TestMQTTv5RejectsUnsupportedSubOptions(t *testing.T) {
 	o := testMQTTDefaultOptionsV5()
 	s := testMQTTRunServer(t, o)
@@ -1172,10 +1239,9 @@ func TestMQTTv5RejectsUnsupportedSubOptions(t *testing.T) {
 		opts      byte
 		expReason byte
 	}{
-		{"no local", 0x04, mqttReasonUnspecifiedError},
 		{"retain as published", 0x08, mqttReasonUnspecifiedError},
 		{"retain handling 3 reserved", 0x30, mqttReasonProtocolError},
-		{"retain handling 3 with no local", 0x34, mqttReasonProtocolError},
+		{"retain handling 3 with retain as published", 0x38, mqttReasonProtocolError},
 		{"reserved bit 6", 0x40, mqttReasonMalformedPacket},
 		{"reserved bit 7", 0x80, mqttReasonMalformedPacket},
 	} {
@@ -1325,6 +1391,365 @@ func TestMQTTv5RetainHandling(t *testing.T) {
 		testMQTTReadPubV5Props(t, c, r, "ov/topic", []byte("retained-ov"))
 		testMQTTExpectNothing(t, r)
 	})
+}
+
+// The v5 No Local subscription option (bit 2) must stop a message from being
+// delivered back to the connection that published it, while a message from a
+// different connection still arrives. Spec5 [3.8.3.1].
+func TestMQTTv5NoLocal(t *testing.T) {
+	o := testMQTTDefaultOptionsV5()
+	s := testMQTTRunServer(t, o)
+	defer testMQTTShutdownServer(s)
+
+	// opts byte: QoS in bits 0-1, No Local in bit 2.
+	const noLocalBit = byte(0x04)
+
+	// runNoLocal exercises the option at the given QoS: the No Local subscriber
+	// must not get its own publish, but must get another connection's.
+	runNoLocal := func(t *testing.T, qos byte, prefix string) {
+		topic := prefix + "/topic"
+
+		a, ra := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: prefix + "-a", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
+		defer a.Close()
+		testMQTTReadConnAckV5(t, ra)
+		testMQTTSubV5(t, a, ra, 1, []mqttV5SubFilter{{topic: topic, opts: qos | noLocalBit}})
+
+		b, rb := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: prefix + "-b", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
+		defer b.Close()
+		testMQTTReadConnAckV5(t, rb)
+		testMQTTSubV5(t, b, rb, 1, []mqttV5SubFilter{{topic: topic, opts: qos}})
+
+		// A publishes: its own No Local subscription must not receive it; B (which
+		// did not set No Local) must. A gets only the PUBACK (its self-delivery is
+		// suppressed), so there is no self-echo race here.
+		testMQTTPubV5Props(t, a, ra, qos, false, 1, topic, []byte("from-a"), nil)
+		testMQTTReadPubV5Props(t, b, rb, topic, []byte("from-a"))
+		testMQTTExpectNothing(t, ra)
+
+		// A different, unsubscribed connection publishes: A must receive it, since
+		// No Local only blocks A's own publishes. Using a non-subscribed publisher
+		// avoids a self-echo racing the PUBACK.
+		p, rp := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: prefix + "-p", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
+		defer p.Close()
+		testMQTTReadConnAckV5(t, rp)
+		testMQTTPubV5Props(t, p, rp, qos, false, 1, topic, []byte("from-p"), nil)
+		testMQTTReadPubV5Props(t, a, ra, topic, []byte("from-p"))
+	}
+
+	t.Run("QoS0", func(t *testing.T) { runNoLocal(t, 0, "nl0") })
+	t.Run("QoS1", func(t *testing.T) { runNoLocal(t, 1, "nl1") })
+
+	// No Local is part of the session state, so it must survive a reconnect of a
+	// persistent session (verifies the option is packed into the stored subs).
+	t.Run("survives reconnect", func(t *testing.T) {
+		ci := &mqttV5ConnInfo{clientID: "nl-persist", props: mqttV5ConnPropsSessionExpiry(30)}
+		c, r := testMQTTConnectV5(t, ci, o.MQTT.Host, o.MQTT.Port)
+		testMQTTReadConnAckV5(t, r)
+		testMQTTSubV5(t, c, r, 1, []mqttV5SubFilter{{topic: "nlp/topic", opts: 1 | noLocalBit}})
+		// Clean v5 DISCONNECT (reason 0), which keeps the session alive.
+		if _, err := testMQTTWrite(c, []byte{mqttPacketDisconnect, 0}); err != nil {
+			t.Fatalf("Error writing DISCONNECT: %v", err)
+		}
+		c.Close()
+
+		// Reconnect the same client ID with a persistent session; the No Local
+		// subscription is restored. Its own publish must still be suppressed.
+		c2, r2 := testMQTTConnectV5(t, ci, o.MQTT.Host, o.MQTT.Port)
+		defer c2.Close()
+		if sp, _, _ := testMQTTReadConnAckV5(t, r2); !sp {
+			t.Fatal("Expected session present on reconnect")
+		}
+		testMQTTPubV5Props(t, c2, r2, 1, false, 1, "nlp/topic", []byte("own"), nil)
+		testMQTTExpectNothing(t, r2)
+
+		// A different connection publishing to the same topic still reaches it.
+		other, ro := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "nlp-other", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
+		defer other.Close()
+		testMQTTReadConnAckV5(t, ro)
+		testMQTTPubV5Props(t, other, ro, 1, false, 1, "nlp/topic", []byte("external"), nil)
+		testMQTTReadPubV5Props(t, c2, r2, "nlp/topic", []byte("external"))
+	})
+
+	// Re-subscribing an existing QoS1 filter must refresh No Local on the
+	// JetStream delivery subscription used by the QoS 1/2 callback.
+	t.Run("QoS1 re-subscribe toggles No Local", func(t *testing.T) {
+		c, r := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "nlt", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
+		defer c.Close()
+		testMQTTReadConnAckV5(t, r)
+
+		// Without No Local the client receives its own publish (PUBACK and the
+		// self-echo can arrive in either order).
+		testMQTTSubV5(t, c, r, 1, []mqttV5SubFilter{{topic: "nlt/topic", opts: 1}})
+		testMQTTPubV5SelfEcho(t, c, r, 1, "nlt/topic", []byte("m1"))
+
+		// Re-subscribe with No Local: its own publish is now suppressed.
+		testMQTTSubV5(t, c, r, 1, []mqttV5SubFilter{{topic: "nlt/topic", opts: 1 | noLocalBit}})
+		testMQTTPubV5Props(t, c, r, 1, false, 2, "nlt/topic", []byte("m2"), nil)
+		testMQTTExpectNothing(t, r)
+
+		// Toggle No Local back off: its own publish is delivered again.
+		testMQTTSubV5(t, c, r, 1, []mqttV5SubFilter{{topic: "nlt/topic", opts: 1}})
+		testMQTTPubV5SelfEcho(t, c, r, 1, "nlt/topic", []byte("m3"))
+	})
+
+	// No Local must also suppress replaying a retained message the same session
+	// published, while a different session's No Local subscription still gets it.
+	t.Run("retained is suppressed for the publishing session", func(t *testing.T) {
+		c, r := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "nlr", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
+		defer c.Close()
+		testMQTTReadConnAckV5(t, r)
+		testMQTTPubV5Props(t, c, r, 1, true, 1, "nlr/topic", []byte("retained"), nil)
+
+		// Same session subscribes with No Local: its own retained is not replayed.
+		testMQTTSubV5(t, c, r, 1, []mqttV5SubFilter{{topic: "nlr/topic", opts: 1 | noLocalBit}})
+		testMQTTExpectNothing(t, r)
+
+		// A different session with No Local still receives the retained message.
+		d, rd := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "nlr-other", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
+		defer d.Close()
+		testMQTTReadConnAckV5(t, rd)
+		testMQTTSubV5(t, d, rd, 1, []mqttV5SubFilter{{topic: "nlr/topic", opts: 1 | noLocalBit}})
+		testMQTTReadPubV5Props(t, d, rd, "nlr/topic", []byte("retained"))
+	})
+
+	// No Local on a Shared Subscription is a Protocol Error. Spec5 [MQTT-3.8.3-4].
+	t.Run("no local on shared subscription rejected", func(t *testing.T) {
+		c, r := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "nlsh", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
+		defer c.Close()
+		testMQTTReadConnAckV5(t, r)
+
+		vh := newMQTTWriter(0)
+		vh.WriteUint16(1)
+		vh.WriteVarInt(0)
+		vh.WriteBytes([]byte("$share/g/f"))
+		vh.WriteByte(0x01 | noLocalBit)
+		w := newMQTTWriter(0)
+		w.WriteByte(mqttPacketSub | mqttSubscribeFlags)
+		w.WriteVarInt(vh.Len())
+		w.Write(vh.Bytes())
+		if _, err := testMQTTWrite(c, w.Bytes()); err != nil {
+			t.Fatalf("Error writing SUBSCRIBE: %v", err)
+		}
+		b, _ := testMQTTReadPacket(t, r)
+		if pt := b & mqttPacketMask; pt != mqttPacketDisconnect {
+			t.Fatalf("Expected DISCONNECT (%x), got %x", mqttPacketDisconnect, pt)
+		}
+		reason, err := r.readByte("disconnect reason")
+		if err != nil {
+			t.Fatalf("Error reading disconnect reason: %v", err)
+		}
+		if reason != mqttReasonProtocolError {
+			t.Fatalf("Expected reason 0x%x (protocol error), got 0x%x", mqttReasonProtocolError, reason)
+		}
+	})
+
+	// A Will is server-originated, so it carries no No Local origin regardless of
+	// which Will path fires or whether it is stored as retained. A subscriber
+	// with the same client ID as the Will owner, using No Local, must still
+	// receive the retained Will. Spec5 [3.8.3.1].
+	t.Run("retained will is not subject to No Local", func(t *testing.T) {
+		retWill := &mqttWill{topic: []byte("wnl/topic"), message: []byte("gone"), qos: 0, retain: true}
+		cw, rw := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "wnl", cleanStart: true, will: retWill}, o.MQTT.Host, o.MQTT.Port)
+		testMQTTReadConnAckV5(t, rw)
+		// Reason 0x04 tells the server to publish the Will immediately.
+		if _, err := testMQTTWrite(cw, []byte{mqttPacketDisconnect, 1, mqttReasonDisconnectWithWill}); err != nil {
+			t.Fatalf("Error writing DISCONNECT: %v", err)
+		}
+		cw.Close()
+
+		// Reconnect with the same client ID and a No Local subscription. The Will
+		// is server-originated (no origin stamped, on either the live header or the
+		// retained copy), so it is delivered rather than suppressed.
+		cs, rs := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "wnl", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
+		defer cs.Close()
+		testMQTTReadConnAckV5(t, rs)
+		// The retained Will store is asynchronous with no ack to wait on, so poll:
+		// re-subscribing replays retained at RH=0. A PUBLISH arriving proves the
+		// Will was not suppressed by this same-ID No Local subscription.
+		var delivered bool
+		for i := 0; i < 20 && !delivered; i++ {
+			testMQTTSubV5(t, cs, rs, uint16(i+1), []mqttV5SubFilter{{topic: "wnl/topic", opts: noLocalBit}})
+			if b, _, ok := testMQTTReadPacketReady(rs, 150*time.Millisecond); ok && b&mqttPacketMask == mqttPacketPub {
+				delivered = true
+			}
+		}
+		if !delivered {
+			t.Fatal("retained Will was not delivered to a same-ID No Local subscription")
+		}
+	})
+}
+
+// A No Local origin supplied by a plain NATS client must not be trusted: the
+// origin marker is an HMAC under a per-server secret, so a client cannot forge
+// one for a victim's session and silently drop that subscriber's messages. This
+// covers both delivery paths that carry the marker.
+func TestMQTTv5NoLocalOriginNotSpoofable(t *testing.T) {
+	o := testMQTTDefaultOptionsV5()
+	s := testMQTTRunServer(t, o)
+	defer testMQTTShutdownServer(s)
+
+	// QoS0 direct path: a NATS client publishes to the subscriber's subject with
+	// a forged Nmqtt-Origin. The QoS0 path never trusts the header (suppression
+	// is only from a local MQTT publisher), so the message is delivered.
+	t.Run("QoS0 direct", func(t *testing.T) {
+		cs, rs := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "spoofsub", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
+		defer cs.Close()
+		testMQTTReadConnAckV5(t, rs)
+		testMQTTSubV5(t, cs, rs, 1, []mqttV5SubFilter{{topic: "spoof/x", opts: 0x04}}) // No Local
+
+		nc := natsConnect(t, s.ClientURL())
+		defer nc.Close()
+		hdr := nats.Header{}
+		hdr.Set(mqttNatsHeader, "0") // parse MQTT metadata on the delivery path
+		hdr.Set(mqttNatsHeaderOrigin, getHash("spoofsub"))
+		if err := nc.PublishMsg(&nats.Msg{Subject: "spoof.x", Header: hdr, Data: []byte("attack")}); err != nil {
+			t.Fatalf("nats publish: %v", err)
+		}
+		nc.Flush()
+		testMQTTReadPublishV5(t, rs, "spoof/x", []byte("attack"))
+	})
+
+	// QoS1/2 path: a NATS client with access to the MQTT stream subject injects a
+	// QoS1-looking message carrying a forged Nmqtt-Origin. The stored marker is
+	// HMAC-authenticated, so the forgery fails verification and the victim's No
+	// Local QoS1 subscription still receives the message.
+	t.Run("QoS1 stream injection", func(t *testing.T) {
+		cs, rs := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "spoofq", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
+		defer cs.Close()
+		testMQTTReadConnAckV5(t, rs)
+		testMQTTSubV5(t, cs, rs, 1, []mqttV5SubFilter{{topic: "spoofq/x", opts: 0x01 | 0x04}}) // QoS1 + No Local
+
+		nc := natsConnect(t, s.ClientURL())
+		defer nc.Close()
+		hdr := nats.Header{}
+		hdr.Set(mqttNatsHeader, "1") // QoS1
+		hdr.Set(mqttNatsHeaderOrigin, getHash("spoofq"))
+		// Inject directly into the MQTT messages stream subject for spoofq.x.
+		if err := nc.PublishMsg(&nats.Msg{Subject: mqttStreamSubjectPrefix + "spoofq.x", Header: hdr, Data: []byte("attack")}); err != nil {
+			t.Fatalf("nats publish: %v", err)
+		}
+		nc.Flush()
+		testMQTTReadPublishV5(t, rs, "spoofq/x", []byte("attack"))
+	})
+}
+
+// The origin marker is deterministic and emitted in a readable header, so it can
+// be observed and replayed. That is benign: the marker only authenticates "this
+// subscriber's own session published this subject+payload", so replaying a
+// victim's marker can at most re-assert the victim's own origin (which No Local
+// suppresses anyway), and cannot suppress an independently-authored message,
+// which carries a different origin's marker. Spec5 [3.8.3.1].
+func TestMQTTv5NoLocalMarkerReplayIsBenign(t *testing.T) {
+	o := testMQTTDefaultOptionsV5()
+	s := testMQTTRunServer(t, o)
+	defer testMQTTShutdownServer(s)
+
+	// A plain NATS client on the subject observes the marker the victim emits.
+	nc := natsConnect(t, s.ClientURL())
+	defer nc.Close()
+	obs, err := nc.SubscribeSync("rpx")
+	if err != nil {
+		t.Fatalf("subscribe: %v", err)
+	}
+	nc.Flush()
+
+	v, rv := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "rpvic", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
+	defer v.Close()
+	testMQTTReadConnAckV5(t, rv)
+	testMQTTSubV5(t, v, rv, 1, []mqttV5SubFilter{{topic: "rpx", opts: 0x01 | 0x04}}) // QoS1 + No Local
+	testMQTTPubV5Props(t, v, rv, 1, false, 1, "rpx", []byte("P"), nil)
+	testMQTTExpectNothing(t, rv) // own message suppressed
+
+	// Capture the emitted origin marker from the live NATS delivery.
+	m, err := obs.NextMsg(time.Second)
+	if err != nil {
+		t.Fatalf("observe: %v", err)
+	}
+	marker := m.Header.Get(mqttNatsHeaderOrigin)
+	if marker == _EMPTY_ {
+		t.Fatal("expected an origin marker on the observed message")
+	}
+
+	// Replay the observed marker with the same payload into the messages stream.
+	// It re-asserts the victim's own origin, so it is suppressed (harmless): the
+	// attacker only gets its own injected duplicate dropped.
+	hdr := nats.Header{}
+	hdr.Set(mqttNatsHeader, "1")
+	hdr.Set(mqttNatsHeaderOrigin, marker)
+	if err := nc.PublishMsg(&nats.Msg{Subject: mqttStreamSubjectPrefix + "rpx", Header: hdr, Data: []byte("P")}); err != nil {
+		t.Fatalf("nats publish: %v", err)
+	}
+	nc.Flush()
+	testMQTTExpectNothing(t, rv)
+
+	// A legitimate third MQTT publisher sending the SAME payload is delivered:
+	// its message carries a different origin's marker, so the replay cannot deny
+	// independently-authored traffic.
+	w, rw := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "rpw", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
+	defer w.Close()
+	testMQTTReadConnAckV5(t, rw)
+	testMQTTPubV5Props(t, w, rw, 1, false, 1, "rpx", []byte("P"), nil)
+	testMQTTReadPubV5Props(t, v, rv, "rpx", []byte("P"))
+}
+
+// No Local must still suppress a QoS1 self-published message when a subject
+// mapping rewrites the published subject: the origin marker must bind the same
+// (mapped) subject the message is stored and delivered under. Spec5 [3.8.3.1].
+func TestMQTTv5NoLocalWithSubjectMapping(t *testing.T) {
+	o := testMQTTDefaultOptionsV5()
+	s := testMQTTRunServer(t, o)
+	defer testMQTTShutdownServer(s)
+
+	// Mapping is on NATS subjects; use single-level topics so the MQTT topic and
+	// NATS subject coincide (nlfoo -> nlbar).
+	if err := s.GlobalAccount().AddMapping("nlfoo", "nlbar"); err != nil {
+		t.Fatalf("AddMapping: %v", err)
+	}
+
+	c, r := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "nlmap", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
+	defer c.Close()
+	testMQTTReadConnAckV5(t, r)
+	// Subscribe to the mapped destination with No Local, publish to the source
+	// (rewritten to the destination). The client must not receive its own message.
+	testMQTTSubV5(t, c, r, 1, []mqttV5SubFilter{{topic: "nlbar", opts: 0x01 | 0x04}})
+	testMQTTPubV5Props(t, c, r, 1, false, 1, "nlfoo", []byte("mapped"), nil)
+	testMQTTExpectNothing(t, r)
+
+	// A different connection publishing to the source still reaches it.
+	other, ro := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "nlmap-other", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
+	defer other.Close()
+	testMQTTReadConnAckV5(t, ro)
+	testMQTTPubV5Props(t, other, ro, 1, false, 1, "nlfoo", []byte("external"), nil)
+	testMQTTReadPubV5Props(t, c, r, "nlbar", []byte("external"))
+}
+
+// Re-subscribing an existing QoS 1/2 filter at a different QoS must update the
+// delivery cap used by the QoS 1/2 callback, which reads it off the (unchanged)
+// JetStream delivery subscription. Spec5 [MQTT-3.8.4-3].
+func TestMQTTv5ResubscribeRefreshesDeliveryQoS(t *testing.T) {
+	o := testMQTTDefaultOptionsV5()
+	s := testMQTTRunServer(t, o)
+	defer testMQTTShutdownServer(s)
+
+	sub, rs := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "rq-sub", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
+	defer sub.Close()
+	testMQTTReadConnAckV5(t, rs)
+	// Subscribe at QoS2, then re-subscribe the same filter down to QoS1.
+	testMQTTSubV5(t, sub, rs, 1, []mqttV5SubFilter{{topic: "rq/topic", opts: 2}})
+	testMQTTSubV5(t, sub, rs, 1, []mqttV5SubFilter{{topic: "rq/topic", opts: 1}})
+
+	pub, rp := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "rq-pub", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
+	defer pub.Close()
+	testMQTTReadConnAckV5(t, rp)
+	testMQTTPubV5Props(t, pub, rp, 2, false, 1, "rq/topic", []byte("m"), nil)
+
+	// Delivery must be capped at the re-subscribed QoS1, not the original QoS2
+	// (which would open a PUBREC handshake instead of a PUBACK).
+	qos, pi := testMQTTReadPublishV5(t, rs, "rq/topic", []byte("m"))
+	if qos != 1 {
+		t.Fatalf("Expected delivery at QoS1 after re-subscribe, got QoS%d", qos)
+	}
+	testMQTTSendPIPacket(mqttPacketPubAck, t, sub, pi)
 }
 
 // MaxProtocolVersion must be range-checked for programmatic Options too, not
@@ -2811,8 +3236,12 @@ func TestMQTTv5MessageExpiryMaxPayload(t *testing.T) {
 		t.Fatalf("subject conversion: %v", err)
 	}
 	pp := &mqttPublish{topic: []byte("foo"), subject: subj, msg: payload, sz: len(payload), props: props}
-	delivery := mqttComputeNatsMsgSize(pp, false, mqttMessageExpiryTTL(props)) // QoS0/1 store form, QoS2 delivery form
-	hold := mqttComputeNatsMsgSize(pp, true, 0)                                // QoS2 dedup-hold form
+	// v5 delivered messages carry the Nmqtt-Origin header (the No Local marker, a
+	// fixed-length HMAC tag, so its size is the same for every client here). The
+	// QoS2 dedup-hold copy carries none. Match production so the boundary is exact.
+	origin := mqttOriginMarker([]byte("k"), "id", "subj", []byte("p"))
+	delivery := mqttComputeNatsMsgSize(pp, false, mqttMessageExpiryTTL(props), origin) // QoS0/1 store form, QoS2 delivery form
+	hold := mqttComputeNatsMsgSize(pp, true, 0, _EMPTY_)                               // QoS2 dedup-hold form
 
 	sendPub := func(t *testing.T, c net.Conn, qos byte) {
 		vh := newMQTTWriter(0)
