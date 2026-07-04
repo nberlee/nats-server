@@ -637,12 +637,20 @@ type mqtt struct {
 
 	// maxPacketSize is the current connection's MQTT 5.0 Maximum Packet Size:
 	// the largest PUBLISH (whole control packet) the client is willing to
-	// accept. 0 means no client-imposed limit (3.1.1, or not sent). Set during
-	// CONNECT and read lock-free on the delivery paths like proto. Unlike the
-	// session's Receive Maximum (rmax), this lives on the per-connection client:
-	// it must gate the QoS0 direct-delivery path, which runs without the session
-	// lock. Spec5 [3.1.2.11.4].
+	// accept. 0 means no client-imposed limit (3.1.1, or not sent). Set at
+	// CONNECT parse time (so even a rejection CONNACK honors it) and read
+	// lock-free on the delivery and ack paths like proto. Unlike the session's
+	// Receive Maximum (rmax), this lives on the per-connection client: it must
+	// gate the QoS0 direct-delivery path, which runs without the session lock.
+	// Spec5 [3.1.2.11.4].
 	maxPacketSize uint32
+
+	// noProblemInfo is true when the v5 client sent Request Problem Information 0:
+	// the server must then not attach a Reason String (or User Property) to any
+	// packet other than CONNACK/DISCONNECT. Absent means 1 (allowed). Set at
+	// CONNECT parse time, read lock-free on the ack paths like proto. Spec5
+	// [3.1.2.11.7].
+	noProblemInfo bool
 
 	// cidGenerated is true when the client sent an empty client ID and the
 	// server assigned one. For v5 it must be echoed back in the CONNACK as the
@@ -799,6 +807,10 @@ type mqttFilter struct {
 	subID int
 	// v5 (UN)SUBACK reason code for this filter (zero value is success).
 	reason byte
+	// v5 human-readable failure detail, set where a filter is rejected. The
+	// (UN)SUBACK packet-level Reason String carries the first failed filter's
+	// text. Spec5 [3.9.2.2.2].
+	reasonStr string
 	// Used only for tracing and should not be used after parsing of (un)sub protocols.
 	ttopic []byte
 }
@@ -1366,7 +1378,11 @@ func (c *client) mqttParse(buf []byte) error {
 				c.traceInOp("CONNECT", errOrTrace(err, c.mqttConnectTrace(cp)))
 			}
 			if rc != 0 {
-				c.mqttEnqueueConnAck(rc, sessp)
+				var rs string
+				if err != nil {
+					rs = err.Error()
+				}
+				c.mqttEnqueueConnAck(rc, sessp, rs)
 				if trace {
 					c.traceOutOp("CONNACK", []byte(fmt.Sprintf("sp=%v rc=%v", sessp, rc)))
 				}
@@ -1376,7 +1392,7 @@ func (c *client) mqttParse(buf []byte) error {
 				// Spec5 [3.1.4.1], [MQTT-3.1.2-19].
 				if c.mqtt.proto == mqttProtoLevel5 {
 					reason := mqttConnAckReasonFromConnectErr(err)
-					c.mqttEnqueueConnAck(reason, false)
+					c.mqttEnqueueConnAck(reason, false, err.Error())
 					if trace {
 						c.traceOutOp("CONNACK", []byte(fmt.Sprintf("sp=%v rc=%v", false, reason)))
 					}
@@ -1462,7 +1478,7 @@ func (c *client) mqttParse(buf []byte) error {
 	} else if err != nil && connected && c.mqtt.proto == mqttProtoLevel5 {
 		// Best-effort: tell the v5 client why we are about to close. The read
 		// loop closes the connection right after this returns.
-		c.mqttEnqueueDisconnect(mqttDisconnectReasonFromErr(err))
+		c.mqttEnqueueDisconnect(mqttDisconnectReasonFromErr(err), err.Error())
 	}
 	return err
 }
@@ -3048,7 +3064,7 @@ func (as *mqttAccountSessionManager) processSessionPersist(_ *subscription, pc *
 	if ec != nil {
 		// Tell the evicted v5 client why before the close (no-op for 3.1.1);
 		// enqueued outside sess.mu since it takes the client lock. Spec5 [3.1.4].
-		ec.mqttEnqueueDisconnect(mqttReasonSessionTakenOver)
+		ec.mqttEnqueueDisconnect(mqttReasonSessionTakenOver, mqttReasonStrSessionTakenOver)
 		// Remove in separate go routine.
 		go ec.closeConnection(DuplicateClientID)
 	}
@@ -4069,6 +4085,7 @@ func (as *mqttAccountSessionManager) processSubs(sess *mqttSession, c *client,
 		if strings.HasPrefix(f.filter, mqttSubPrefix) ||
 			strings.HasPrefix(f.filter, mqttPubRelDeliverySubjectPrefix) {
 			f.qos = mqttSubAckFailure
+			f.reasonStr = "cannot subscribe to internal server subject"
 			continue
 		}
 
@@ -4076,6 +4093,7 @@ func (as *mqttAccountSessionManager) processSubs(sess *mqttSession, c *client,
 			if err := sess.ensurePubRelConsumerSubscription(c); err != nil {
 				c.Errorf("failed to initialize PUBREL processing: %v", err)
 				f.qos = mqttSubAckFailure
+				f.reasonStr = err.Error()
 				continue
 			}
 		}
@@ -4158,6 +4176,7 @@ func (as *mqttAccountSessionManager) processSubs(sess *mqttSession, c *client,
 
 		if err != nil {
 			f.qos = mqttSubAckFailure
+			f.reasonStr = err.Error()
 			sess.cleanupFailedSub(c, sub, jscons, jssub)
 			continue
 		}
@@ -4169,6 +4188,7 @@ func (as *mqttAccountSessionManager) processSubs(sess *mqttSession, c *client,
 		jscons, jssub, err = sess.processJSConsumer(c, subject, sid, f.qos, f.noLocal, f.retainAsPublished, f.subID, fromSubProto)
 		if err != nil {
 			f.qos = mqttSubAckFailure
+			f.reasonStr = err.Error()
 			sess.cleanupFailedSub(c, sub, jscons, jssub)
 			continue
 		}
@@ -4192,6 +4212,7 @@ func (as *mqttAccountSessionManager) processSubs(sess *mqttSession, c *client,
 			if err != nil {
 				// c.processSub already called c.Errorf(), so no need here.
 				f.qos = mqttSubAckFailure
+				f.reasonStr = err.Error()
 				sess.cleanupFailedSub(c, sub, jscons, jssub)
 				continue
 			}
@@ -4200,6 +4221,7 @@ func (as *mqttAccountSessionManager) processSubs(sess *mqttSession, c *client,
 			if err != nil {
 				// c.processSub already called c.Errorf(), so no need here.
 				f.qos = mqttSubAckFailure
+				f.reasonStr = err.Error()
 				sess.cleanupFailedSub(c, sub, jscons, jssub)
 				sess.cleanupFailedSub(c, fwcsub, fwjscons, fwjssub)
 				continue
@@ -5684,6 +5706,19 @@ func (c *client) mqttParseConnect(r *mqttReader, hasMappings bool) (byte, *mqttC
 		if err != nil {
 			return 0, nil, err
 		}
+		// Capture at parse time the two properties that gate optional outbound
+		// content, so even a CONNACK that rejects this CONNECT honors them:
+		// Maximum Packet Size lets an optional Reason String be omitted when it
+		// would exceed the client's limit, and Request Problem Information 0
+		// forbids Reason String/User Property on packets other than
+		// CONNACK/DISCONNECT. Full Maximum Packet Size enforcement for mandatory
+		// control packets is a separate concern. If readProperties itself failed
+		// above, cp.props is nil and the client communicated no limit. Spec5
+		// [3.1.2.11.4], [3.1.2.11.7].
+		if cp.props != nil {
+			c.mqtt.maxPacketSize = cp.props.maxPacketSize
+			c.mqtt.noProblemInfo = cp.props.present[mqttPropRequestProblemInfo] && cp.props.requestProblem == 0
+		}
 		// Enhanced authentication (AUTH exchange) is not implemented. If the
 		// client requests an authentication method, reject the connection with
 		// the v5 "bad authentication method" reason. Spec5 [4.12].
@@ -5842,8 +5877,8 @@ func (c *client) mqttConnectTrace(cp *mqttConnectProto) string {
 // Runs from the client's readLoop.
 // No lock held on entry.
 func (s *Server) mqttProcessConnect(c *client, cp *mqttConnectProto, trace bool) error {
-	sendConnAck := func(rc byte, sessp bool) {
-		c.mqttEnqueueConnAck(rc, sessp)
+	sendConnAck := func(rc byte, sessp bool, reasonStr string) {
+		c.mqttEnqueueConnAck(rc, sessp, reasonStr)
 		if trace {
 			c.traceOutOp("CONNACK", []byte(fmt.Sprintf("sp=%v rc=%v", sessp, rc)))
 		}
@@ -5961,7 +5996,7 @@ CHECK:
 		es, exists, err = asm.createOrRestoreSession(cid, s.getOpts())
 		if err != nil {
 			if err == errMQTTSessionCollision {
-				sendConnAck(mqttConnAckRCIdentifierRejected, false)
+				sendConnAck(mqttConnAckRCIdentifierRejected, false, err.Error())
 			}
 			return formatError(err)
 		}
@@ -6023,7 +6058,7 @@ CHECK:
 			c.Warnf("Replacing old client %q since both have the same client ID %q", ec, cid)
 			// Tell the evicted v5 client why before the close (no-op for
 			// 3.1.1). Spec5 [3.1.4].
-			ec.mqttEnqueueDisconnect(mqttReasonSessionTakenOver)
+			ec.mqttEnqueueDisconnect(mqttReasonSessionTakenOver, mqttReasonStrSessionTakenOver)
 			// Close old client in separate go routine
 			go ec.closeConnection(DuplicateClientID)
 		}
@@ -6052,16 +6087,6 @@ CHECK:
 	// drop its persisted copy with the save that follows. Spec5 [MQTT-3.1.2-8].
 	es.will = nil
 	es.mu.Unlock()
-
-	// MQTT 5.0 Maximum Packet Size: never send this client a PUBLISH larger than
-	// it will accept. Unlike Receive Maximum this lands on the per-connection
-	// client (not the session): it is read lock-free on the delivery paths and
-	// must gate the QoS0 path, which has no session lock. A fresh client per
-	// connection makes it inherently per-connection, so no explicit re-eval is
-	// needed. 0 means no client-imposed limit.
-	if cp.props != nil {
-		c.mqtt.maxPacketSize = cp.props.maxPacketSize
-	}
 
 	// MQTT 5.0 Topic Alias Maximum (inbound-only): resolve the server-side cap
 	// for this connection; advertised in the CONNACK below. The client's own
@@ -6110,7 +6135,7 @@ CHECK:
 	c.mu.Unlock()
 
 	// Spec [MQTT-3.2.0-1]: CONNACK must be the first protocol sent to the session.
-	sendConnAck(mqttConnAckRCConnectionAccepted, sessp)
+	sendConnAck(mqttConnAckRCConnectionAccepted, sessp, _EMPTY_)
 
 	// Process possible saved subscriptions.
 	if l := len(es.subs); l > 0 {
@@ -6158,7 +6183,7 @@ func mqttConnAckReasonFromRC(rc byte) byte {
 	return mqttReasonUnspecifiedError
 }
 
-func (c *client) mqttEnqueueConnAck(rc byte, sessionPresent bool) {
+func (c *client) mqttEnqueueConnAck(rc byte, sessionPresent bool, reasonStr string) {
 	// Spec [MQTT-3.2.2-4], spec5 [3.2.2.1.1]: when the (reason) code indicates
 	// failure, the session present flag must be 0.
 	sp := byte(0)
@@ -6167,7 +6192,7 @@ func (c *client) mqttEnqueueConnAck(rc byte, sessionPresent bool) {
 	}
 
 	if c.mqtt.proto == mqttProtoLevel5 {
-		c.mqttEnqueueConnAckV5(rc, sp)
+		c.mqttEnqueueConnAckV5(rc, sp, reasonStr)
 		return
 	}
 
@@ -6179,7 +6204,9 @@ func (c *client) mqttEnqueueConnAck(rc byte, sessionPresent bool) {
 
 // mqttEnqueueConnAckV5 writes an MQTT 5.0 CONNACK: a reason code, the session
 // present flag, and a properties block advertising the server's capabilities.
-func (c *client) mqttEnqueueConnAckV5(rc, sp byte) {
+// On a failure reason, reasonStr (when set and it fits) is added as a Reason
+// String. Spec5 [3.2.2].
+func (c *client) mqttEnqueueConnAckV5(rc, sp byte, reasonStr string) {
 	reason := mqttConnAckReasonFromRC(rc)
 
 	props := &mqttProperties{present: map[byte]bool{}}
@@ -6222,29 +6249,103 @@ func (c *client) mqttEnqueueConnAckV5(rc, sp byte) {
 	if reason == mqttReasonSuccess && c.mqtt.cidGenerated {
 		props.assignedClientID = c.mqtt.cid
 	}
+	// On a failure reason, explain why with a Reason String (CONNACK is exempt
+	// from Request Problem Information). Spec5 [3.2.2.3.9].
+	if reason >= 0x80 {
+		props.reasonString = c.mqttReasonString(mqttPacketConnectAck, reasonStr)
+	}
 
-	w := newMQTTWriter(0)
-	w.WriteByte(mqttPacketConnectAck)
 	// Variable header = session present (1) + reason code (1) + properties.
-	var vh mqttWriter
-	vh.WriteByte(sp)
-	vh.WriteByte(reason)
-	vh.writeProperties(props)
-	w.WriteVarInt(vh.Len())
-	w.Write(vh.Bytes())
+	frame := func() []byte {
+		w := newMQTTWriter(0)
+		w.WriteByte(mqttPacketConnectAck)
+		var vh mqttWriter
+		vh.WriteByte(sp)
+		vh.WriteByte(reason)
+		vh.writeProperties(props)
+		w.WriteVarInt(vh.Len())
+		w.Write(vh.Bytes())
+		return w.Bytes()
+	}
+	buf := frame()
+	// Drop the Reason String (only) if it pushed the packet past the client's
+	// Maximum Packet Size. Spec5 [3.1.2.11.4].
+	if props.reasonString != _EMPTY_ && !c.mqttFitsClientMax(len(buf)) {
+		props.reasonString = _EMPTY_
+		buf = frame()
+	}
 
 	c.mu.Lock()
-	c.enqueueProto(w.Bytes())
+	c.enqueueProto(buf)
 	c.mu.Unlock()
 }
 
+// Reason String sent with the DISCONNECT to a client whose session is taken
+// over by a new connection with the same client ID. Spec5 [3.1.4].
+const mqttReasonStrSessionTakenOver = "session taken over by a new connection"
+
+// mqttReasonString returns reasonStr if it may accompany a server-generated
+// packet of type pktType, or empty otherwise: v5 only; a client that sent
+// Request Problem Information 0 gets one only on CONNACK/DISCONNECT (where the
+// server MAY send it regardless); and it must be a valid MQTT UTF-8 string
+// ([MQTT-1.5.4-1]) no longer than an MQTT UTF-8 string can encode (the writer
+// lays down a uint16 length, so an over-long string would wrap it and corrupt
+// the block). Callers may pass client-derived error text, so both checks matter.
+// Spec5 [1.5.4], [3.1.2.11.7].
+func (c *client) mqttReasonString(pktType byte, reasonStr string) string {
+	if reasonStr == _EMPTY_ || c.mqtt == nil || c.mqtt.proto != mqttProtoLevel5 {
+		return _EMPTY_
+	}
+	if c.mqtt.noProblemInfo && pktType != mqttPacketConnectAck && pktType != mqttPacketDisconnect {
+		return _EMPTY_
+	}
+	if len(reasonStr) > 0xFFFF || mqttValidateString(reasonStr, "reason string") != nil {
+		return _EMPTY_
+	}
+	return reasonStr
+}
+
+// mqttFitsClientMax reports whether a framed packet of n bytes fits the client's
+// MQTT 5.0 Maximum Packet Size (0 = no limit). An oversized packet must drop its
+// Reason String rather than be sent. Spec5 [3.1.2.11.4].
+func (c *client) mqttFitsClientMax(n int) bool {
+	return c.mqtt == nil || c.mqtt.maxPacketSize == 0 || uint32(n) <= c.mqtt.maxPacketSize
+}
+
+// mqttReasonProps returns a properties block carrying reasonStr as a Reason
+// String for a server-generated packet of type pktType, or nil (which encodes as
+// a single zero length byte, byte-identical to no properties) when the string is
+// empty or not permitted. Spec5 [3.9.2.2.2].
+func (c *client) mqttReasonProps(pktType byte, reasonStr string) *mqttProperties {
+	if rs := c.mqttReasonString(pktType, reasonStr); rs != _EMPTY_ {
+		return &mqttProperties{reasonString: rs}
+	}
+	return nil
+}
+
 // mqttEnqueueDisconnect sends an MQTT 5.0 DISCONNECT with the given reason code
-// (no properties) to the client, before the connection is closed on a
-// protocol/processing error. It is a no-op for 3.1.1 connections, which have
-// no server-initiated DISCONNECT. Spec5 [3.14].
-func (c *client) mqttEnqueueDisconnect(reason byte) {
+// (and, when allowed and it fits, a Reason String) to the client, before the
+// connection is closed on a protocol/processing error. It is a no-op for 3.1.1
+// connections, which have no server-initiated DISCONNECT. Spec5 [3.14].
+func (c *client) mqttEnqueueDisconnect(reason byte, reasonStr string) {
 	if c.mqtt == nil || c.mqtt.proto != mqttProtoLevel5 {
 		return
+	}
+	if rs := c.mqttReasonString(mqttPacketDisconnect, reasonStr); rs != _EMPTY_ {
+		w := newMQTTWriter(0)
+		w.WriteByte(mqttPacketDisconnect)
+		var vh mqttWriter
+		vh.WriteByte(reason)
+		vh.writeProperties(&mqttProperties{reasonString: rs})
+		w.WriteVarInt(vh.Len())
+		w.Write(vh.Bytes())
+		if c.mqttFitsClientMax(w.Len()) {
+			c.mu.Lock()
+			c.enqueueProto(w.Bytes())
+			c.mu.Unlock()
+			return
+		}
+		// Falls through to the short form when the Reason String would overflow.
 	}
 	// Remaining length of 1: just the reason code, properties omitted (allowed
 	// when there are no properties). Spec5 [3.14.2.2.1].
@@ -6977,7 +7078,8 @@ func (c *client) mqttQoS2InternalSubject(pi uint16) string {
 func (s *Server) mqttProcessPubRel(c *client, pi uint16, trace bool) error {
 	// Once done with the processing, send a PUBCOMP back to the client.
 	reason := mqttReasonSuccess
-	defer func() { c.mqttEnqueuePubResponseReason(mqttPacketPubComp, pi, reason, trace) }()
+	var reasonStr string
+	defer func() { c.mqttEnqueuePubResponseReason(mqttPacketPubComp, pi, reason, reasonStr, trace) }()
 
 	// See if there is a message pending for this pi. All failures are treated
 	// as "not found".
@@ -6988,6 +7090,7 @@ func (s *Server) mqttProcessPubRel(c *client, pi uint16, trace bool) error {
 		// No message found: no session state for this PI, which a v5 PUBCOMP
 		// reports as 0x92. Spec5 [MQTT-4.3.3-1].
 		reason = mqttReasonPacketIDNotFound
+		reasonStr = "no message found for the packet identifier"
 		return nil
 	}
 	// Best attempt to delete the message from the QoS2 stream.
@@ -7292,10 +7395,10 @@ func pubAllowed(perms *mqttPerm, subject string) bool {
 }
 
 func (c *client) mqttEnqueuePubResponse(packetType byte, pi uint16, trace bool) {
-	c.mqttEnqueuePubResponseReason(packetType, pi, mqttReasonSuccess, trace)
+	c.mqttEnqueuePubResponseReason(packetType, pi, mqttReasonSuccess, _EMPTY_, trace)
 }
 
-func (c *client) mqttEnqueuePubResponseReason(packetType byte, pi uint16, reason byte, trace bool) {
+func (c *client) mqttEnqueuePubResponseReason(packetType byte, pi uint16, reason byte, reasonStr string, trace bool) {
 	proto := [5]byte{packetType, 0x2, 0, 0, 0}
 	proto[2] = byte(pi >> 8)
 	proto[3] = byte(pi)
@@ -7315,8 +7418,27 @@ func (c *client) mqttEnqueuePubResponseReason(packetType byte, pi uint16, reason
 		proto[0] |= 0x2
 	}
 
+	// A failure reason may carry a Reason String when the client permits it and
+	// it fits; otherwise fall back to the fixed short form. Spec5 [3.4.2.2].
+	buf := proto[:n]
+	if n == 5 {
+		if rs := c.mqttReasonString(packetType, reasonStr); rs != _EMPTY_ {
+			w := newMQTTWriter(0)
+			w.WriteByte(proto[0])
+			var vh mqttWriter
+			vh.WriteUint16(pi)
+			vh.WriteByte(reason)
+			vh.writeProperties(&mqttProperties{reasonString: rs})
+			w.WriteVarInt(vh.Len())
+			w.Write(vh.Bytes())
+			if c.mqttFitsClientMax(w.Len()) {
+				buf = w.Bytes()
+			}
+		}
+	}
+
 	c.mu.Lock()
-	c.enqueueProto(proto[:n])
+	c.enqueueProto(buf)
 	c.mu.Unlock()
 
 	if trace {
@@ -7570,6 +7692,7 @@ func (c *client) mqttParseSubsOrUnsubs(r *mqttReader, b byte, pl int, sub bool) 
 			return 0, nil, err
 		}
 		var qos, reason byte
+		var reasonStr string
 		var retainHandling byte
 		var noLocal bool
 		var retainAsPublished bool
@@ -7618,6 +7741,7 @@ func (c *client) mqttParseSubsOrUnsubs(r *mqttReader, b byte, pl int, sub bool) 
 				// Spec5 [3.9.3], [4.13.2].
 				if bytes.HasPrefix(topic, mqttSharedSubPrefix) {
 					reason = mqttReasonSharedSubNotSupported
+					reasonStr = "shared subscriptions are not supported"
 				}
 			} else {
 				qos, err = r.readByte("QoS")
@@ -7630,7 +7754,7 @@ func (c *client) mqttParseSubsOrUnsubs(r *mqttReader, b byte, pl int, sub bool) 
 				return 0, nil, fmt.Errorf("subscribe QoS value must be 0, 1 or 2, got %v", qos)
 			}
 		}
-		f := &mqttFilter{ttopic: topic, filter: string(filter), qos: qos, retainHandling: retainHandling, noLocal: noLocal, retainAsPublished: retainAsPublished, subID: subID, reason: reason}
+		f := &mqttFilter{ttopic: topic, filter: string(filter), qos: qos, retainHandling: retainHandling, noLocal: noLocal, retainAsPublished: retainAsPublished, subID: subID, reason: reason, reasonStr: reasonStr}
 		filters = append(filters, f)
 	}
 	// Spec [MQTT-3.8.3-3], [MQTT-3.10.3-2]
@@ -8492,21 +8616,45 @@ func (c *client) mqttEnqueueSubAck(pi uint16, filters []*mqttFilter) {
 	// SUBACK reason codes, so the payload byte is identical for both protocol
 	// levels. v5 only adds a properties block before the reason codes.
 	if c.mqtt.proto == mqttProtoLevel5 {
-		var vh mqttWriter
-		vh.WriteUint16(pi)
-		vh.writeProperties(nil)
+		// Carry the first failed filter's detail as the packet-level Reason
+		// String, when the client permits it. Spec5 [3.9.2.2.2].
+		var reasonStr string
 		for _, f := range filters {
-			vh.WriteByte(f.qos)
+			if f.qos >= mqttSubAckFailure && f.reasonStr != _EMPTY_ {
+				reasonStr = f.reasonStr
+				break
+			}
 		}
-		w.WriteVarInt(vh.Len())
-		w.Write(vh.Bytes())
-	} else {
-		// packet length is 2 (for packet identifier) and 1 byte per filter.
-		w.WriteVarInt(2 + len(filters))
-		w.WriteUint16(pi)
-		for _, f := range filters {
-			w.WriteByte(f.qos)
+		props := c.mqttReasonProps(mqttPacketSubAck, reasonStr)
+		frame := func() []byte {
+			var vh mqttWriter
+			vh.WriteUint16(pi)
+			vh.writeProperties(props)
+			for _, f := range filters {
+				vh.WriteByte(f.qos)
+			}
+			w.Reset()
+			w.WriteByte(mqttPacketSubAck)
+			w.WriteVarInt(vh.Len())
+			w.Write(vh.Bytes())
+			return w.Bytes()
 		}
+		buf := frame()
+		// Drop the Reason String (only) if it overflows the client's max.
+		if props != nil && !c.mqttFitsClientMax(len(buf)) {
+			props = nil
+			buf = frame()
+		}
+		c.mu.Lock()
+		c.enqueueProto(buf)
+		c.mu.Unlock()
+		return
+	}
+	// packet length is 2 (for packet identifier) and 1 byte per filter.
+	w.WriteVarInt(2 + len(filters))
+	w.WriteUint16(pi)
+	for _, f := range filters {
+		w.WriteByte(f.qos)
 	}
 	c.mu.Lock()
 	c.enqueueProto(w.Bytes())
@@ -8579,6 +8727,7 @@ func (c *client) mqttProcessUnsubs(filters []*mqttFilter) error {
 		// guarded by the session-manager lock held here. Spec5 [3.11.3].
 		if _, ok := sess.subs[sid]; !ok {
 			f.reason = mqttReasonNoSubscriptionExisted
+			f.reasonStr = "no matching subscription existed"
 		}
 		// Remove JS Consumer if one exists for this sid
 		removeJSCons(sid)
@@ -8602,17 +8751,37 @@ func (c *client) mqttEnqueueUnsubAck(pi uint16, filters []*mqttFilter) {
 		// v5 UNSUBACK adds a properties block and one reason code per filter.
 		// Spec5 [3.11].
 		w := newMQTTWriter(7 + len(filters))
-		w.WriteByte(mqttPacketUnsubAck)
-		var vh mqttWriter
-		vh.WriteUint16(pi)
-		vh.writeProperties(nil)
+		// Carry the first failed filter's detail as the packet-level Reason
+		// String, when the client permits it. Spec5 [3.11.2.1.2].
+		var reasonStr string
 		for _, f := range filters {
-			vh.WriteByte(f.reason)
+			if f.reason != 0 && f.reasonStr != _EMPTY_ {
+				reasonStr = f.reasonStr
+				break
+			}
 		}
-		w.WriteVarInt(vh.Len())
-		w.Write(vh.Bytes())
+		props := c.mqttReasonProps(mqttPacketUnsubAck, reasonStr)
+		frame := func() []byte {
+			var vh mqttWriter
+			vh.WriteUint16(pi)
+			vh.writeProperties(props)
+			for _, f := range filters {
+				vh.WriteByte(f.reason)
+			}
+			w.Reset()
+			w.WriteByte(mqttPacketUnsubAck)
+			w.WriteVarInt(vh.Len())
+			w.Write(vh.Bytes())
+			return w.Bytes()
+		}
+		buf := frame()
+		// Drop the Reason String (only) if it overflows the client's max.
+		if props != nil && !c.mqttFitsClientMax(len(buf)) {
+			props = nil
+			buf = frame()
+		}
 		c.mu.Lock()
-		c.enqueueProto(w.Bytes())
+		c.enqueueProto(buf)
 		c.mu.Unlock()
 		return
 	}

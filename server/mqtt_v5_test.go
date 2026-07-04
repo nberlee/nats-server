@@ -152,6 +152,14 @@ func testMQTTSubV5(t testing.TB, c net.Conn, r *mqttReader, pi uint16, filters [
 // single 0 length byte (empty properties).
 func testMQTTSubV5Props(t testing.TB, c net.Conn, r *mqttReader, pi uint16, props []byte, filters []mqttV5SubFilter) []byte {
 	t.Helper()
+	codes, _ := testMQTTSubV5PropsEx(t, c, r, pi, props, filters)
+	return codes
+}
+
+// testMQTTSubV5PropsEx is testMQTTSubV5Props but also returns the SUBACK's parsed
+// properties (e.g. to assert a Reason String).
+func testMQTTSubV5PropsEx(t testing.TB, c net.Conn, r *mqttReader, pi uint16, props []byte, filters []mqttV5SubFilter) ([]byte, *mqttProperties) {
+	t.Helper()
 	vh := newMQTTWriter(0)
 	vh.WriteUint16(pi)
 	if len(props) > 0 {
@@ -181,7 +189,8 @@ func testMQTTSubV5Props(t testing.TB, c net.Conn, r *mqttReader, pi uint16, prop
 	if err != nil || rpi != pi {
 		t.Fatalf("Expected SUBACK pi=%v, got %v (err=%v)", pi, rpi, err)
 	}
-	if _, err := r.readProperties(mqttPacketSubAck); err != nil {
+	sprops, err := r.readProperties(mqttPacketSubAck)
+	if err != nil {
 		t.Fatalf("Error reading SUBACK properties: %v", err)
 	}
 	codes := make([]byte, 0, len(filters))
@@ -195,10 +204,18 @@ func testMQTTSubV5Props(t testing.TB, c net.Conn, r *mqttReader, pi uint16, prop
 	if len(codes) != len(filters) {
 		t.Fatalf("Expected %d SUBACK reason codes, got %d", len(filters), len(codes))
 	}
-	return codes
+	return codes, sprops
 }
 
 func testMQTTUnsubV5(t testing.TB, c net.Conn, r *mqttReader, pi uint16, topics []string) []byte {
+	t.Helper()
+	codes, _ := testMQTTUnsubV5Ex(t, c, r, pi, topics)
+	return codes
+}
+
+// testMQTTUnsubV5Ex is testMQTTUnsubV5 but also returns the UNSUBACK's parsed
+// properties (e.g. to assert a Reason String).
+func testMQTTUnsubV5Ex(t testing.TB, c net.Conn, r *mqttReader, pi uint16, topics []string) ([]byte, *mqttProperties) {
 	t.Helper()
 	vh := newMQTTWriter(0)
 	vh.WriteUint16(pi)
@@ -223,7 +240,8 @@ func testMQTTUnsubV5(t testing.TB, c net.Conn, r *mqttReader, pi uint16, topics 
 	if err != nil || rpi != pi {
 		t.Fatalf("Expected UNSUBACK pi=%v, got %v (err=%v)", pi, rpi, err)
 	}
-	if _, err := r.readProperties(mqttPacketUnsubAck); err != nil {
+	uprops, err := r.readProperties(mqttPacketUnsubAck)
+	if err != nil {
 		t.Fatalf("Error reading UNSUBACK properties: %v", err)
 	}
 	codes := make([]byte, 0, len(topics))
@@ -234,7 +252,7 @@ func testMQTTUnsubV5(t testing.TB, c net.Conn, r *mqttReader, pi uint16, topics 
 		}
 		codes = append(codes, rc)
 	}
-	return codes
+	return codes, uprops
 }
 
 func testMQTTPublishV5(t testing.TB, c net.Conn, qos byte, pi uint16, topic string, payload []byte) {
@@ -2007,16 +2025,430 @@ func TestMQTTv5SessionTakenOverDisconnect(t *testing.T) {
 	defer c2.Close()
 	testMQTTReadConnAckV5(t, r2)
 
-	b, _ := testMQTTReadPacket(t, r1)
-	if pt := b & mqttPacketMask; pt != mqttPacketDisconnect {
-		t.Fatalf("Expected DISCONNECT (%x), got %x", mqttPacketDisconnect, pt)
-	}
-	reason, err := r1.readByte("disconnect reason")
-	if err != nil {
-		t.Fatalf("Error reading disconnect reason: %v", err)
-	}
+	reason, props := testMQTTReadDisconnectV5(t, r1)
 	if reason != mqttReasonSessionTakenOver {
 		t.Fatalf("Expected reason 0x%x (session taken over), got 0x%x", mqttReasonSessionTakenOver, reason)
+	}
+	if props == nil || props.reasonString != mqttReasonStrSessionTakenOver {
+		t.Fatalf("Expected reason string %q, got %+v", mqttReasonStrSessionTakenOver, props)
+	}
+}
+
+// mqttV5RequestProblemInfoProps builds a CONNECT properties body carrying only a
+// Request Problem Information property with the given value (0 or 1).
+func mqttV5RequestProblemInfoProps(v byte) []byte {
+	return []byte{mqttPropRequestProblemInfo, v}
+}
+
+// mqttV5MaxPacketSizeProps builds a CONNECT properties body carrying only a
+// Maximum Packet Size property.
+func mqttV5MaxPacketSizeProps(max uint32) []byte {
+	w := newMQTTWriter(0)
+	w.WriteByte(mqttPropMaxPacketSize)
+	w.WriteUint32(max)
+	return w.Bytes()
+}
+
+// testMQTTReadPubCompV5 reads a PUBCOMP for expPI, returning its reason code and
+// (when present) parsed properties.
+func testMQTTReadPubCompV5(t testing.TB, r *mqttReader, expPI uint16) (byte, *mqttProperties) {
+	t.Helper()
+	b, pl := testMQTTReadPacket(t, r)
+	if pt := b & mqttPacketMask; pt != mqttPacketPubComp {
+		t.Fatalf("Expected PUBCOMP (%x), got %x", mqttPacketPubComp, pt)
+	}
+	start := r.pos
+	pi, err := r.readUint16("pubcomp pi")
+	if err != nil || pi != expPI {
+		t.Fatalf("Expected PUBCOMP pi=%v, got %v (err=%v)", expPI, pi, err)
+	}
+	reason := byte(mqttReasonSuccess)
+	if r.pos-start < pl {
+		if reason, err = r.readByte("pubcomp reason"); err != nil {
+			t.Fatalf("Error reading PUBCOMP reason: %v", err)
+		}
+	}
+	var props *mqttProperties
+	if r.pos-start < pl {
+		if props, err = r.readProperties(mqttPacketPubComp); err != nil {
+			t.Fatalf("Error reading PUBCOMP properties: %v", err)
+		}
+	}
+	return reason, props
+}
+
+// A rejected v5 CONNACK carries a Reason String explaining the failure; a
+// successful CONNACK carries none.
+func TestMQTTv5ConnAckReasonString(t *testing.T) {
+	o := testMQTTDefaultOptionsV5()
+	s := testMQTTRunServer(t, o)
+	defer testMQTTShutdownServer(s)
+
+	// Requesting enhanced authentication is rejected with 0x8C and a Reason
+	// String. Spec5 [4.12].
+	amProps := newMQTTWriter(0)
+	amProps.WriteByte(mqttPropAuthMethod)
+	amProps.WriteString("SCRAM-SHA-1")
+	c, r := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "am", cleanStart: true, props: amProps.Bytes()}, o.MQTT.Host, o.MQTT.Port)
+	defer c.Close()
+	_, reason, props := testMQTTReadConnAckV5(t, r)
+	if reason != mqttReasonBadAuthMethod {
+		t.Fatalf("Expected reason 0x%x, got 0x%x", mqttReasonBadAuthMethod, reason)
+	}
+	if props == nil || props.reasonString == _EMPTY_ {
+		t.Fatalf("Expected a Reason String on the rejected CONNACK, got %+v", props)
+	}
+
+	// A successful CONNACK carries no Reason String.
+	c2, r2 := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "ok", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
+	defer c2.Close()
+	_, reason, props = testMQTTReadConnAckV5(t, r2)
+	if reason != mqttReasonSuccess {
+		t.Fatalf("Expected success, got 0x%x", reason)
+	}
+	if props != nil && props.reasonString != _EMPTY_ {
+		t.Fatalf("Expected no Reason String on success, got %q", props.reasonString)
+	}
+}
+
+// A server-initiated DISCONNECT on a protocol error carries a Reason String.
+func TestMQTTv5DisconnectReasonString(t *testing.T) {
+	o := testMQTTDefaultOptionsV5()
+	s := testMQTTRunServer(t, o)
+	defer testMQTTShutdownServer(s)
+
+	c, r := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "de", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
+	defer c.Close()
+	testMQTTReadConnAckV5(t, r)
+
+	// A PUBLISH with a wildcard Response Topic is a Protocol Error. Spec5
+	// [3.3.2.3.5].
+	props := newMQTTWriter(0)
+	props.WriteByte(mqttPropResponseTopic)
+	props.WriteString("a/+/b")
+	vh := newMQTTWriter(0)
+	vh.WriteString("foo")
+	vh.WriteVarInt(props.Len())
+	vh.Write(props.Bytes())
+	vh.Write([]byte("msg"))
+	w := newMQTTWriter(0)
+	w.WriteByte(mqttPacketPub)
+	w.WriteVarInt(vh.Len())
+	w.Write(vh.Bytes())
+	if _, err := testMQTTWrite(c, w.Bytes()); err != nil {
+		t.Fatalf("Error writing PUBLISH: %v", err)
+	}
+
+	reason, dprops := testMQTTReadDisconnectV5(t, r)
+	if reason != mqttReasonProtocolError {
+		t.Fatalf("Expected reason 0x%x, got 0x%x", mqttReasonProtocolError, reason)
+	}
+	if dprops == nil || dprops.reasonString == _EMPTY_ {
+		t.Fatalf("Expected a Reason String on the DISCONNECT, got %+v", dprops)
+	}
+}
+
+// A SUBACK with a rejected (shared subscription) filter carries the failure text
+// as the packet-level Reason String, alongside the per-filter 0x9E code.
+func TestMQTTv5SubAckReasonString(t *testing.T) {
+	o := testMQTTDefaultOptionsV5()
+	s := testMQTTRunServer(t, o)
+	defer testMQTTShutdownServer(s)
+
+	c, r := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "sa", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
+	defer c.Close()
+	testMQTTReadConnAckV5(t, r)
+
+	codes, props := testMQTTSubV5PropsEx(t, c, r, 1, nil, []mqttV5SubFilter{
+		{topic: "$share/g/foo", opts: 1},
+		{topic: "bar", opts: 1},
+	})
+	if len(codes) != 2 || codes[0] != mqttReasonSharedSubNotSupported || codes[1] != 1 {
+		t.Fatalf("Expected codes [0x%x, 1], got %v", mqttReasonSharedSubNotSupported, codes)
+	}
+	if props == nil || props.reasonString == _EMPTY_ {
+		t.Fatalf("Expected a Reason String on the SUBACK, got %+v", props)
+	}
+}
+
+// An UNSUBACK for a never-subscribed filter carries the failure text.
+func TestMQTTv5UnsubAckReasonString(t *testing.T) {
+	o := testMQTTDefaultOptionsV5()
+	s := testMQTTRunServer(t, o)
+	defer testMQTTShutdownServer(s)
+
+	c, r := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "ua", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
+	defer c.Close()
+	testMQTTReadConnAckV5(t, r)
+
+	codes, props := testMQTTUnsubV5Ex(t, c, r, 1, []string{"never/subscribed"})
+	if len(codes) != 1 || codes[0] != mqttReasonNoSubscriptionExisted {
+		t.Fatalf("Expected code [0x%x], got %v", mqttReasonNoSubscriptionExisted, codes)
+	}
+	if props == nil || props.reasonString == _EMPTY_ {
+		t.Fatalf("Expected a Reason String on the UNSUBACK, got %+v", props)
+	}
+}
+
+// A PUBCOMP with a failure reason (unknown packet identifier) carries the failure
+// text as a Reason String.
+func TestMQTTv5PubCompReasonString(t *testing.T) {
+	o := testMQTTDefaultOptionsV5()
+	s := testMQTTRunServer(t, o)
+	defer testMQTTShutdownServer(s)
+
+	c, r := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "pc", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
+	defer c.Close()
+	testMQTTReadConnAckV5(t, r)
+
+	if _, err := testMQTTWrite(c, []byte{mqttPacketPubRel | 0x2, 2, 0, 42}); err != nil {
+		t.Fatalf("Error writing PUBREL: %v", err)
+	}
+	reason, props := testMQTTReadPubCompV5(t, r, 42)
+	if reason != mqttReasonPacketIDNotFound {
+		t.Fatalf("Expected reason 0x%x, got 0x%x", mqttReasonPacketIDNotFound, reason)
+	}
+	if props == nil || props.reasonString == _EMPTY_ {
+		t.Fatalf("Expected a Reason String on the PUBCOMP, got %+v", props)
+	}
+}
+
+// Request Problem Information 0 suppresses Reason Strings on acks (SUBACK,
+// PUBCOMP) but not on CONNACK/DISCONNECT, which the server MAY always send.
+// Spec5 [3.1.2.11.7].
+func TestMQTTv5ReasonStringRequestProblemInfo(t *testing.T) {
+	o := testMQTTDefaultOptionsV5()
+	s := testMQTTRunServer(t, o)
+	defer testMQTTShutdownServer(s)
+
+	c, r := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "rpi", cleanStart: true, props: mqttV5RequestProblemInfoProps(0)}, o.MQTT.Host, o.MQTT.Port)
+	defer c.Close()
+	testMQTTReadConnAckV5(t, r)
+
+	// SUBACK: failure code present, but no Reason String.
+	codes, sprops := testMQTTSubV5PropsEx(t, c, r, 1, nil, []mqttV5SubFilter{{topic: "$share/g/foo", opts: 1}})
+	if len(codes) != 1 || codes[0] != mqttReasonSharedSubNotSupported {
+		t.Fatalf("Expected code [0x%x], got %v", mqttReasonSharedSubNotSupported, codes)
+	}
+	if sprops != nil && sprops.reasonString != _EMPTY_ {
+		t.Fatalf("RPI=0: expected no Reason String on SUBACK, got %q", sprops.reasonString)
+	}
+
+	// PUBCOMP: failure reason present, but no Reason String.
+	if _, err := testMQTTWrite(c, []byte{mqttPacketPubRel | 0x2, 2, 0, 7}); err != nil {
+		t.Fatalf("Error writing PUBREL: %v", err)
+	}
+	reason, pprops := testMQTTReadPubCompV5(t, r, 7)
+	if reason != mqttReasonPacketIDNotFound {
+		t.Fatalf("Expected reason 0x%x, got 0x%x", mqttReasonPacketIDNotFound, reason)
+	}
+	if pprops != nil && pprops.reasonString != _EMPTY_ {
+		t.Fatalf("RPI=0: expected no Reason String on PUBCOMP, got %q", pprops.reasonString)
+	}
+
+	// DISCONNECT still carries a Reason String even with RPI=0.
+	pw := newMQTTWriter(0)
+	pw.WriteByte(mqttPropResponseTopic)
+	pw.WriteString("a/+/b")
+	vh := newMQTTWriter(0)
+	vh.WriteString("foo")
+	vh.WriteVarInt(pw.Len())
+	vh.Write(pw.Bytes())
+	vh.Write([]byte("msg"))
+	w := newMQTTWriter(0)
+	w.WriteByte(mqttPacketPub)
+	w.WriteVarInt(vh.Len())
+	w.Write(vh.Bytes())
+	if _, err := testMQTTWrite(c, w.Bytes()); err != nil {
+		t.Fatalf("Error writing PUBLISH: %v", err)
+	}
+	dreason, dprops := testMQTTReadDisconnectV5(t, r)
+	if dreason != mqttReasonProtocolError {
+		t.Fatalf("Expected reason 0x%x, got 0x%x", mqttReasonProtocolError, dreason)
+	}
+	if dprops == nil || dprops.reasonString == _EMPTY_ {
+		t.Fatalf("RPI=0: DISCONNECT must still carry a Reason String, got %+v", dprops)
+	}
+
+	// A rejected CONNACK on a second RPI=0 connection still carries text.
+	amProps := newMQTTWriter(0)
+	amProps.WriteByte(mqttPropRequestProblemInfo)
+	amProps.WriteByte(0)
+	amProps.WriteByte(mqttPropAuthMethod)
+	amProps.WriteString("SCRAM-SHA-1")
+	c2, r2 := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "rpi2", cleanStart: true, props: amProps.Bytes()}, o.MQTT.Host, o.MQTT.Port)
+	defer c2.Close()
+	_, creason, cprops := testMQTTReadConnAckV5(t, r2)
+	if creason != mqttReasonBadAuthMethod {
+		t.Fatalf("Expected reason 0x%x, got 0x%x", mqttReasonBadAuthMethod, creason)
+	}
+	if cprops == nil || cprops.reasonString == _EMPTY_ {
+		t.Fatalf("RPI=0: rejected CONNACK must still carry a Reason String, got %+v", cprops)
+	}
+}
+
+// When adding a Reason String would exceed the client's Maximum Packet Size, the
+// server drops only the Reason String, falling back to the exact short form of
+// each packet. Exercises all four writer families (CONNACK, DISCONNECT, SUBACK,
+// PUBCOMP) since each frames separately.
+func TestMQTTv5ReasonStringMaxPacketSize(t *testing.T) {
+	o := testMQTTDefaultOptionsV5()
+	s := testMQTTRunServer(t, o)
+	defer testMQTTShutdownServer(s)
+
+	// A tiny Maximum Packet Size leaves no room for any Reason String.
+	tiny := mqttV5MaxPacketSizeProps(12)
+
+	// SUBACK falls back: failure code present, no Reason String.
+	c, r := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "mps", cleanStart: true, props: tiny}, o.MQTT.Host, o.MQTT.Port)
+	defer c.Close()
+	testMQTTReadConnAckV5(t, r)
+	codes, sprops := testMQTTSubV5PropsEx(t, c, r, 1, nil, []mqttV5SubFilter{{topic: "$share/g/foo", opts: 1}})
+	if len(codes) != 1 || codes[0] != mqttReasonSharedSubNotSupported {
+		t.Fatalf("Expected code [0x%x], got %v", mqttReasonSharedSubNotSupported, codes)
+	}
+	if sprops != nil && sprops.reasonString != _EMPTY_ {
+		t.Fatalf("Tiny max: expected no Reason String on SUBACK, got %q", sprops.reasonString)
+	}
+
+	// PUBCOMP falls back to the exact 5-byte short form (reason, no properties).
+	if _, err := testMQTTWrite(c, []byte{mqttPacketPubRel | 0x2, 2, 0, 5}); err != nil {
+		t.Fatalf("Error writing PUBREL: %v", err)
+	}
+	reason, pprops := testMQTTReadPubCompV5(t, r, 5)
+	if reason != mqttReasonPacketIDNotFound {
+		t.Fatalf("Expected reason 0x%x, got 0x%x", mqttReasonPacketIDNotFound, reason)
+	}
+	if pprops != nil && pprops.reasonString != _EMPTY_ {
+		t.Fatalf("Tiny max: expected no Reason String on PUBCOMP, got %q", pprops.reasonString)
+	}
+
+	// DISCONNECT falls back to the short form (no properties).
+	pw := newMQTTWriter(0)
+	pw.WriteByte(mqttPropResponseTopic)
+	pw.WriteString("a/+/b")
+	vh := newMQTTWriter(0)
+	vh.WriteString("foo")
+	vh.WriteVarInt(pw.Len())
+	vh.Write(pw.Bytes())
+	vh.Write([]byte("msg"))
+	w := newMQTTWriter(0)
+	w.WriteByte(mqttPacketPub)
+	w.WriteVarInt(vh.Len())
+	w.Write(vh.Bytes())
+	if _, err := testMQTTWrite(c, w.Bytes()); err != nil {
+		t.Fatalf("Error writing PUBLISH: %v", err)
+	}
+	dreason, dprops := testMQTTReadDisconnectV5(t, r)
+	if dreason != mqttReasonProtocolError {
+		t.Fatalf("Expected reason 0x%x, got 0x%x", mqttReasonProtocolError, dreason)
+	}
+	if dprops != nil && dprops.reasonString != _EMPTY_ {
+		t.Fatalf("Tiny max: expected no Reason String on DISCONNECT, got %q", dprops.reasonString)
+	}
+
+	// A rejected CONNACK on a second tiny-max connection also drops the text.
+	amProps := newMQTTWriter(0)
+	amProps.WriteByte(mqttPropMaxPacketSize)
+	amProps.WriteUint32(12)
+	amProps.WriteByte(mqttPropAuthMethod)
+	amProps.WriteString("SCRAM-SHA-1")
+	c2, r2 := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "mps2", cleanStart: true, props: amProps.Bytes()}, o.MQTT.Host, o.MQTT.Port)
+	defer c2.Close()
+	_, creason, cprops := testMQTTReadConnAckV5(t, r2)
+	if creason != mqttReasonBadAuthMethod {
+		t.Fatalf("Expected reason 0x%x, got 0x%x", mqttReasonBadAuthMethod, creason)
+	}
+	if cprops != nil && cprops.reasonString != _EMPTY_ {
+		t.Fatalf("Tiny max: expected no Reason String on CONNACK, got %q", cprops.reasonString)
+	}
+
+	// A control connection with a large limit still gets the SUBACK text.
+	c3, r3 := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "mps3", cleanStart: true, props: mqttV5MaxPacketSizeProps(1024)}, o.MQTT.Host, o.MQTT.Port)
+	defer c3.Close()
+	testMQTTReadConnAckV5(t, r3)
+	_, bigProps := testMQTTSubV5PropsEx(t, c3, r3, 1, nil, []mqttV5SubFilter{{topic: "$share/g/foo", opts: 1}})
+	if bigProps == nil || bigProps.reasonString == _EMPTY_ {
+		t.Fatalf("Large max: expected a Reason String on SUBACK, got %+v", bigProps)
+	}
+}
+
+// A Reason String derived from client-controlled text must be dropped when it
+// exceeds the maximum length an MQTT UTF-8 string can encode; otherwise the
+// uint16 length prefix would wrap and corrupt the properties block. The
+// resulting DISCONNECT must still be well-formed (short form).
+func TestMQTTv5ReasonStringMaxLength(t *testing.T) {
+	o := testMQTTDefaultOptionsV5()
+	s := testMQTTRunServer(t, o)
+	defer testMQTTShutdownServer(s)
+
+	c, r := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "rsmax", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
+	defer c.Close()
+	testMQTTReadConnAckV5(t, r)
+
+	// A wildcard Response Topic is a protocol error whose text embeds the topic;
+	// a max-length (65535-byte) topic pushes that text over the string limit.
+	bigTopic := strings.Repeat("a", 0xFFFF-1) + "+"
+	props := newMQTTWriter(0)
+	props.WriteByte(mqttPropResponseTopic)
+	props.WriteString(bigTopic)
+	vh := newMQTTWriter(0)
+	vh.WriteString("foo")
+	vh.WriteVarInt(props.Len())
+	vh.Write(props.Bytes())
+	vh.Write([]byte("msg"))
+	w := newMQTTWriter(0)
+	w.WriteByte(mqttPacketPub)
+	w.WriteVarInt(vh.Len())
+	w.Write(vh.Bytes())
+	if _, err := testMQTTWrite(c, w.Bytes()); err != nil {
+		t.Fatalf("Error writing PUBLISH: %v", err)
+	}
+
+	reason, dprops := testMQTTReadDisconnectV5(t, r)
+	if reason != mqttReasonProtocolError {
+		t.Fatalf("Expected reason 0x%x, got 0x%x", mqttReasonProtocolError, reason)
+	}
+	if dprops != nil && dprops.reasonString != _EMPTY_ {
+		t.Fatalf("Over-long Reason String must be dropped, got %d bytes", len(dprops.reasonString))
+	}
+}
+
+// A 3.1.1 client is unaffected by Reason Strings: a failed-filter SUBACK keeps
+// the legacy form (packet identifier + one reason byte per filter, no properties
+// block), even against a v5-enabled server.
+func TestMQTTv5ReasonStringV4Unaffected(t *testing.T) {
+	o := testMQTTDefaultOptionsV5()
+	s := testMQTTRunServer(t, o)
+	defer testMQTTShutdownServer(s)
+
+	c, r := testMQTTConnect(t, &mqttConnInfo{clientID: "v4", cleanSess: true}, o.MQTT.Host, o.MQTT.Port)
+	defer c.Close()
+	testMQTTCheckConnAck(t, r, mqttConnAckRCConnectionAccepted, false)
+
+	// This topic converts to an internal NATS subject, which is rejected (0x80).
+	testMQTTSub(t, 1, c, r, []*mqttFilter{{filter: "$MQTT/sub/foo", qos: 0}}, []byte{mqttSubAckFailure})
+
+	// The whole packet is the legacy form: fixed header + remaining length 3
+	// (2-byte pi + one reason byte, no properties). testMQTTSub already consumed
+	// it above; here we re-run against a fresh sub to inspect the raw length.
+	vh := newMQTTWriter(0)
+	vh.WriteUint16(2)
+	vh.WriteBytes([]byte("$MQTT/sub/bar"))
+	vh.WriteByte(0)
+	w := newMQTTWriter(0)
+	w.WriteByte(mqttPacketSub | mqttSubscribeFlags)
+	w.WriteVarInt(vh.Len())
+	w.Write(vh.Bytes())
+	if _, err := testMQTTWrite(c, w.Bytes()); err != nil {
+		t.Fatalf("Error writing SUBSCRIBE: %v", err)
+	}
+	b, pl := testMQTTReadPacket(t, r)
+	if pt := b & mqttPacketMask; pt != mqttPacketSubAck {
+		t.Fatalf("Expected SUBACK (%x), got %x", mqttPacketSubAck, pt)
+	}
+	if pl != 3 {
+		t.Fatalf("Expected legacy SUBACK remaining length 3 (pi + 1 reason, no props), got %d", pl)
 	}
 }
 
@@ -4917,15 +5349,30 @@ func testMQTTSendPubV5Raw(t testing.TB, c net.Conn, qos byte, pi uint16, retain 
 // testMQTTReadDisconnectReason reads a v5 DISCONNECT and returns its reason code.
 func testMQTTReadDisconnectReason(t testing.TB, r *mqttReader) byte {
 	t.Helper()
-	b, _ := testMQTTReadPacket(t, r)
+	reason, _ := testMQTTReadDisconnectV5(t, r)
+	return reason
+}
+
+// testMQTTReadDisconnectV5 reads a v5 DISCONNECT, returning its reason code and
+// (when the packet carries a properties block) the parsed properties.
+func testMQTTReadDisconnectV5(t testing.TB, r *mqttReader) (byte, *mqttProperties) {
+	t.Helper()
+	b, pl := testMQTTReadPacket(t, r)
 	if pt := b & mqttPacketMask; pt != mqttPacketDisconnect {
 		t.Fatalf("Expected DISCONNECT (%x), got %x", mqttPacketDisconnect, pt)
 	}
+	start := r.pos
 	reason, err := r.readByte("disconnect reason")
 	if err != nil {
 		t.Fatalf("Error reading disconnect reason: %v", err)
 	}
-	return reason
+	var props *mqttProperties
+	if r.pos-start < pl {
+		if props, err = r.readProperties(mqttPacketDisconnect); err != nil {
+			t.Fatalf("Error reading DISCONNECT properties: %v", err)
+		}
+	}
+	return reason, props
 }
 
 // The advertised Topic Alias Maximum in the CONNACK reflects the configured

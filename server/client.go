@@ -2465,7 +2465,9 @@ func (c *client) authViolation() {
 		}
 	}
 	if c.isMqtt() {
-		c.mqttEnqueueConnAck(mqttConnAckRCNotAuthorized, false)
+		// No Reason String: do not leak auth internals to an unauthenticated
+		// peer; the 0x87 reason code is enough.
+		c.mqttEnqueueConnAck(mqttConnAckRCNotAuthorized, false, _EMPTY_)
 	} else {
 		// Send this to client, regardless of the authErr override.
 		c.sendErr("Authorization Violation")
