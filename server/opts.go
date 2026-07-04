@@ -786,6 +786,15 @@ type MQTTOpts struct {
 	// Spec5 [3.2.2.3.2].
 	TopicAliasMaximum int
 
+	// KeepAliveMaximum is the highest keep alive (in seconds) the server allows
+	// an MQTT 5.0 client to use. When set to [1..65535] and a v5 client requests
+	// no keep alive (0) or a larger value, the server enforces this maximum
+	// instead and advertises it in the CONNACK Server Keep Alive property. 0
+	// (default) disables the override. Ignored for 3.1.1 clients, which have no
+	// way to be told of an override. Changing this option requires a restart.
+	// Spec5 [3.1.2.10], [3.2.2.3.14].
+	KeepAliveMaximum int
+
 	// Snapshot of configured TLS options.
 	tlsConfigOpts *TLSConfigOpts
 
@@ -5674,6 +5683,16 @@ func parseMQTT(v any, o *Options, errors *[]error, warnings *[]error) error {
 				o.MQTT.TopicAliasMaximum = -1
 			} else {
 				o.MQTT.TopicAliasMaximum = tmp
+			}
+		case "keep_alive_maximum", "keep_alive_max":
+			tmp := int(mv.(int64))
+			if tmp < 0 || tmp > 0xFFFF {
+				err := &configErr{tk, fmt.Sprintf("invalid value %v, should be in [0..%d] range (0 disables)", tmp, 0xFFFF)}
+				*errors = append(*errors, err)
+			} else {
+				// No 0 => -1 remap (unlike topic_alias_maximum): there is no
+				// non-zero default, so unset and disabled are the same thing.
+				o.MQTT.KeepAliveMaximum = tmp
 			}
 
 		default:

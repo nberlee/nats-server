@@ -4964,6 +4964,75 @@ func TestMQTTv5TopicAliasMaxAdvertised(t *testing.T) {
 	}
 }
 
+// The server advertises Server Keep Alive only when it overrides the client's
+// requested keep alive: never when the option is unset, and only when the
+// client asked for 0 (none) or a value above the configured maximum.
+func TestMQTTv5ServerKeepAliveAdvertised(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		opt      int
+		clientKA uint16
+		expSet   bool
+		expVal   uint16
+	}{
+		{"unset with none", 0, 0, false, 0},
+		{"unset with value", 0, 30, false, 0},
+		{"override none", 10, 0, true, 10},
+		{"override above max", 10, 60, true, 10},
+		{"at max", 10, 10, false, 0},
+		{"below max", 10, 5, false, 0},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			o := testMQTTDefaultOptionsV5()
+			o.MQTT.KeepAliveMaximum = test.opt
+			s := testMQTTRunServer(t, o)
+			defer testMQTTShutdownServer(s)
+
+			ci := &mqttV5ConnInfo{clientID: "ska", cleanStart: true, keepAlive: test.clientKA}
+			c, r := testMQTTConnectV5(t, ci, o.MQTT.Host, o.MQTT.Port)
+			defer c.Close()
+			_, reason, props := testMQTTReadConnAckV5(t, r)
+			if reason != mqttReasonSuccess {
+				t.Fatalf("Expected success, got 0x%x", reason)
+			}
+			if props.present[mqttPropServerKeepAlive] != test.expSet {
+				t.Fatalf("Server Keep Alive present=%v, want %v", props.present[mqttPropServerKeepAlive], test.expSet)
+			}
+			if test.expSet && props.serverKeepAlive != test.expVal {
+				t.Fatalf("Server Keep Alive=%d, want %d", props.serverKeepAlive, test.expVal)
+			}
+		})
+	}
+}
+
+// With keep_alive_maximum set, a v5 client that requested no keep alive is still
+// disconnected once the enforced deadline (1.5x the maximum) elapses, while a
+// 3.1.1 client on the same server keeps its (absent) keep alive: the override is
+// silently inapplicable to v4, which has no way to be told of it.
+func TestMQTTv5ServerKeepAliveEnforced(t *testing.T) {
+	o := testMQTTDefaultOptionsV5()
+	o.MQTT.KeepAliveMaximum = 1
+	s := testMQTTRunServer(t, o)
+	defer testMQTTShutdownServer(s)
+
+	// v5 client requesting no keep alive: server enforces 1s => 1.5s deadline.
+	c5, r5 := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "v5ka", cleanStart: true, keepAlive: 0}, o.MQTT.Host, o.MQTT.Port)
+	defer c5.Close()
+	if _, reason, _ := testMQTTReadConnAckV5(t, r5); reason != mqttReasonSuccess {
+		t.Fatalf("Expected success, got 0x%x", reason)
+	}
+
+	// 3.1.1 control also requesting no keep alive: no override, stays connected.
+	c4, r4 := testMQTTConnect(t, &mqttConnInfo{cleanSess: true, keepAlive: 0}, o.MQTT.Host, o.MQTT.Port)
+	defer c4.Close()
+	testMQTTCheckConnAck(t, r4, mqttConnAckRCConnectionAccepted, false)
+
+	time.Sleep(2 * time.Second)
+	testMQTTExpectDisconnect(t, c5)
+	// The v4 client is still alive: a PING round-trips.
+	testMQTTFlush(t, c4, nil, r4)
+}
+
 // A client binds a Topic Alias with a full-topic PUBLISH, then publishes with an
 // empty topic + the alias; the server resolves it and delivers on the bound
 // topic. Exercised at QoS 0 and QoS 1.

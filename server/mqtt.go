@@ -664,6 +664,12 @@ type mqtt struct {
 	// accessed from the read loop. Spec5 [3.3.2.3.4].
 	topicAliases map[uint16][]byte
 
+	// serverKeepAlive is the keep alive (seconds) this server enforces when it
+	// overrides a v5 client's requested value; advertised in the CONNACK Server
+	// Keep Alive property. 0 = no override (property omitted). Set during
+	// CONNECT, read on the CONNACK path only. Spec5 [3.2.2.3.14].
+	serverKeepAlive uint16
+
 	// rejectQoS2Pub tells the MQTT client to not accept QoS2 PUBLISH, instead
 	// error and terminate the connection.
 	rejectQoS2Pub bool
@@ -721,6 +727,7 @@ type mqttPending struct {
 
 type mqttConnectProto struct {
 	rd    time.Duration
+	ka    uint16 // client-requested keep alive (seconds), 0 = none
 	will  *mqttWill
 	flags byte
 	// MQTT 5.0 CONNECT properties (nil for 3.1.1).
@@ -1118,6 +1125,12 @@ func validateMQTTOptions(o *Options) error {
 	if mo.TopicAliasMaximum < -1 || mo.TopicAliasMaximum > 0xFFFF {
 		return fmt.Errorf("mqtt topic_alias_maximum must be in [-1..%d] (0 = default %d, -1 disables), got %d",
 			0xFFFF, mqttDefaultTopicAliasMax, mo.TopicAliasMaximum)
+	}
+	// Keep Alive Maximum: 0 = no override, 1..65535 explicit. No -1 sentinel is
+	// needed (unlike topic_alias_maximum): there is no non-zero default, so
+	// unset and disabled are the same thing.
+	if mo.KeepAliveMaximum < 0 || mo.KeepAliveMaximum > 0xFFFF {
+		return fmt.Errorf("mqtt keep_alive_maximum must be in [0..%d] (0 = no override), got %d", 0xFFFF, mo.KeepAliveMaximum)
 	}
 	// If strictly standalone and there is no JS enabled, then it won't work...
 	// For leafnodes, we could either have remote(s) and it would be ok, or no
@@ -5551,6 +5564,13 @@ func (sess *mqttSession) deleteConsumer(cc *ConsumerConfig) {
 //
 //////////////////////////////////////////////////////////////////////////////
 
+// mqttKeepAliveRD returns the read deadline for a keep alive: one and a half
+// times the keep alive interval. Computed in milliseconds to avoid truncating
+// the half second for odd keep alives (e.g. 1s => 1.5s). Spec [MQTT-3.1.2-24].
+func mqttKeepAliveRD(ka uint16) time.Duration {
+	return time.Duration(ka) * 1500 * time.Millisecond
+}
+
 // Parse the MQTT connect protocol
 func (c *client) mqttParseConnect(r *mqttReader, hasMappings bool) (byte, *mqttConnectProto, error) {
 	// Protocol name
@@ -5651,9 +5671,10 @@ func (c *client) mqttParseConnect(r *mqttReader, hasMappings bool) (byte, *mqttC
 	if err != nil {
 		return 0, nil, err
 	}
+	cp.ka = ka
 	// Spec [MQTT-3.1.2-24]
 	if ka > 0 {
-		cp.rd = time.Duration(float64(ka)*1.5) * time.Second
+		cp.rd = mqttKeepAliveRD(ka)
 	}
 
 	// MQTT 5.0: the CONNECT variable header ends with a properties block, just
@@ -6051,6 +6072,20 @@ CHECK:
 		c.mqtt.topicAliasMax = mqttTopicAliasMax(s.getOpts())
 	}
 
+	// MQTT 5.0 Server Keep Alive: if the client requested no keep alive (0) or
+	// one above the configured maximum, enforce the maximum: it becomes the read
+	// deadline basis and is advertised in the CONNACK below. v5 only: 3.1.1 has
+	// no Server Keep Alive property, so an override could not be communicated.
+	// Resolved on the accept path, so failure CONNACKs never carry the property
+	// and the CONNECT trace keeps showing the client-sent value. Spec5
+	// [3.1.2.10], [3.2.2.3.14].
+	if c.mqtt.proto == mqttProtoLevel5 {
+		if kam := s.getOpts().MQTT.KeepAliveMaximum; kam > 0 && (cp.ka == 0 || cp.ka > uint16(kam)) {
+			c.mqtt.serverKeepAlive = uint16(kam)
+			cp.rd = mqttKeepAliveRD(uint16(kam))
+		}
+	}
+
 	// We would need to save only if it did not exist previously, but we save
 	// always in case we are running in cluster mode. This will notify other
 	// running servers that this session is being used.
@@ -6167,6 +6202,13 @@ func (c *client) mqttEnqueueConnAckV5(rc, sp byte) {
 	if tam := c.mqtt.topicAliasMax; tam > 0 {
 		props.topicAliasMax = tam
 		props.present[mqttPropTopicAliasMax] = true
+	}
+	// Server Keep Alive: sent only when the server overrides the client's
+	// requested keep alive; absent => the client's value applies. Spec5
+	// [3.2.2.3.14].
+	if ska := c.mqtt.serverKeepAlive; ska > 0 {
+		props.serverKeepAlive = ska
+		props.present[mqttPropServerKeepAlive] = true
 	}
 	// We intentionally do NOT advertise Maximum Packet Size. The natural
 	// candidate (Options.MaxPayload) is not the value the server actually
