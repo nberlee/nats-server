@@ -166,6 +166,10 @@ const (
 	// Maximum payload size of a control packet
 	mqttMaxPayloadSize = 0xFFFFFFF
 
+	// Largest value representable as an MQTT variable byte integer (4 bytes),
+	// also the maximum valid Subscription Identifier. Spec5 [1.5.5], [3.8.2.1.2].
+	mqttMaxVarInt = 0xFFFFFFF
+
 	// Topic/Filter characters
 	mqttTopicLevelSep = '/'
 	mqttSingleLevelWC = '+'
@@ -433,6 +437,7 @@ type mqttSession struct {
 	subs        map[string]byte     // Key is MQTT SUBSCRIBE filter, value is the subscription QoS
 	noLocalSubs map[string]struct{} // Set of SUBSCRIBE filters that carry the v5 No Local option
 	rapSubs     map[string]struct{} // Set of SUBSCRIBE filters that carry the v5 Retain As Published option
+	subIDs      map[string]int      // SUBSCRIBE filter -> v5 Subscription Identifier (absent = none)
 
 	cons                   map[string]*ConsumerConfig
 	pubRelConsumer         *ConsumerConfig
@@ -490,11 +495,13 @@ type mqttPersistedSession struct {
 	Clean  bool            `json:"clean,omitempty"`
 	Subs   map[string]byte `json:"subs,omitempty"`
 	// NoLocal and RetainAsPublished are the sets of Subs filters that carry the
-	// v5 No Local / Retain As Published options. Kept separate from Subs (rather
-	// than packed into its QoS byte) so an older server reading this record still
-	// sees a valid 0..2 QoS and simply ignores these fields. Spec5 [3.8.3.1].
+	// v5 No Local / Retain As Published options; SubIDs maps a Subs filter to its
+	// v5 Subscription Identifier. All kept separate from Subs (rather than packed
+	// into its QoS byte) so an older server reading this record still sees a valid
+	// 0..2 QoS and simply ignores these fields. Spec5 [3.8.3.1], [3.8.2.1.2].
 	NoLocal           []string                   `json:"no_local,omitempty"`
 	RetainAsPublished []string                   `json:"retain_as_published,omitempty"`
+	SubIDs            map[string]int             `json:"sub_ids,omitempty"`
 	Cons              map[string]*ConsumerConfig `json:"cons,omitempty"`
 	PubRel            *ConsumerConfig            `json:"pubrel,omitempty"`
 	Will              *mqttPersistedWill         `json:"will,omitempty"`
@@ -591,6 +598,11 @@ type mqttSub struct {
 	// instead of having it cleared. Read in the delivery callbacks like noLocal.
 	// Spec5 [3.8.3.1].
 	retainAsPublished bool
+
+	// subID is the v5 Subscription Identifier for this subscription (0 = none).
+	// The server injects it into every PUBLISH delivered because of this sub.
+	// Read in the delivery callbacks like noLocal. Spec5 [3.8.2.1.2].
+	subID int
 }
 
 type mqtt struct {
@@ -751,6 +763,10 @@ type mqttFilter struct {
 	// live-forwarded message keeps the RETAIN flag it was published with. Spec5
 	// [3.8.3.1].
 	retainAsPublished bool
+	// v5 Subscription Identifier from the SUBSCRIBE properties block (0 = none).
+	// The packet's single identifier applies to every filter it carries. Spec5
+	// [3.8.2.1.2].
+	subID int
 	// v5 (UN)SUBACK reason code for this filter (zero value is success).
 	reason byte
 	// Used only for tracing and should not be used after parsing of (un)sub protocols.
@@ -1637,10 +1653,12 @@ func mqttParsePublishNATSHeader(headerBytes []byte) *mqttParsedPublishNATSHeader
 // mqttValidateForwardProps returns raw only if it is a well-formed MQTT 5.0
 // properties block that is safe to forward to a subscriber: it must parse
 // cleanly with no trailing bytes and must not contain a Topic Alias (hop-by-hop,
-// never forwarded) or a Subscription Identifier (unsupported; disallowed in the
-// PUBLISH context). Otherwise it returns nil so the message is delivered
-// without properties. This protects against a crafted Nmqtt-Props header from a
-// non-MQTT publisher making the server emit a malformed or forbidden PUBLISH.
+// never forwarded) or a Subscription Identifier (per-hop and server-generated at
+// delivery time; a publisher-supplied block must never smuggle one, so it is
+// disallowed in the inbound PUBLISH context). Otherwise it returns nil so the
+// message is delivered without properties. This protects against a crafted
+// Nmqtt-Props header from a non-MQTT publisher making the server emit a malformed
+// or forbidden PUBLISH.
 func mqttValidateForwardProps(raw []byte) []byte {
 	if len(raw) == 0 {
 		return nil
@@ -1819,6 +1837,53 @@ func mqttForwardExpiry(props []byte, storeUnixNano int64) (out []byte, expired b
 	copy(out, props)
 	binary.BigEndian.PutUint32(out[off:], uint32(orig-elapsed))
 	return out, false
+}
+
+// mqttInjectSubID returns a raw v5 properties block (variable-int length prefix
+// + body) equal to props with a Subscription Identifier property (0x0B, varint
+// id) appended to the body and the length prefix re-encoded, synthesizing a
+// fresh block when props is empty. It is always the last rewrite before framing:
+// offset-based rewrites (mqttSetMessageExpiry / mqttForwardExpiry) must run on
+// the original block first. props is returned unchanged when the id is out of
+// range, the block is unsafe to forward (see mqttValidateForwardProps), or the
+// injected block would exceed the maximum varint length. Spec5 [3.8.2.1.2].
+func mqttInjectSubID(props []byte, id int) []byte {
+	if id <= 0 || id > mqttMaxVarInt {
+		return props
+	}
+	// The Subscription Identifier property: id 0x0B followed by its varint value.
+	suffix := newMQTTWriter(5)
+	suffix.WriteByte(mqttPropSubscriptionID)
+	suffix.WriteVarInt(id)
+	sb := suffix.Bytes()
+
+	// An absent (nil) or empty (single 0 length byte) block: synthesize one that
+	// carries just the identifier. Checked before validation so an empty input is
+	// not mistaken for an invalid block.
+	var body []byte
+	if n := len(props); n > 1 {
+		// A publisher-supplied block must be safe to forward verbatim before we
+		// extend it (WritePublishHeader writes the result unchanged); a valid
+		// length prefix can still wrap an invalid or unsafe body.
+		if mqttValidateForwardProps(props) == nil {
+			return props
+		}
+		plen, off := mqttVarIntFromSlice(props)
+		if off < 0 || off+plen != n {
+			return props
+		}
+		body = props[off:]
+	}
+
+	newLen := len(body) + len(sb)
+	if newLen > mqttMaxVarInt {
+		return props
+	}
+	w := newMQTTWriter(5 + newLen)
+	w.WriteVarInt(newLen)
+	w.Write(body)
+	w.Write(sb)
+	return w.Bytes()
 }
 
 func mqttParsePubRelNATSHeader(headerBytes []byte) uint16 {
@@ -3736,14 +3801,14 @@ func (as *mqttAccountSessionManager) removeSession(sess *mqttSession, lock bool)
 // waiting.
 func (sess *mqttSession) processQOS12Sub(
 	c *client, // subscribing client.
-	subject, sid []byte, isReserved bool, qos byte, noLocal, retainAsPublished bool, jsDurName string, h msgHandler, // subscription parameters.
+	subject, sid []byte, isReserved bool, qos byte, noLocal, retainAsPublished bool, subID int, jsDurName string, h msgHandler, // subscription parameters.
 ) (*subscription, error) {
-	return sess.processSub(c, subject, sid, isReserved, qos, noLocal, retainAsPublished, jsDurName, h, false, nil, false, nil)
+	return sess.processSub(c, subject, sid, isReserved, qos, noLocal, retainAsPublished, subID, jsDurName, h, false, nil, false, nil)
 }
 
 func (sess *mqttSession) processSub(
 	c *client, // subscribing client.
-	subject, sid []byte, isReserved bool, qos byte, noLocal, retainAsPublished bool, jsDurName string, h msgHandler, // subscription parameters.
+	subject, sid []byte, isReserved bool, qos byte, noLocal, retainAsPublished bool, subID int, jsDurName string, h msgHandler, // subscription parameters.
 	initShadow bool, // do we need to scan for shadow subscriptions? (not for QOS1+)
 	rms map[string]*mqttRetainedMsg, // preloaded rms (can be empty, or missing items if errors)
 	trace bool, // trace serialized retained messages in the log?
@@ -3784,6 +3849,7 @@ func (sess *mqttSession) processSub(
 		ss.mqtt.qos = qos
 		ss.mqtt.noLocal = noLocal
 		ss.mqtt.retainAsPublished = retainAsPublished
+		ss.mqtt.subID = subID
 		ss.mqtt.jsDur = jsDurName
 		// A (re)configured subscription is live; clear any prior teardown mark.
 		ss.mqtt.closed = false
@@ -3813,6 +3879,26 @@ func mqttUpdateFilterOptSet(set map[string]struct{}, filter string, want bool) (
 		return set, true
 	}
 	return set, false
+}
+
+// mqttUpdateFilterSubID records (or, when id is 0, removes) the v5 Subscription
+// Identifier for filter, allocating the map on first add. Returns the (possibly
+// new) map and whether it changed, so the caller can flag the session for
+// persistence.
+func mqttUpdateFilterSubID(m map[string]int, filter string, id int) (map[string]int, bool) {
+	if id != 0 {
+		if cur, has := m[filter]; !has || cur != id {
+			if m == nil {
+				m = make(map[string]int)
+			}
+			m[filter] = id
+			return m, true
+		}
+	} else if _, has := m[filter]; has {
+		delete(m, filter)
+		return m, true
+	}
+	return m, false
 }
 
 // mqttFilterSetToList returns a subscription-filter set as a slice for
@@ -3995,7 +4081,7 @@ func (as *mqttAccountSessionManager) processSubs(sess *mqttSession, c *client,
 		as.mu.Lock()
 		sess.mu.Lock()
 		sub, err = sess.processSub(c,
-			bsubject, bsid, isReserved, f.qos, f.noLocal, f.retainAsPublished, // main subject
+			bsubject, bsid, isReserved, f.qos, f.noLocal, f.retainAsPublished, f.subID, // main subject
 			_EMPTY_, mqttDeliverMsgCbQoS0, // no jsDur for QOS0
 			processShadowSubs,
 			subRMS, trace, as)
@@ -4012,7 +4098,7 @@ func (as *mqttAccountSessionManager) processSubs(sess *mqttSession, c *client,
 		// subscriptions of QoS >= 1. But if a JS consumer already exists and
 		// the subscription for same subject is now a QoS==0, then the JS
 		// consumer will be deleted.
-		jscons, jssub, err = sess.processJSConsumer(c, subject, sid, f.qos, f.noLocal, f.retainAsPublished, fromSubProto)
+		jscons, jssub, err = sess.processJSConsumer(c, subject, sid, f.qos, f.noLocal, f.retainAsPublished, f.subID, fromSubProto)
 		if err != nil {
 			f.qos = mqttSubAckFailure
 			sess.cleanupFailedSub(c, sub, jscons, jssub)
@@ -4029,7 +4115,7 @@ func (as *mqttAccountSessionManager) processSubs(sess *mqttSession, c *client,
 			as.mu.Lock()
 			sess.mu.Lock()
 			fwcsub, err = sess.processSub(c,
-				[]byte(fwcsubject), []byte(fwcsid), isReserved, f.qos, f.noLocal, f.retainAsPublished, // FWC (top-level wildcard) subject
+				[]byte(fwcsubject), []byte(fwcsid), isReserved, f.qos, f.noLocal, f.retainAsPublished, f.subID, // FWC (top-level wildcard) subject
 				_EMPTY_, mqttDeliverMsgCbQoS0, // no jsDur for QOS0
 				processShadowSubs,
 				subRMS, trace, as)
@@ -4042,7 +4128,7 @@ func (as *mqttAccountSessionManager) processSubs(sess *mqttSession, c *client,
 				continue
 			}
 
-			fwjscons, fwjssub, err = sess.processJSConsumer(c, fwcsubject, fwcsid, f.qos, f.noLocal, f.retainAsPublished, fromSubProto)
+			fwjscons, fwjssub, err = sess.processJSConsumer(c, fwcsubject, fwcsid, f.qos, f.noLocal, f.retainAsPublished, f.subID, fromSubProto)
 			if err != nil {
 				// c.processSub already called c.Errorf(), so no need here.
 				f.qos = mqttSubAckFailure
@@ -4130,19 +4216,26 @@ func (as *mqttAccountSessionManager) serializeRetainedMsgsForSub(rms map[string]
 		// MQTT 5.0 Message Expiry Interval: a v5 subscriber must receive the
 		// interval reduced by the time the retained message has been waiting in the
 		// server. Spec5 [3.3.2.3.3]. 3.1.1 subscribers get no properties section.
+		v5 := c.mqtt.proto == mqttProtoLevel5
 		props := rm.Props
-		if c.mqtt.proto == mqttProtoLevel5 && !rm.expires.IsZero() {
+		if v5 && !rm.expires.IsZero() {
 			rem := uint32(time.Until(rm.expires).Seconds())
 			if rem < 1 {
 				rem = 1
 			}
 			props = mqttSetMessageExpiry(rm.Props, rem)
 		}
+		// MQTT 5.0 Subscription Identifier: inject the subscription's identifier
+		// (this path builds the header directly, bypassing mqttEnqueuePublishMsgTo).
+		// After the expiry rewrite and before the size check below. Spec5 [3.8.2.1.2].
+		if v5 && sub.mqtt.subID > 0 {
+			props = mqttInjectSubID(props, sub.mqtt.subID)
+		}
 
 		// Need to use the subject for the retained message, not the `sub` subject.
 		// We can find the published retained message in rm.sub.subject.
 		// Set the RETAIN flag: [MQTT-3.3.1-8].
-		flags, headerBytes := mqttMakePublishHeader(pi, qos, false, true, c.mqtt.proto == mqttProtoLevel5, []byte(rm.Topic), props, len(rm.Msg))
+		flags, headerBytes := mqttMakePublishHeader(pi, qos, false, true, v5, []byte(rm.Topic), props, len(rm.Msg))
 
 		// MQTT 5.0 Maximum Packet Size: skip a retained message that would exceed
 		// the client's limit rather than send an oversized packet (which a strict
@@ -4582,6 +4675,7 @@ func (as *mqttAccountSessionManager) createOrRestoreSession(clientID string, opt
 	sess.subs = ps.Subs
 	sess.noLocalSubs = mqttFilterSetFromList(ps.NoLocal)
 	sess.rapSubs = mqttFilterSetFromList(ps.RetainAsPublished)
+	sess.subIDs = ps.SubIDs
 	sess.cons = ps.Cons
 	sess.pubRelConsumer = ps.PubRel
 	sess.expiryInterval = ps.ExpiryInterval
@@ -4812,6 +4906,7 @@ func (sess *mqttSession) save() error {
 		Subs:              sess.subs,
 		NoLocal:           mqttFilterSetToList(sess.noLocalSubs),
 		RetainAsPublished: mqttFilterSetToList(sess.rapSubs),
+		SubIDs:            sess.subIDs,
 		Cons:              sess.cons,
 		PubRel:            sess.pubRelConsumer,
 		Will:              sess.will,
@@ -4873,6 +4968,7 @@ func (sess *mqttSession) clear(noWait bool) error {
 	sess.subs = nil
 	sess.noLocalSubs = nil
 	sess.rapSubs = nil
+	sess.subIDs = nil
 	sess.pendingPublish = nil
 	sess.pendingPubRel = nil
 	sess.cpending = nil
@@ -4939,6 +5035,11 @@ func (sess *mqttSession) update(filters []*mqttFilter, add bool) error {
 			if sess.rapSubs, changed = mqttUpdateFilterOptSet(sess.rapSubs, f.filter, f.retainAsPublished); changed {
 				needUpdate = true
 			}
+			// f.subID == 0 clears any prior identifier: a re-SUBSCRIBE without one
+			// removes it. Spec5 [3.8.2.1.2].
+			if sess.subIDs, changed = mqttUpdateFilterSubID(sess.subIDs, f.filter, f.subID); changed {
+				needUpdate = true
+			}
 		} else {
 			if _, ok := sess.subs[f.filter]; ok {
 				delete(sess.subs, f.filter)
@@ -4949,6 +5050,9 @@ func (sess *mqttSession) update(filters []*mqttFilter, add bool) error {
 				needUpdate = true
 			}
 			if sess.rapSubs, changed = mqttUpdateFilterOptSet(sess.rapSubs, f.filter, false); changed {
+				needUpdate = true
+			}
+			if sess.subIDs, changed = mqttUpdateFilterSubID(sess.subIDs, f.filter, 0); changed {
 				needUpdate = true
 			}
 		}
@@ -5900,7 +6004,7 @@ CHECK:
 		for subject, qos := range es.subs {
 			_, noLocal := es.noLocalSubs[subject]
 			_, rap := es.rapSubs[subject]
-			filters = append(filters, &mqttFilter{filter: subject, qos: qos, noLocal: noLocal, retainAsPublished: rap})
+			filters = append(filters, &mqttFilter{filter: subject, qos: qos, noLocal: noLocal, retainAsPublished: rap, subID: es.subIDs[subject]})
 		}
 		if _, err := asm.processSubs(es, c, filters, false, trace); err != nil {
 			return err
@@ -5974,12 +6078,11 @@ func (c *client) mqttEnqueueConnAckV5(rc, sp byte) {
 	//   - Wildcard Subscription Available: absent => wildcards supported.
 	//   - Topic Alias Maximum: absent => 0, i.e. we accept no topic aliases.
 	// We only emit the properties whose truthful value differs from the default.
-	// Shared subscriptions and subscription identifiers are not implemented by
-	// this foundation, so advertise them as unavailable. Spec5 [3.2.2.3].
+	// Shared subscriptions are not implemented, so advertise them as unavailable.
+	// Subscription identifiers are supported (absent => available), so we emit
+	// nothing for them. Spec5 [3.2.2.3].
 	props.sharedSubAvail = 0
 	props.present[mqttPropSharedSubAvailable] = true
-	props.subIDAvail = 0
-	props.present[mqttPropSubIDAvailable] = true
 	// We intentionally do NOT advertise Maximum Packet Size. The natural
 	// candidate (Options.MaxPayload) is not the value the server actually
 	// enforces: an inbound PUBLISH is re-encoded as a NATS message with extra
@@ -7263,6 +7366,9 @@ func (c *client) mqttParseSubsOrUnsubs(r *mqttReader, b byte, pl int, sub bool) 
 	end := r.pos + (pl - 2)
 	// MQTT 5.0: a properties block follows the packet identifier in both
 	// SUBSCRIBE and UNSUBSCRIBE. Spec5 [3.8.2.1], [3.10.2.1].
+	// subID is the packet's single v5 Subscription Identifier (0 = none); it
+	// applies to every filter the packet carries. Spec5 [3.8.2.1.2].
+	var subID int
 	if c.mqtt.proto == mqttProtoLevel5 {
 		ctx := mqttPacketSub
 		if !sub {
@@ -7272,11 +7378,17 @@ func (c *client) mqttParseSubsOrUnsubs(r *mqttReader, b byte, pl int, sub bool) 
 		if perr != nil {
 			return 0, nil, perr
 		}
-		// Subscription identifiers are not implemented (advertised as
-		// unavailable in CONNACK), so reject a SUBSCRIBE carrying one rather
-		// than silently ignoring it. Spec5 [3.8.4].
-		if sub && props != nil && len(props.subIDs) > 0 {
-			return 0, nil, fmt.Errorf("MQTT subscription identifiers are not supported")
+		// readProperties accepts repeated Subscription Identifiers because a
+		// delivered PUBLISH may legitimately carry several; in a SUBSCRIBE more
+		// than one is a Protocol Error. A value of 0 is already rejected there.
+		// Spec5 [MQTT-3.8.2.1.2].
+		if sub && props != nil {
+			if len(props.subIDs) > 1 {
+				return 0, nil, fmt.Errorf("%w: more than one subscription identifier in SUBSCRIBE", errMQTTProtocolError)
+			}
+			if len(props.subIDs) == 1 {
+				subID = props.subIDs[0]
+			}
 		}
 	}
 	var filters []*mqttFilter
@@ -7355,7 +7467,7 @@ func (c *client) mqttParseSubsOrUnsubs(r *mqttReader, b byte, pl int, sub bool) 
 				return 0, nil, fmt.Errorf("subscribe QoS value must be 0, 1 or 2, got %v", qos)
 			}
 		}
-		f := &mqttFilter{ttopic: topic, filter: string(filter), qos: qos, retainHandling: retainHandling, noLocal: noLocal, retainAsPublished: retainAsPublished, reason: reason}
+		f := &mqttFilter{ttopic: topic, filter: string(filter), qos: qos, retainHandling: retainHandling, noLocal: noLocal, retainAsPublished: retainAsPublished, subID: subID, reason: reason}
 		filters = append(filters, f)
 	}
 	// Spec [MQTT-3.8.3-3], [MQTT-3.10.3-2]
@@ -7420,6 +7532,7 @@ func mqttDeliverMsgCbQoS0(sub *subscription, pc *client, _ *Account, subject, re
 	subQoS := sub.mqtt.qos
 	noLocal := sub.mqtt.noLocal
 	retainAsPublished := sub.mqtt.retainAsPublished
+	subID := sub.mqtt.subID
 	ignore := mqttMustIgnoreForReservedSub(sub, subject)
 	sess.subsMu.RUnlock()
 
@@ -7517,7 +7630,7 @@ func mqttDeliverMsgCbQoS0(sub *subscription, pc *client, _ *Account, subject, re
 	// Message never has a packet identifier nor is marked as duplicate. A QoS0
 	// message dropped for exceeding the client's Maximum Packet Size needs no
 	// completion (it is not JetStream-backed here), so the result is ignored.
-	pc.mqttEnqueuePublishMsgTo(cc, sub, 0, 0, false, retainAsPublished && origRetain, topic, msg, props)
+	pc.mqttEnqueuePublishMsgTo(cc, sub, 0, 0, false, retainAsPublished && origRetain, subID, topic, msg, props)
 }
 
 // This is the callback attached to a JS durable subscription for a MQTT QoS 1+
@@ -7616,6 +7729,9 @@ func mqttDeliverMsgCbQoS12(sub *subscription, pc *client, _ *Account, subject, r
 	// message keeps the original RETAIN flag (from the stored Nmqtt-Ret header)
 	// only when the subscription set it. Spec5 [3.8.3.1].
 	retainAsPub := sub.mqtt.retainAsPublished && h != nil && h.retained
+	// Subscription Identifier: capture under the lock, injected on enqueue below.
+	// Spec5 [3.8.2.1.2].
+	subID := sub.mqtt.subID
 
 	pi, dup, started := sess.trackPublish(sub.mqtt.jsDur, reply)
 	sess.mu.Unlock()
@@ -7652,7 +7768,7 @@ func mqttDeliverMsgCbQoS12(sub *subscription, pc *client, _ *Account, subject, r
 			return
 		}
 	}
-	if !pc.mqttEnqueuePublishMsgTo(cc, sub, pi, qos, dup, retainAsPub, originalTopic, msg, props) {
+	if !pc.mqttEnqueuePublishMsgTo(cc, sub, pi, qos, dup, retainAsPub, subID, originalTopic, msg, props) {
 		// The PUBLISH exceeds the client's MQTT 5.0 Maximum Packet Size. Discard
 		// it and complete the delivery so JetStream does not redeliver it forever:
 		// release the packet identifier and ack the JS message. Spec5 [3.1.2.11.4].
@@ -7770,7 +7886,9 @@ func sparkbReplaceDeathTimestamp(msg []byte) []byte {
 // returns false without sending when the packet would exceed the client's MQTT
 // 5.0 Maximum Packet Size; the caller is then responsible for completing the
 // message (for QoS1/2, acking the JS delivery so it is not redelivered).
-func (c *client) mqttEnqueuePublishMsgTo(cc *client, sub *subscription, pi uint16, qos byte, dup, retainAsPub bool, topic, msg, props []byte) bool {
+// subID is the subscription's v5 Subscription Identifier (0 = none), injected
+// into the properties block for a v5 receiver. Spec5 [3.8.2.1.2].
+func (c *client) mqttEnqueuePublishMsgTo(cc *client, sub *subscription, pi uint16, qos byte, dup, retainAsPub bool, subID int, topic, msg, props []byte) bool {
 	// [tck-id-conformance-mqtt-aware-nbirth-mqtt-retain] A Sparkplug Aware
 	// MQTT Server MUST make NBIRTH messages available on the topic:
 	// $sparkplug/certificates/namespace/group_id/NBIRTH/edge_node_id with
@@ -7794,7 +7912,16 @@ func (c *client) mqttEnqueuePublishMsgTo(cc *client, sub *subscription, pi uint1
 		msg = sparkbReplaceDeathTimestamp(msg)
 	}
 
-	flags, headerBytes := mqttMakePublishHeader(pi, qos, dup, retain, cc.mqtt.proto == mqttProtoLevel5, topic, props, len(msg))
+	// MQTT 5.0 Subscription Identifier: inject the subscription's identifier into
+	// the delivered PUBLISH's properties. Only for a v5 receiver (a 3.1.1 receiver
+	// gets no properties section) and before the size check below so the extra
+	// bytes count against Maximum Packet Size. Spec5 [3.8.2.1.2].
+	v5 := cc.mqtt.proto == mqttProtoLevel5
+	if v5 && subID > 0 {
+		props = mqttInjectSubID(props, subID)
+	}
+
+	flags, headerBytes := mqttMakePublishHeader(pi, qos, dup, retain, v5, topic, props, len(msg))
 
 	// MQTT 5.0 Maximum Packet Size: never send a PUBLISH larger than the client
 	// is willing to accept. Discard it instead and let the caller complete the
@@ -8022,7 +8149,7 @@ func (sess *mqttSession) ensurePubRelConsumerSubscription(c *client) error {
 // Session lock is acquired and released as needed. Session is in the locked
 // map.
 func (sess *mqttSession) processJSConsumer(c *client, subject, sid string,
-	qos byte, noLocal, retainAsPublished, fromSubProto bool) (*ConsumerConfig, *subscription, error) {
+	qos byte, noLocal, retainAsPublished bool, subID int, fromSubProto bool) (*ConsumerConfig, *subscription, error) {
 
 	sess.mu.Lock()
 	cc, exists := sess.cons[sid]
@@ -8077,11 +8204,11 @@ func (sess *mqttSession) processJSConsumer(c *client, subject, sid string,
 		// the JS consumer already exists, we are done (it was created
 		// during the processing of CONNECT).
 		if fromSubProto {
-			// A re-SUBSCRIBE to an existing QoS 1/2 filter can change the QoS and
-			// the No Local option, both read by the QoS 1/2 delivery callback off
-			// the delivery subscription. The durable consumer itself is unchanged,
-			// so refresh those fields here so the new values take effect. Spec5
-			// [MQTT-3.8.4-3], [3.8.3.1].
+			// A re-SUBSCRIBE to an existing QoS 1/2 filter can change the QoS, the
+			// No Local option, and the Subscription Identifier, all read by the QoS
+			// 1/2 delivery callback off the delivery subscription. The durable
+			// consumer itself is unchanged, so refresh those fields here so the new
+			// values take effect. Spec5 [MQTT-3.8.4-3], [3.8.3.1], [3.8.2.1.2].
 			c.mu.Lock()
 			sub := c.subs[cc.DeliverSubject]
 			c.mu.Unlock()
@@ -8095,6 +8222,7 @@ func (sess *mqttSession) processJSConsumer(c *client, subject, sid string,
 					sub.mqtt.qos = qos
 					sub.mqtt.noLocal = noLocal
 					sub.mqtt.retainAsPublished = retainAsPublished
+					sub.mqtt.subID = subID
 				}
 				sess.subsMu.Unlock()
 				sess.mu.Unlock()
@@ -8166,7 +8294,7 @@ func (sess *mqttSession) processJSConsumer(c *client, subject, sid string,
 	sess.mu.Lock()
 	sess.tmaxack = tmaxack
 	sub, err := sess.processQOS12Sub(c, []byte(inbox), []byte(inbox),
-		isMQTTReservedSubscription(subject), qos, noLocal, retainAsPublished, cc.Durable, mqttDeliverMsgCbQoS12)
+		isMQTTReservedSubscription(subject), qos, noLocal, retainAsPublished, subID, cc.Durable, mqttDeliverMsgCbQoS12)
 	sess.mu.Unlock()
 
 	if err != nil {
@@ -8745,23 +8873,27 @@ func mqttPropertyKnown(prop byte) bool {
 // property set. It cannot collide with real packet types (multiples of 0x10).
 const mqttPropsContextWill = byte(0x01)
 
+// mqttPropsContextPubOut is a pseudo "packet type" for a server-to-client
+// (outbound) PUBLISH, which unlike an inbound PUBLISH may carry a server-injected
+// Subscription Identifier. Used to parse/validate delivered PUBLISH blocks (e.g.
+// in tests). It cannot collide with real packet types (multiples of 0x10).
+const mqttPropsContextPubOut = byte(0x02)
+
 // mqttPropertyAllowed reports whether property prop may appear in the given
-// context (a packet type, or mqttPropsContextWill for Will properties).
+// context (a packet type, or mqttPropsContextWill / mqttPropsContextPubOut).
 // Spec5 [2.2.2.2] table of which properties belong to which packets.
 func mqttPropertyAllowed(prop, ctx byte) bool {
 	switch prop {
 	case mqttPropPayloadFormat, mqttPropMessageExpiry, mqttPropContentType,
 		mqttPropResponseTopic, mqttPropCorrelationData:
-		return ctx == mqttPacketPub || ctx == mqttPropsContextWill
+		return ctx == mqttPacketPub || ctx == mqttPropsContextWill || ctx == mqttPropsContextPubOut
 	case mqttPropSubscriptionID:
-		// A Subscription Identifier is valid only on a SUBSCRIBE and (from the
-		// server) on a delivered PUBLISH. A client-to-server PUBLISH MUST NOT
-		// carry one (spec5 [MQTT-3.3.4-6]); since we only ever parse inbound
-		// (client->server) PUBLISH properties and validate forwarded blocks
-		// with the PUBLISH context, disallow it here so both are rejected
-		// rather than relayed (subscription identifiers are unsupported and
-		// advertised as unavailable).
-		return ctx == mqttPacketSub
+		// A Subscription Identifier is valid on a SUBSCRIBE and, from the server,
+		// on a delivered PUBLISH (mqttPropsContextPubOut). A client-to-server
+		// PUBLISH MUST NOT carry one (spec5 [MQTT-3.3.4-6]); inbound PUBLISH
+		// properties and forwarded blocks are validated with the mqttPacketPub
+		// context, so a client-supplied identifier is still rejected.
+		return ctx == mqttPacketSub || ctx == mqttPropsContextPubOut
 	case mqttPropSessionExpiry:
 		return ctx == mqttPacketConnect || ctx == mqttPacketConnectAck || ctx == mqttPacketDisconnect
 	case mqttPropAssignedClientID, mqttPropServerKeepAlive, mqttPropResponseInfo,

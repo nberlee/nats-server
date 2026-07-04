@@ -144,9 +144,21 @@ type mqttV5SubFilter struct {
 
 func testMQTTSubV5(t testing.TB, c net.Conn, r *mqttReader, pi uint16, filters []mqttV5SubFilter) []byte {
 	t.Helper()
+	return testMQTTSubV5Props(t, c, r, pi, nil, filters)
+}
+
+// testMQTTSubV5Props sends a SUBSCRIBE whose variable header carries the given
+// raw properties block (length prefix + body); a nil props block is encoded as a
+// single 0 length byte (empty properties).
+func testMQTTSubV5Props(t testing.TB, c net.Conn, r *mqttReader, pi uint16, props []byte, filters []mqttV5SubFilter) []byte {
+	t.Helper()
 	vh := newMQTTWriter(0)
 	vh.WriteUint16(pi)
-	vh.WriteVarInt(0) // empty properties
+	if len(props) > 0 {
+		vh.Write(props)
+	} else {
+		vh.WriteVarInt(0) // empty properties
+	}
 	for _, f := range filters {
 		vh.WriteBytes([]byte(f.topic))
 		vh.WriteByte(f.opts)
@@ -290,7 +302,7 @@ func testMQTTPubV5SelfEcho(t testing.TB, c net.Conn, r *mqttReader, pi uint16, t
 			if err != nil {
 				t.Fatalf("Error reading pi: %v", err)
 			}
-			if _, err := r.readProperties(mqttPacketPub); err != nil {
+			if _, err := r.readProperties(mqttPropsContextPubOut); err != nil {
 				t.Fatalf("Error reading PUBLISH properties: %v", err)
 			}
 			egot := r.buf[r.pos : start+pl]
@@ -336,7 +348,7 @@ func testMQTTReadPubCheckRetainV5(t testing.TB, c net.Conn, r *mqttReader, expTo
 			t.Fatalf("Error reading pi: %v", err)
 		}
 	}
-	if _, err := r.readProperties(mqttPacketPub); err != nil {
+	if _, err := r.readProperties(mqttPropsContextPubOut); err != nil {
 		t.Fatalf("Error reading PUBLISH properties: %v", err)
 	}
 	got := r.buf[r.pos : start+pl]
@@ -376,7 +388,7 @@ func testMQTTReadPublishV5(t testing.TB, r *mqttReader, expTopic string, expPayl
 		}
 	}
 	// v5: a properties block precedes the payload.
-	if _, err := r.readProperties(mqttPacketPub); err != nil {
+	if _, err := r.readProperties(mqttPropsContextPubOut); err != nil {
 		t.Fatalf("Error reading PUBLISH properties: %v", err)
 	}
 	payloadLen := pl - (r.pos - start)
@@ -465,13 +477,15 @@ func TestMQTTv5ConnectAndCapabilities(t *testing.T) {
 	if props.present[mqttPropWildcardSubAvailable] {
 		t.Fatalf("Wildcard Subscription Available should be omitted (supported by default)")
 	}
-	// Features not implemented by the foundation must be advertised as off
-	// (their default is "available", so they must be sent explicitly as 0).
+	// Shared subscriptions are not implemented, so must be advertised as off
+	// (their default is "available", so it must be sent explicitly as 0).
 	if !props.present[mqttPropSharedSubAvailable] || props.sharedSubAvail != 0 {
 		t.Fatalf("Expected Shared Subscription Available=0")
 	}
-	if !props.present[mqttPropSubIDAvailable] || props.subIDAvail != 0 {
-		t.Fatalf("Expected Subscription Identifier Available=0")
+	// Subscription identifiers are supported, so the property must be omitted
+	// (absent => available).
+	if props.present[mqttPropSubIDAvailable] {
+		t.Fatalf("Subscription Identifier Available should be omitted (supported)")
 	}
 }
 
@@ -2155,7 +2169,7 @@ func testMQTTReadPubV5Props(t testing.TB, c net.Conn, r *mqttReader, expTopic st
 			t.Fatalf("Error reading pi: %v", err)
 		}
 	}
-	props, err := r.readProperties(mqttPacketPub)
+	props, err := r.readProperties(mqttPropsContextPubOut)
 	if err != nil {
 		t.Fatalf("Error reading PUBLISH properties: %v", err)
 	}
@@ -2773,7 +2787,7 @@ func testMQTTReadAnyPublishV5(t testing.TB, r *mqttReader) (byte, string, []byte
 			t.Fatalf("Error reading pi: %v", err)
 		}
 	}
-	if _, err = r.readProperties(mqttPacketPub); err != nil {
+	if _, err = r.readProperties(mqttPropsContextPubOut); err != nil {
 		t.Fatalf("Error reading PUBLISH properties: %v", err)
 	}
 	payloadLen := pl - (r.pos - start)
@@ -4323,4 +4337,543 @@ func TestMQTTv5SessionExpiryOwnerCrashSweep(t *testing.T) {
 		}
 		return nil
 	})
+}
+
+// ---- v5 Subscription Identifier ----
+
+// mqttV5SubIDProps builds a SUBSCRIBE properties block carrying a single
+// Subscription Identifier.
+func mqttV5SubIDProps(id int) []byte {
+	body := newMQTTWriter(0)
+	body.WriteByte(mqttPropSubscriptionID)
+	body.WriteVarInt(id)
+	return mqttMakePropsBlock(body.Bytes())
+}
+
+// testMQTTCheckSubID asserts the delivered properties carry exactly the given
+// Subscription Identifier; id == 0 asserts none.
+func testMQTTCheckSubID(t testing.TB, p *mqttProperties, id int) {
+	t.Helper()
+	var got []int
+	if p != nil {
+		got = p.subIDs
+	}
+	if id == 0 {
+		if len(got) != 0 {
+			t.Fatalf("Expected no subscription identifier, got %v", got)
+		}
+		return
+	}
+	if len(got) != 1 || got[0] != id {
+		t.Fatalf("Expected subscription identifier [%d], got %v", id, got)
+	}
+}
+
+// testMQTTReadPubV5Raw reads a delivered v5 PUBLISH, validates topic/payload, and
+// returns its first byte (for the DUP/RETAIN flags), packet id, and parsed
+// properties without acking (so a QoS1 redelivery can be observed).
+func testMQTTReadPubV5Raw(t testing.TB, r *mqttReader, expTopic string, expPayload []byte) (byte, uint16, *mqttProperties) {
+	t.Helper()
+	b, pl := testMQTTReadPacket(t, r)
+	if pt := b & mqttPacketMask; pt != mqttPacketPub {
+		t.Fatalf("Expected PUBLISH (%x), got %x", mqttPacketPub, pt)
+	}
+	start := r.pos
+	qos := mqttGetQoS(b & mqttPacketFlagMask)
+	topic, err := r.readBytes("topic", false)
+	if err != nil {
+		t.Fatalf("Error reading topic: %v", err)
+	}
+	if string(topic) != expTopic {
+		t.Fatalf("Expected topic %q, got %q", expTopic, topic)
+	}
+	var pi uint16
+	if qos > 0 {
+		if pi, err = r.readUint16("pi"); err != nil {
+			t.Fatalf("Error reading pi: %v", err)
+		}
+	}
+	props, err := r.readProperties(mqttPropsContextPubOut)
+	if err != nil {
+		t.Fatalf("Error reading PUBLISH properties: %v", err)
+	}
+	payloadLen := pl - (r.pos - start)
+	if payloadLen < 0 || r.pos+payloadLen > len(r.buf) {
+		t.Fatalf("Invalid payload length %d", payloadLen)
+	}
+	got := r.buf[r.pos : r.pos+payloadLen]
+	r.pos += payloadLen
+	if string(got) != string(expPayload) {
+		t.Fatalf("Expected payload %q, got %q", expPayload, got)
+	}
+	return b, pi, props
+}
+
+// A Subscription Identifier is injected into every PUBLISH delivered because of
+// the subscription that carries it, across QoS0 and QoS1 delivery. Spec5
+// [3.8.2.1.2].
+func TestMQTTv5SubscriptionIdentifier(t *testing.T) {
+	o := testMQTTDefaultOptionsV5()
+	s := testMQTTRunServer(t, o)
+	defer testMQTTShutdownServer(s)
+
+	newPub := func(id string) (net.Conn, *mqttReader) {
+		c, r := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: id, cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
+		testMQTTReadConnAckV5(t, r)
+		return c, r
+	}
+
+	t.Run("QoS0", func(t *testing.T) {
+		c, r := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "sid0", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
+		defer c.Close()
+		testMQTTReadConnAckV5(t, r)
+		testMQTTSubV5Props(t, c, r, 1, mqttV5SubIDProps(42), []mqttV5SubFilter{{topic: "sid0/t", opts: 0}})
+
+		// Control subscriber without an identifier gets none.
+		cc, rc := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "sid0-ctl", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
+		defer cc.Close()
+		testMQTTReadConnAckV5(t, rc)
+		testMQTTSubV5(t, cc, rc, 1, []mqttV5SubFilter{{topic: "sid0/t", opts: 0}})
+
+		p, rp := newPub("sid0-pub")
+		defer p.Close()
+		testMQTTPubV5Props(t, p, rp, 0, false, 0, "sid0/t", []byte("m"), nil)
+
+		testMQTTCheckSubID(t, testMQTTReadPubV5Props(t, c, r, "sid0/t", []byte("m")), 42)
+		testMQTTCheckSubID(t, testMQTTReadPubV5Props(t, cc, rc, "sid0/t", []byte("m")), 0)
+	})
+
+	t.Run("QoS1", func(t *testing.T) {
+		c, r := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "sid1", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
+		defer c.Close()
+		testMQTTReadConnAckV5(t, r)
+		testMQTTSubV5Props(t, c, r, 1, mqttV5SubIDProps(7), []mqttV5SubFilter{{topic: "sid1/t", opts: 1}})
+
+		p, rp := newPub("sid1-pub")
+		defer p.Close()
+		testMQTTPubV5Props(t, p, rp, 1, false, 1, "sid1/t", []byte("m"), nil)
+
+		testMQTTCheckSubID(t, testMQTTReadPubV5Props(t, c, r, "sid1/t", []byte("m")), 7)
+	})
+
+	// A single SUBSCRIBE identifier applies to every filter in the packet.
+	t.Run("applies to all filters", func(t *testing.T) {
+		c, r := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "sid-multi", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
+		defer c.Close()
+		testMQTTReadConnAckV5(t, r)
+		testMQTTSubV5Props(t, c, r, 1, mqttV5SubIDProps(15),
+			[]mqttV5SubFilter{{topic: "sidm/a", opts: 0}, {topic: "sidm/b", opts: 0}})
+
+		p, rp := newPub("sid-multi-pub")
+		defer p.Close()
+		testMQTTPubV5Props(t, p, rp, 0, false, 0, "sidm/a", []byte("a"), nil)
+		testMQTTPubV5Props(t, p, rp, 0, false, 0, "sidm/b", []byte("b"), nil)
+
+		testMQTTCheckSubID(t, testMQTTReadPubV5Props(t, c, r, "sidm/a", []byte("a")), 15)
+		testMQTTCheckSubID(t, testMQTTReadPubV5Props(t, c, r, "sidm/b", []byte("b")), 15)
+	})
+
+	// The identifier coexists with properties forwarded from the publisher.
+	t.Run("with forwarded props", func(t *testing.T) {
+		c, r := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "sid-fwd", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
+		defer c.Close()
+		testMQTTReadConnAckV5(t, r)
+		testMQTTSubV5Props(t, c, r, 1, mqttV5SubIDProps(11), []mqttV5SubFilter{{topic: "sidf/t", opts: 1}})
+
+		p, rp := newPub("sid-fwd-pub")
+		defer p.Close()
+		testMQTTPubV5Props(t, p, rp, 1, false, 1, "sidf/t", []byte("m"), testMQTTv5PubPropsBlock())
+
+		props := testMQTTReadPubV5Props(t, c, r, "sidf/t", []byte("m"))
+		testMQTTCheckFwdProps(t, props)
+		testMQTTCheckSubID(t, props, 11)
+	})
+
+	// A '#' subscription delivers at the parent level through a companion sub; the
+	// identifier must reach both.
+	t.Run("level-up companion sub", func(t *testing.T) {
+		c, r := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "sid-lvl", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
+		defer c.Close()
+		testMQTTReadConnAckV5(t, r)
+		testMQTTSubV5Props(t, c, r, 1, mqttV5SubIDProps(33), []mqttV5SubFilter{{topic: "lvl/#", opts: 0}})
+
+		p, rp := newPub("sid-lvl-pub")
+		defer p.Close()
+		testMQTTPubV5Props(t, p, rp, 0, false, 0, "lvl", []byte("parent"), nil)
+		testMQTTPubV5Props(t, p, rp, 0, false, 0, "lvl/child", []byte("child"), nil)
+
+		testMQTTCheckSubID(t, testMQTTReadPubV5Props(t, c, r, "lvl", []byte("parent")), 33)
+		testMQTTCheckSubID(t, testMQTTReadPubV5Props(t, c, r, "lvl/child", []byte("child")), 33)
+	})
+}
+
+// A retained message replayed to a new subscription carries the subscription's
+// identifier, and the Message Expiry rewrite composes with the injection. Spec5
+// [3.8.2.1.2], [3.3.2.3.3].
+func TestMQTTv5SubscriptionIdentifierRetained(t *testing.T) {
+	o := testMQTTDefaultOptionsV5()
+	s := testMQTTRunServer(t, o)
+	defer testMQTTShutdownServer(s)
+
+	t.Run("plain", func(t *testing.T) {
+		p, rp := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "sidret-pub", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
+		defer p.Close()
+		testMQTTReadConnAckV5(t, rp)
+		testMQTTPubV5Props(t, p, rp, 1, true, 1, "sidret/t", []byte("ret"), nil)
+
+		c, r := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "sidret-sub", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
+		defer c.Close()
+		testMQTTReadConnAckV5(t, r)
+		testMQTTSubV5Props(t, c, r, 1, mqttV5SubIDProps(9), []mqttV5SubFilter{{topic: "sidret/t", opts: 1}})
+
+		b, _, props := testMQTTReadPubV5Raw(t, r, "sidret/t", []byte("ret"))
+		if b&mqttPubFlagRetain == 0 {
+			t.Fatal("retained replay must set RETAIN")
+		}
+		testMQTTCheckSubID(t, props, 9)
+	})
+
+	// The identifier injection composes with the Message Expiry rewrite the
+	// retained path applies (the two touch the same properties block).
+	t.Run("with message expiry", func(t *testing.T) {
+		expBody := newMQTTWriter(0)
+		expBody.WriteByte(mqttPropMessageExpiry)
+		expBody.WriteUint32(3600)
+		p, rp := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "sidrete-pub", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
+		defer p.Close()
+		testMQTTReadConnAckV5(t, rp)
+		testMQTTPubV5Props(t, p, rp, 1, true, 1, "sidrete/t", []byte("ret"), mqttMakePropsBlock(expBody.Bytes()))
+
+		c, r := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "sidrete-sub", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
+		defer c.Close()
+		testMQTTReadConnAckV5(t, r)
+		testMQTTSubV5Props(t, c, r, 1, mqttV5SubIDProps(19), []mqttV5SubFilter{{topic: "sidrete/t", opts: 1}})
+
+		_, _, props := testMQTTReadPubV5Raw(t, r, "sidrete/t", []byte("ret"))
+		testMQTTCheckSubID(t, props, 19)
+		if !props.present[mqttPropMessageExpiry] || props.messageExpiry == 0 || props.messageExpiry > 3600 {
+			t.Fatalf("expected a reduced non-zero message expiry, got present=%v val=%d",
+				props.present[mqttPropMessageExpiry], props.messageExpiry)
+		}
+	})
+}
+
+// Overlapping subscriptions are not coalesced: a topic matching two filters, each
+// with its own identifier, yields one PUBLISH per subscription carrying that
+// subscription's identifier. Spec5 [3.8.2.1.2].
+func TestMQTTv5SubscriptionIdentifierOverlapping(t *testing.T) {
+	o := testMQTTDefaultOptionsV5()
+	s := testMQTTRunServer(t, o)
+	defer testMQTTShutdownServer(s)
+
+	c, r := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "sid-ov", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
+	defer c.Close()
+	testMQTTReadConnAckV5(t, r)
+	testMQTTSubV5Props(t, c, r, 1, mqttV5SubIDProps(5), []mqttV5SubFilter{{topic: "ov/+", opts: 0}})
+	testMQTTSubV5Props(t, c, r, 2, mqttV5SubIDProps(9), []mqttV5SubFilter{{topic: "ov/topic", opts: 0}})
+
+	p, rp := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "sid-ov-pub", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
+	defer p.Close()
+	testMQTTReadConnAckV5(t, rp)
+	testMQTTPubV5Props(t, p, rp, 0, false, 0, "ov/topic", []byte("m"), nil)
+
+	// Two PUBLISHes arrive (one per matching subscription); order is not defined.
+	seen := map[int]bool{}
+	for i := 0; i < 2; i++ {
+		_, _, props := testMQTTReadPubV5Raw(t, r, "ov/topic", []byte("m"))
+		if props == nil || len(props.subIDs) != 1 {
+			t.Fatalf("Expected exactly one subscription identifier per delivery, got %v", props)
+		}
+		seen[props.subIDs[0]] = true
+	}
+	if !seen[5] || !seen[9] {
+		t.Fatalf("Expected deliveries carrying identifiers 5 and 9, got %v", seen)
+	}
+}
+
+// A re-SUBSCRIBE to the same filter replaces its identifier; re-subscribing with
+// no identifier clears it. Spec5 [3.8.2.1.2], [MQTT-3.8.4-3].
+func TestMQTTv5ResubscribeReplacesSubscriptionID(t *testing.T) {
+	o := testMQTTDefaultOptionsV5()
+	s := testMQTTRunServer(t, o)
+	defer testMQTTShutdownServer(s)
+
+	c, r := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "sid-re", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
+	defer c.Close()
+	testMQTTReadConnAckV5(t, r)
+
+	p, rp := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "sid-re-pub", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
+	defer p.Close()
+	testMQTTReadConnAckV5(t, rp)
+
+	pubAndCheck := func(pi uint16, props []byte, expID int) {
+		testMQTTSubV5Props(t, c, r, pi, props, []mqttV5SubFilter{{topic: "sidre/t", opts: 0}})
+		testMQTTPubV5Props(t, p, rp, 0, false, 0, "sidre/t", []byte("m"), nil)
+		testMQTTCheckSubID(t, testMQTTReadPubV5Props(t, c, r, "sidre/t", []byte("m")), expID)
+	}
+
+	pubAndCheck(1, mqttV5SubIDProps(1), 1) // initial identifier
+	pubAndCheck(2, mqttV5SubIDProps(2), 2) // replaced
+	pubAndCheck(3, nil, 0)                 // re-subscribe with no identifier clears it
+}
+
+// A Subscription Identifier survives a persistent session's reconnect, for both a
+// fresh publish and the redelivery of an unacked QoS1 message. Spec5 [3.8.2.1.2].
+func TestMQTTv5SubscriptionIdentifierRestoredOnReconnect(t *testing.T) {
+	o := testMQTTDefaultOptionsV5()
+	s := testMQTTRunServer(t, o)
+	defer testMQTTShutdownServer(s)
+
+	t.Run("fresh publish after reconnect", func(t *testing.T) {
+		ci := &mqttV5ConnInfo{clientID: "sid-persist", props: mqttV5ConnPropsSessionExpiry(30)}
+		c, r := testMQTTConnectV5(t, ci, o.MQTT.Host, o.MQTT.Port)
+		testMQTTReadConnAckV5(t, r)
+		testMQTTSubV5Props(t, c, r, 1, mqttV5SubIDProps(77), []mqttV5SubFilter{{topic: "sidp/t", opts: 1}})
+		if _, err := testMQTTWrite(c, []byte{mqttPacketDisconnect, 0}); err != nil {
+			t.Fatalf("Error writing DISCONNECT: %v", err)
+		}
+		c.Close()
+
+		c2, r2 := testMQTTConnectV5(t, ci, o.MQTT.Host, o.MQTT.Port)
+		defer c2.Close()
+		if sp, _, _ := testMQTTReadConnAckV5(t, r2); !sp {
+			t.Fatal("Expected session present on reconnect")
+		}
+
+		p, rp := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "sidp-pub", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
+		defer p.Close()
+		testMQTTReadConnAckV5(t, rp)
+		testMQTTPubV5Props(t, p, rp, 1, false, 1, "sidp/t", []byte("after"), nil)
+		testMQTTCheckSubID(t, testMQTTReadPubV5Props(t, c2, r2, "sidp/t", []byte("after")), 77)
+	})
+
+	t.Run("pending redelivery keeps id", func(t *testing.T) {
+		ci := &mqttV5ConnInfo{clientID: "sid-pr", props: mqttV5ConnPropsSessionExpiry(30)}
+		c, r := testMQTTConnectV5(t, ci, o.MQTT.Host, o.MQTT.Port)
+		testMQTTReadConnAckV5(t, r)
+		testMQTTSubV5Props(t, c, r, 1, mqttV5SubIDProps(21), []mqttV5SubFilter{{topic: "sidpr/t", opts: 1}})
+
+		p, rp := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "sidpr-pub", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
+		defer p.Close()
+		testMQTTReadConnAckV5(t, rp)
+		testMQTTPubV5Props(t, p, rp, 1, false, 1, "sidpr/t", []byte("m"), nil)
+
+		// Receive but do NOT ack.
+		b, _, props := testMQTTReadPubV5Raw(t, r, "sidpr/t", []byte("m"))
+		if b&mqttPubFlagDup != 0 {
+			t.Fatal("first delivery should not be DUP")
+		}
+		testMQTTCheckSubID(t, props, 21)
+		c.Close()
+
+		// Reconnect: the unacked QoS1 message is redelivered with DUP set and the
+		// identifier restored from the persisted session.
+		c2, r2 := testMQTTConnectV5(t, ci, o.MQTT.Host, o.MQTT.Port)
+		defer c2.Close()
+		if sp, _, _ := testMQTTReadConnAckV5(t, r2); !sp {
+			t.Fatal("Expected session present on reconnect")
+		}
+		b2, pi2, props2 := testMQTTReadPubV5Raw(t, r2, "sidpr/t", []byte("m"))
+		if b2&mqttPubFlagDup == 0 {
+			t.Fatal("redelivery should be DUP")
+		}
+		testMQTTCheckSubID(t, props2, 21)
+		pa := [4]byte{mqttPacketPubAck, 0x2, byte(pi2 >> 8), byte(pi2)}
+		if _, err := testMQTTWrite(c2, pa[:]); err != nil {
+			t.Fatalf("Error writing PUBACK: %v", err)
+		}
+	})
+}
+
+// A v5 subscriber with a Subscription Identifier and a 3.1.1 subscriber on the
+// same topic: only the v5 delivery carries the identifier; the 3.1.1 delivery has
+// no properties section at all.
+func TestMQTTv5SubscriptionIdentifier311Unaffected(t *testing.T) {
+	o := testMQTTDefaultOptionsV5()
+	s := testMQTTRunServer(t, o)
+	defer testMQTTShutdownServer(s)
+
+	c5, r5 := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "sid-v5", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
+	defer c5.Close()
+	testMQTTReadConnAckV5(t, r5)
+	testMQTTSubV5Props(t, c5, r5, 1, mqttV5SubIDProps(8), []mqttV5SubFilter{{topic: "mix/t", opts: 0}})
+
+	c3, r3 := testMQTTConnect(t, &mqttConnInfo{clientID: "sid-311", cleanSess: true}, o.MQTT.Host, o.MQTT.Port)
+	defer c3.Close()
+	testMQTTCheckConnAck(t, r3, mqttConnAckRCConnectionAccepted, false)
+	testMQTTSub(t, 1, c3, r3, []*mqttFilter{{filter: "mix/t", qos: 0}}, []byte{0})
+
+	p, rp := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "mix-pub", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
+	defer p.Close()
+	testMQTTReadConnAckV5(t, rp)
+	testMQTTPubV5Props(t, p, rp, 0, false, 0, "mix/t", []byte("m"), nil)
+
+	testMQTTCheckSubID(t, testMQTTReadPubV5Props(t, c5, r5, "mix/t", []byte("m")), 8)
+	// The 3.1.1 subscriber gets a plain PUBLISH (no properties section on the wire).
+	testMQTTCheckPubMsg(t, c3, r3, "mix/t", 0, []byte("m"))
+}
+
+// A SUBSCRIBE carrying more than one Subscription Identifier, or one with value 0,
+// is a Protocol Error. Spec5 [MQTT-3.8.2.1.2], [3.3.2.3.8].
+func TestMQTTv5SubscribeSubscriptionIDProtocolErrors(t *testing.T) {
+	o := testMQTTDefaultOptionsV5()
+	s := testMQTTRunServer(t, o)
+	defer testMQTTShutdownServer(s)
+
+	twoIDs := func() []byte {
+		body := newMQTTWriter(0)
+		body.WriteByte(mqttPropSubscriptionID)
+		body.WriteVarInt(1)
+		body.WriteByte(mqttPropSubscriptionID)
+		body.WriteVarInt(2)
+		return mqttMakePropsBlock(body.Bytes())
+	}()
+
+	for _, test := range []struct {
+		name  string
+		props []byte
+	}{
+		{"more than one identifier", twoIDs},
+		{"identifier of zero", mqttV5SubIDProps(0)},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			c, r := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "sid-err", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
+			defer c.Close()
+			testMQTTReadConnAckV5(t, r)
+
+			vh := newMQTTWriter(0)
+			vh.WriteUint16(1)
+			vh.Write(test.props)
+			vh.WriteBytes([]byte("foo"))
+			vh.WriteByte(0x00)
+			w := newMQTTWriter(0)
+			w.WriteByte(mqttPacketSub | mqttSubscribeFlags)
+			w.WriteVarInt(vh.Len())
+			w.Write(vh.Bytes())
+			if _, err := testMQTTWrite(c, w.Bytes()); err != nil {
+				t.Fatalf("Error writing SUBSCRIBE: %v", err)
+			}
+
+			b, _ := testMQTTReadPacket(t, r)
+			if pt := b & mqttPacketMask; pt != mqttPacketDisconnect {
+				t.Fatalf("Expected DISCONNECT (%x), got %x", mqttPacketDisconnect, pt)
+			}
+			reason, err := r.readByte("disconnect reason")
+			if err != nil {
+				t.Fatalf("Error reading disconnect reason: %v", err)
+			}
+			if reason != mqttReasonProtocolError {
+				t.Fatalf("Expected protocol error 0x%x, got 0x%x", mqttReasonProtocolError, reason)
+			}
+		})
+	}
+}
+
+// A message that fits a client's Maximum Packet Size without the injected
+// Subscription Identifier but exceeds it once injected must be discarded; the
+// injection therefore has to happen before the size check. Spec5 [3.1.2.11.4].
+func TestMQTTv5SubscriptionIdentifierMaxPacketSize(t *testing.T) {
+	o := testMQTTDefaultOptionsV5()
+	s := testMQTTRunServer(t, o)
+	defer testMQTTShutdownServer(s)
+
+	maxPktProps := func(sz uint32) []byte {
+		body := newMQTTWriter(0)
+		body.WriteByte(mqttPropMaxPacketSize)
+		body.WriteUint32(sz)
+		return body.Bytes()
+	}
+
+	topic := "sidmps/t"
+	payload := []byte(strings.Repeat("x", 20))
+	// QoS0 packet size WITHOUT an injected identifier: fixed header (1) + remaining
+	// length varint (1, since rem < 128) + topic (2 + len) + empty props (1) +
+	// payload. Injecting a small identifier adds 2 bytes, pushing it over.
+	rem := 2 + len(topic) + 1 + len(payload)
+	pktNoSubID := uint32(1 + 1 + rem)
+
+	// Subscriber A: identifier + a Maximum Packet Size that exactly fits the
+	// un-injected PUBLISH. The injected identifier must push it over the limit.
+	ca, ra := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "sidmps-a", cleanStart: true, props: maxPktProps(pktNoSubID)}, o.MQTT.Host, o.MQTT.Port)
+	defer ca.Close()
+	testMQTTReadConnAckV5(t, ra)
+	testMQTTSubV5Props(t, ca, ra, 1, mqttV5SubIDProps(3), []mqttV5SubFilter{{topic: topic, opts: 0}})
+
+	// Subscriber B: same limit but no identifier; the PUBLISH fits and is delivered.
+	cb, rb := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "sidmps-b", cleanStart: true, props: maxPktProps(pktNoSubID)}, o.MQTT.Host, o.MQTT.Port)
+	defer cb.Close()
+	testMQTTReadConnAckV5(t, rb)
+	testMQTTSubV5(t, cb, rb, 1, []mqttV5SubFilter{{topic: topic, opts: 0}})
+
+	p, rp := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "sidmps-pub", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
+	defer p.Close()
+	testMQTTReadConnAckV5(t, rp)
+	testMQTTPubV5Props(t, p, rp, 0, false, 0, topic, payload, nil)
+
+	// B fits without injection and receives it.
+	testMQTTReadPubV5Props(t, cb, rb, topic, payload)
+
+	// A must NOT receive it (injection pushes it over the limit). Prove A is alive
+	// and the message was dropped, not delayed, by sending a small follow-up that
+	// fits even with the identifier: A's next PUBLISH is that follow-up.
+	testMQTTPubV5Props(t, p, rp, 0, false, 0, topic, []byte("s"), nil)
+	testMQTTCheckSubID(t, testMQTTReadPubV5Props(t, ca, ra, topic, []byte("s")), 3)
+}
+
+// Unit test of mqttInjectSubID: the property is appended to (or synthesized as) a
+// well-formed block, and out-of-range ids or unsafe/malformed blocks are left
+// unchanged. Spec5 [3.8.2.1.2].
+func TestMQTTv5InjectSubID(t *testing.T) {
+	parse := func(block []byte) *mqttProperties {
+		t.Helper()
+		r := &mqttReader{}
+		r.reset(block)
+		p, err := r.readProperties(mqttPropsContextPubOut)
+		if err != nil || r.hasMore() {
+			t.Fatalf("re-parse injected block: err=%v hasMore=%v", err, r.hasMore())
+		}
+		return p
+	}
+	checkOnly := func(block []byte, id int) {
+		t.Helper()
+		p := parse(block)
+		if len(p.subIDs) != 1 || p.subIDs[0] != id {
+			t.Fatalf("Expected subscription identifier [%d], got %v", id, p.subIDs)
+		}
+	}
+
+	// Synthesize a fresh block from nil and from an empty (single 0) block.
+	checkOnly(mqttInjectSubID(nil, 5), 5)
+	checkOnly(mqttInjectSubID([]byte{0}, 6), 6)
+	// Maximum valid identifier (multi-byte varint).
+	checkOnly(mqttInjectSubID(nil, mqttMaxVarInt), mqttMaxVarInt)
+
+	// Append to an existing forwardable block: all original props plus the id.
+	valid := testMQTTv5PubPropsBlock()
+	out := mqttInjectSubID(valid, 7)
+	p := parse(out)
+	testMQTTCheckFwdProps(t, p)
+	if len(p.subIDs) != 1 || p.subIDs[0] != 7 {
+		t.Fatalf("Expected subscription identifier [7], got %v", p.subIDs)
+	}
+
+	// Unchanged cases: out-of-range id, an unsafe block (Topic Alias), and a block
+	// with a valid length prefix but an invalid body.
+	topicAlias := mqttMakePropsBlock([]byte{mqttPropTopicAlias, 0x00, 0x01})
+	badBody := []byte{0x02, 0x99, 0x99} // length 2, body is not a valid property
+	for _, test := range []struct {
+		name string
+		in   []byte
+		id   int
+	}{
+		{"id zero", valid, 0},
+		{"id negative", valid, -1},
+		{"id too large", valid, mqttMaxVarInt + 1},
+		{"topic alias unsafe", topicAlias, 5},
+		{"invalid body", badBody, 5},
+	} {
+		if got := mqttInjectSubID(test.in, test.id); !bytes.Equal(got, test.in) {
+			t.Fatalf("%s: expected props unchanged, got %v (in %v)", test.name, got, test.in)
+		}
+	}
 }
