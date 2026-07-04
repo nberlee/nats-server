@@ -2448,7 +2448,11 @@ func (c *client) accountAuthExpired() {
 	c.closeConnection(AuthenticationExpired)
 }
 
-func (c *client) authViolation() {
+// authViolation reports the auth failure to the client and closes the
+// connection. It returns whether an MQTT CONNACK was actually enqueued (a v5
+// CONNACK can be suppressed by the client's Maximum Packet Size); non-MQTT
+// callers ignore the result.
+func (c *client) authViolation() bool {
 	authErr := c.getAuthError()
 	if authErr == nil {
 		authErr = ErrAuthentication
@@ -2464,15 +2468,17 @@ func (c *client) authViolation() {
 			c.Errorf(ErrAuthentication.Error())
 		}
 	}
+	sent := true
 	if c.isMqtt() {
 		// No Reason String: do not leak auth internals to an unauthenticated
 		// peer; the 0x87 reason code is enough.
-		c.mqttEnqueueConnAck(mqttConnAckRCNotAuthorized, false, _EMPTY_)
+		sent = c.mqttEnqueueConnAck(mqttConnAckRCNotAuthorized, false, _EMPTY_)
 	} else {
 		// Send this to client, regardless of the authErr override.
 		c.sendErr("Authorization Violation")
 	}
 	c.closeConnection(reason)
+	return sent
 }
 
 func (c *client) maxAccountConnExceeded() {

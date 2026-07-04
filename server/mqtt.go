@@ -130,6 +130,8 @@ const (
 	mqttReasonPacketIDInUse               = byte(0x91)
 	mqttReasonPacketIDNotFound            = byte(0x92)
 	mqttReasonTopicAliasInvalid           = byte(0x94)
+	mqttReasonPacketTooLarge              = byte(0x95)
+	mqttReasonQuotaExceeded               = byte(0x97)
 	mqttReasonQoSNotSupported             = byte(0x9b)
 	mqttReasonSharedSubNotSupported       = byte(0x9e)
 	mqttReasonSubIDNotSupported           = byte(0xa1)
@@ -166,6 +168,12 @@ const (
 
 	// Maximum payload size of a control packet
 	mqttMaxPayloadSize = 0xFFFFFFF
+
+	// Largest legal full control packet: the Remaining Length ceiling plus the
+	// fixed header (type/flags byte + up-to-4-byte Remaining Length varint).
+	// Maximum Packet Size counts the full packet, not just Remaining Length.
+	// Spec5 [2.1.4], [3.1.2.11.4].
+	mqttMaxControlPacketSize = mqttMaxPayloadSize + 5
 
 	// Largest value representable as an MQTT variable byte integer (4 bytes),
 	// also the maximum valid Subscription Identifier. Spec5 [1.5.5], [3.8.2.1.2].
@@ -644,6 +652,15 @@ type mqtt struct {
 	// gate the QoS0 direct-delivery path, which runs without the session lock.
 	// Spec5 [3.1.2.11.4].
 	maxPacketSize uint32
+
+	// maxInPacketSize is the server's MQTT 5.0 Maximum Packet Size advertised in
+	// this connection's success CONNACK and enforced on inbound packets in the
+	// read loop; a larger packet gets a DISCONNECT 0x95. 0 means nothing is
+	// advertised or enforced (3.1.1, or no configured limit). Captured once in
+	// mqttProcessConnect so the encoded value and the enforced value are always
+	// identical even if a config reload changes c.mpay. Read lock-free on the
+	// read-loop goroutine like proto. Spec5 [3.2.2.3.6], [MQTT-3.2.2-15].
+	maxInPacketSize uint32
 
 	// noProblemInfo is true when the v5 client sent Request Problem Information 0:
 	// the server must then not attach a Reason String (or User Property) to any
@@ -1237,10 +1254,20 @@ func (c *client) mqttParse(buf []byte) error {
 		maxLen := int32(jwt.NoLimit)
 		if !connected {
 			maxLen = atomic.LoadInt32(&c.mpay)
+		} else if mps := c.mqtt.maxInPacketSize; mps > 0 {
+			// Enforce the Maximum Packet Size advertised in the CONNACK. A larger
+			// packet is cut off before its body is buffered. [MQTT-3.2.2-15].
+			maxLen = int32(mps)
 		}
 		pl, complete, err = r.readPacketLen(maxLen)
 		if err != nil || !complete {
 			if err == ErrMaxPayload {
+				// Tell a connected v5 client why before the close (no-op for 3.1.1
+				// and pre-CONNECT); maxPayloadViolation then logs and closes.
+				if connected {
+					c.mqttEnqueueDisconnect(mqttReasonPacketTooLarge,
+						fmt.Sprintf("packet size %d exceeds maximum packet size %d", pl, maxLen))
+				}
 				c.maxPayloadViolation(pl, maxLen)
 			}
 			break
@@ -1318,12 +1345,13 @@ func (c *client) mqttParse(buf []byte) error {
 			}
 			if err == nil {
 				subs, err = c.mqttProcessSubs(filters)
-				if err == nil && trace {
-					c.traceOutOp("SUBACK", []byte(fmt.Sprintf("pi=%v", pi)))
-				}
 			}
 			if err == nil {
-				c.mqttEnqueueSubAck(pi, filters)
+				// Trace only if the SUBACK was actually sent (a tiny client
+				// Maximum Packet Size can suppress it).
+				if c.mqttEnqueueSubAck(pi, filters) && trace {
+					c.traceOutOp("SUBACK", []byte(fmt.Sprintf("pi=%v", pi)))
+				}
 				c.mqttSendRetainedMsgsToNewSubs(subs)
 			}
 
@@ -1336,12 +1364,13 @@ func (c *client) mqttParse(buf []byte) error {
 			}
 			if err == nil {
 				err = c.mqttProcessUnsubs(filters)
-				if err == nil && trace {
-					c.traceOutOp("UNSUBACK", []byte(fmt.Sprintf("pi=%v", pi)))
-				}
 			}
 			if err == nil {
-				c.mqttEnqueueUnsubAck(pi, filters)
+				// Trace only if the UNSUBACK was actually sent (a tiny client
+				// Maximum Packet Size can suppress it).
+				if c.mqttEnqueueUnsubAck(pi, filters) && trace {
+					c.traceOutOp("UNSUBACK", []byte(fmt.Sprintf("pi=%v", pi)))
+				}
 			}
 
 		// Packets that we get both as a receiver and sender: PING, CONNECT, DISCONNECT
@@ -1382,8 +1411,8 @@ func (c *client) mqttParse(buf []byte) error {
 				if err != nil {
 					rs = err.Error()
 				}
-				c.mqttEnqueueConnAck(rc, sessp, rs)
-				if trace {
+				sent := c.mqttEnqueueConnAck(rc, sessp, rs)
+				if sent && trace {
 					c.traceOutOp("CONNACK", []byte(fmt.Sprintf("sp=%v rc=%v", sessp, rc)))
 				}
 			} else if err != nil {
@@ -1392,8 +1421,8 @@ func (c *client) mqttParse(buf []byte) error {
 				// Spec5 [3.1.4.1], [MQTT-3.1.2-19].
 				if c.mqtt.proto == mqttProtoLevel5 {
 					reason := mqttConnAckReasonFromConnectErr(err)
-					c.mqttEnqueueConnAck(reason, false, err.Error())
-					if trace {
+					sent := c.mqttEnqueueConnAck(reason, false, err.Error())
+					if sent && trace {
 						c.traceOutOp("CONNACK", []byte(fmt.Sprintf("sp=%v rc=%v", false, reason)))
 					}
 				}
@@ -1475,9 +1504,10 @@ func (c *client) mqttParse(buf []byte) error {
 	}
 	if err == nil && rd > 0 {
 		r.reader.SetReadDeadline(time.Now().Add(rd))
-	} else if err != nil && connected && c.mqtt.proto == mqttProtoLevel5 {
+	} else if err != nil && err != ErrMaxPayload && connected && c.mqtt.proto == mqttProtoLevel5 {
 		// Best-effort: tell the v5 client why we are about to close. The read
-		// loop closes the connection right after this returns.
+		// loop closes the connection right after this returns. ErrMaxPayload is
+		// excluded: it already sent a DISCONNECT 0x95 and closed above.
 		c.mqttEnqueueDisconnect(mqttDisconnectReasonFromErr(err), err.Error())
 	}
 	return err
@@ -5708,11 +5738,10 @@ func (c *client) mqttParseConnect(r *mqttReader, hasMappings bool) (byte, *mqttC
 		}
 		// Capture at parse time the two properties that gate optional outbound
 		// content, so even a CONNACK that rejects this CONNECT honors them:
-		// Maximum Packet Size lets an optional Reason String be omitted when it
-		// would exceed the client's limit, and Request Problem Information 0
-		// forbids Reason String/User Property on packets other than
-		// CONNACK/DISCONNECT. Full Maximum Packet Size enforcement for mandatory
-		// control packets is a separate concern. If readProperties itself failed
+		// Maximum Packet Size bounds every server-generated packet (an optional
+		// Reason String is dropped, and a packet that still overflows is not sent),
+		// and Request Problem Information 0 forbids Reason String/User Property on
+		// packets other than CONNACK/DISCONNECT. If readProperties itself failed
 		// above, cp.props is nil and the client communicated no limit. Spec5
 		// [3.1.2.11.4], [3.1.2.11.7].
 		if cp.props != nil {
@@ -5877,11 +5906,12 @@ func (c *client) mqttConnectTrace(cp *mqttConnectProto) string {
 // Runs from the client's readLoop.
 // No lock held on entry.
 func (s *Server) mqttProcessConnect(c *client, cp *mqttConnectProto, trace bool) error {
-	sendConnAck := func(rc byte, sessp bool, reasonStr string) {
-		c.mqttEnqueueConnAck(rc, sessp, reasonStr)
-		if trace {
+	sendConnAck := func(rc byte, sessp bool, reasonStr string) bool {
+		sent := c.mqttEnqueueConnAck(rc, sessp, reasonStr)
+		if sent && trace {
 			c.traceOutOp("CONNACK", []byte(fmt.Sprintf("sp=%v rc=%v", sessp, rc)))
 		}
+		return sent
 	}
 
 	c.mu.Lock()
@@ -5889,10 +5919,11 @@ func (s *Server) mqttProcessConnect(c *client, cp *mqttConnectProto, trace bool)
 	c.clearAuthTimer()
 	c.mu.Unlock()
 	if !s.isClientAuthorized(c) {
-		if trace {
+		// The CONNACK is enqueued inside authViolation; trace it only if sent.
+		sent := c.authViolation()
+		if sent && trace {
 			c.traceOutOp("CONNACK", []byte(fmt.Sprintf("sp=%v rc=%v", false, mqttConnAckRCNotAuthorized)))
 		}
-		c.authViolation()
 		return ErrAuthentication
 	}
 	// Now that we are authenticated, we have the client bound to the account.
@@ -5902,6 +5933,36 @@ func (s *Server) mqttProcessConnect(c *client, cp *mqttConnectProto, trace bool)
 	asm, err := s.getOrCreateMQTTAccountSessionManager(c)
 	if err != nil {
 		return err
+	}
+
+	// Resolve every input the success CONNACK's size depends on, then verify the
+	// frame fits the client's Maximum Packet Size BEFORE touching any session
+	// state. If it cannot fit, the server MUST NOT send it [MQTT-3.1.2-24]; there
+	// is no useful connection to establish, so fail now — before any session
+	// lookup, clear, rebind, live-client eviction or Will handling — so nothing
+	// needs rolling back and no side effects leak. v5 only. Spec5 [3.2.2.3.6].
+	if c.mqtt.proto == mqttProtoLevel5 {
+		// Server Keep Alive: enforce the configured maximum when the client asked
+		// for none (0) or more. Reads only Options and cp.ka. Spec5 [3.1.2.10],
+		// [3.2.2.3.14].
+		if kam := s.getOpts().MQTT.KeepAliveMaximum; kam > 0 && (cp.ka == 0 || cp.ka > uint16(kam)) {
+			c.mqtt.serverKeepAlive = uint16(kam)
+			cp.rd = mqttKeepAliveRD(uint16(kam))
+		}
+		// Topic Alias Maximum (inbound-only): the server-side cap for this
+		// connection. The client's own Topic Alias Maximum is intentionally not
+		// consumed: it caps aliases the server would send, and this server never
+		// sends any. Spec5 [3.2.2.3.2].
+		c.mqtt.topicAliasMax = mqttTopicAliasMax(s.getOpts())
+		// Maximum Packet Size we advertise and enforce on inbound; captured once so
+		// the encoded and enforced values are identical even across a reload.
+		c.mqtt.maxInPacketSize = c.mqttServerMaxPacketSize()
+		// Frame size is independent of the session present flag, so a placeholder
+		// (0) is fine for the fit check.
+		if frame := c.mqttMakeConnAckV5Frame(mqttConnAckRCConnectionAccepted, 0, _EMPTY_); !c.mqttFitsClientMax(len(frame)) {
+			c.Errorf("Success CONNACK of %d bytes exceeds client Maximum Packet Size %d; closing", len(frame), c.mqtt.maxPacketSize)
+			return fmt.Errorf("CONNACK exceeds client maximum packet size")
+		}
 	}
 
 	// Most of the session state is altered only in the readLoop so does not
@@ -6088,28 +6149,9 @@ CHECK:
 	es.will = nil
 	es.mu.Unlock()
 
-	// MQTT 5.0 Topic Alias Maximum (inbound-only): resolve the server-side cap
-	// for this connection; advertised in the CONNACK below. The client's own
-	// Topic Alias Maximum (cp.props.topicAliasMax) is intentionally not consumed:
-	// it caps aliases the server would send, and this server never sends any.
-	// Spec5 [3.2.2.3.2].
-	if c.mqtt.proto == mqttProtoLevel5 {
-		c.mqtt.topicAliasMax = mqttTopicAliasMax(s.getOpts())
-	}
-
-	// MQTT 5.0 Server Keep Alive: if the client requested no keep alive (0) or
-	// one above the configured maximum, enforce the maximum: it becomes the read
-	// deadline basis and is advertised in the CONNACK below. v5 only: 3.1.1 has
-	// no Server Keep Alive property, so an override could not be communicated.
-	// Resolved on the accept path, so failure CONNACKs never carry the property
-	// and the CONNECT trace keeps showing the client-sent value. Spec5
-	// [3.1.2.10], [3.2.2.3.14].
-	if c.mqtt.proto == mqttProtoLevel5 {
-		if kam := s.getOpts().MQTT.KeepAliveMaximum; kam > 0 && (cp.ka == 0 || cp.ka > uint16(kam)) {
-			c.mqtt.serverKeepAlive = uint16(kam)
-			cp.rd = mqttKeepAliveRD(uint16(kam))
-		}
-	}
+	// Server Keep Alive, Topic Alias Maximum and the advertised Maximum Packet
+	// Size were resolved on entry (before any session state), so the CONNACK could
+	// be size-checked against the client's Maximum Packet Size before committing.
 
 	// We would need to save only if it did not exist previously, but we save
 	// always in case we are running in cluster mode. This will notify other
@@ -6135,7 +6177,11 @@ CHECK:
 	c.mu.Unlock()
 
 	// Spec [MQTT-3.2.0-1]: CONNACK must be the first protocol sent to the session.
-	sendConnAck(mqttConnAckRCConnectionAccepted, sessp, _EMPTY_)
+	// The entry fit check used the identical frame builder and captured values, so
+	// this send is guaranteed to fit; the guard is defensive.
+	if !sendConnAck(mqttConnAckRCConnectionAccepted, sessp, _EMPTY_) {
+		return fmt.Errorf("CONNACK exceeds client maximum packet size")
+	}
 
 	// Process possible saved subscriptions.
 	if l := len(es.subs); l > 0 {
@@ -6183,7 +6229,10 @@ func mqttConnAckReasonFromRC(rc byte) byte {
 	return mqttReasonUnspecifiedError
 }
 
-func (c *client) mqttEnqueueConnAck(rc byte, sessionPresent bool, reasonStr string) {
+// mqttEnqueueConnAck enqueues a CONNACK and reports whether it was sent. A v5
+// CONNACK is suppressed (returns false) when it cannot fit the client's Maximum
+// Packet Size even after dropping its Reason String; the 3.1.1 path always sends.
+func (c *client) mqttEnqueueConnAck(rc byte, sessionPresent bool, reasonStr string) bool {
 	// Spec [MQTT-3.2.2-4], spec5 [3.2.2.1.1]: when the (reason) code indicates
 	// failure, the session present flag must be 0.
 	sp := byte(0)
@@ -6192,22 +6241,24 @@ func (c *client) mqttEnqueueConnAck(rc byte, sessionPresent bool, reasonStr stri
 	}
 
 	if c.mqtt.proto == mqttProtoLevel5 {
-		c.mqttEnqueueConnAckV5(rc, sp, reasonStr)
-		return
+		return c.mqttEnqueueFittingProto(c.mqttMakeConnAckV5Frame(rc, sp, reasonStr))
 	}
 
 	proto := [4]byte{mqttPacketConnectAck, 2, sp, rc}
 	c.mu.Lock()
 	c.enqueueProto(proto[:])
 	c.mu.Unlock()
+	return true
 }
 
-// mqttEnqueueConnAckV5 writes an MQTT 5.0 CONNACK: a reason code, the session
-// present flag, and a properties block advertising the server's capabilities.
-// On a failure reason, reasonStr (when set and it fits) is added as a Reason
-// String. Spec5 [3.2.2].
-func (c *client) mqttEnqueueConnAckV5(rc, sp byte, reasonStr string) {
+// mqttMakeConnAckV5Frame builds an MQTT 5.0 CONNACK frame: a reason code, the
+// session present flag, and a properties block advertising the server's
+// capabilities. On a failure reason, reasonStr (when set and it fits) is added
+// as a Reason String. The frame size is independent of sp (one byte either way),
+// so the accept path can size it before knowing session present. Spec5 [3.2.2].
+func (c *client) mqttMakeConnAckV5Frame(rc, sp byte, reasonStr string) []byte {
 	reason := mqttConnAckReasonFromRC(rc)
+	success := reason == mqttReasonSuccess
 
 	props := &mqttProperties{present: map[byte]bool{}}
 	// Advertise the capabilities of the current implementation. Properties left
@@ -6224,29 +6275,31 @@ func (c *client) mqttEnqueueConnAckV5(rc, sp byte, reasonStr string) {
 	props.sharedSubAvail = 0
 	props.present[mqttPropSharedSubAvailable] = true
 	// Topic Alias Maximum: advertise the (configured) number of inbound topic
-	// aliases we accept. Omitted when disabled: absent => 0, i.e. the client
-	// must not send any alias. Spec5 [3.2.2.3.2].
-	if tam := c.mqtt.topicAliasMax; tam > 0 {
+	// aliases we accept. Success only (resolved on the accept path); omitted when
+	// disabled: absent => 0, i.e. the client must not send any alias. Spec5
+	// [3.2.2.3.2].
+	if tam := c.mqtt.topicAliasMax; success && tam > 0 {
 		props.topicAliasMax = tam
 		props.present[mqttPropTopicAliasMax] = true
 	}
 	// Server Keep Alive: sent only when the server overrides the client's
-	// requested keep alive; absent => the client's value applies. Spec5
-	// [3.2.2.3.14].
-	if ska := c.mqtt.serverKeepAlive; ska > 0 {
+	// requested keep alive (resolved on the accept path); absent => the client's
+	// value applies. Spec5 [3.2.2.3.14].
+	if ska := c.mqtt.serverKeepAlive; success && ska > 0 {
 		props.serverKeepAlive = ska
 		props.present[mqttPropServerKeepAlive] = true
 	}
-	// We intentionally do NOT advertise Maximum Packet Size. The natural
-	// candidate (Options.MaxPayload) is not the value the server actually
-	// enforces: an inbound PUBLISH is re-encoded as a NATS message with extra
-	// header overhead and checked against MaxPayload (see mqttComputeNatsMsgSize),
-	// so a v5 PUBLISH sized just under MaxPayload can still be rejected.
-	// Advertising a limit the server does not honor is worse than advertising
-	// none (absent => the client applies no server-side limit, same as 3.1.1),
-	// so we omit it until packet-size enforcement is implemented.
+	// Maximum Packet Size: advertise the server's inbound limit (captured on the
+	// accept path). Truthful: a packet over it gets a DISCONNECT 0x95 at the
+	// framing layer, and an in-range PUBLISH whose NATS re-encoding exceeds the
+	// account max payload gets a non-fatal 0x97 rather than being rejected here.
+	// Omitted (absent => no limit) when there is none. Spec5 [3.2.2.3.6].
+	if mps := c.mqtt.maxInPacketSize; success && mps > 0 {
+		props.maxPacketSize = mps
+		props.present[mqttPropMaxPacketSize] = true
+	}
 	// Echo a server-assigned client identifier. Spec5 [3.2.2.3.7].
-	if reason == mqttReasonSuccess && c.mqtt.cidGenerated {
+	if success && c.mqtt.cidGenerated {
 		props.assignedClientID = c.mqtt.cid
 	}
 	// On a failure reason, explain why with a Reason String (CONNACK is exempt
@@ -6274,10 +6327,7 @@ func (c *client) mqttEnqueueConnAckV5(rc, sp byte, reasonStr string) {
 		props.reasonString = _EMPTY_
 		buf = frame()
 	}
-
-	c.mu.Lock()
-	c.enqueueProto(buf)
-	c.mu.Unlock()
+	return buf
 }
 
 // Reason String sent with the DISCONNECT to a client whose session is taken
@@ -6310,6 +6360,32 @@ func (c *client) mqttReasonString(pktType byte, reasonStr string) string {
 // Reason String rather than be sent. Spec5 [3.1.2.11.4].
 func (c *client) mqttFitsClientMax(n int) bool {
 	return c.mqtt == nil || c.mqtt.maxPacketSize == 0 || uint32(n) <= c.mqtt.maxPacketSize
+}
+
+// mqttEnqueueFittingProto enqueues buf unless it would exceed the client's
+// Maximum Packet Size; the server MUST NOT send such a packet [MQTT-3.1.2-24].
+// Returns whether it was enqueued.
+func (c *client) mqttEnqueueFittingProto(buf []byte) bool {
+	if !c.mqttFitsClientMax(len(buf)) {
+		c.Debugf("Suppressing MQTT packet of %d bytes exceeding client Maximum Packet Size %d", len(buf), c.mqtt.maxPacketSize)
+		return false
+	}
+	c.mu.Lock()
+	c.enqueueProto(buf)
+	c.mu.Unlock()
+	return true
+}
+
+// mqttServerMaxPacketSize returns the server's MQTT 5.0 Maximum Packet Size for
+// this connection, derived from the account max payload, or 0 when there is no
+// effective limit (unlimited, or a limit at/above the largest legal control
+// packet). Spec5 [3.2.2.3.6].
+func (c *client) mqttServerMaxPacketSize() uint32 {
+	mpay := atomic.LoadInt32(&c.mpay)
+	if mpay <= 0 || mpay > mqttMaxControlPacketSize {
+		return 0
+	}
+	return uint32(mpay)
 }
 
 // mqttReasonProps returns a properties block carrying reasonStr as a Reason
@@ -6348,11 +6424,11 @@ func (c *client) mqttEnqueueDisconnect(reason byte, reasonStr string) {
 		// Falls through to the short form when the Reason String would overflow.
 	}
 	// Remaining length of 1: just the reason code, properties omitted (allowed
-	// when there are no properties). Spec5 [3.14.2.2.1].
+	// when there are no properties). Suppressed if even this doesn't fit (only
+	// possible before a success CONNACK bounds the client's tiny limit); the
+	// connection closes regardless. Spec5 [3.14.2.2.1].
 	proto := [3]byte{mqttPacketDisconnect, 1, reason}
-	c.mu.Lock()
-	c.enqueueProto(proto[:])
-	c.mu.Unlock()
+	c.mqttEnqueueFittingProto(proto[:])
 }
 
 // mqttDisconnectReasonFromErr picks a v5 DISCONNECT reason code for a parse or
@@ -6915,6 +6991,24 @@ func (s *Server) mqttProcessPub(c *client, pp *mqttPublish, trace bool) error {
 			}
 		}
 		if total > int(maxPayload) {
+			// A v5 PUBLISH within the advertised Maximum Packet Size can still
+			// exceed the account max payload once re-encoded as a NATS message
+			// (header overhead). Rather than close the connection, discard the
+			// message and report a non-fatal Quota Exceeded so the advertised
+			// packet-size limit stays truthful. QoS0 has no ack, so drop silently.
+			// Spec5 [3.4.2.1], [3.5.2.1], reason 0x97.
+			if c.mqtt.proto == mqttProtoLevel5 {
+				rs := fmt.Sprintf("message size %d exceeds server maximum of %d after encoding", total, maxPayload)
+				switch qos {
+				case 1:
+					c.mqttEnqueuePubResponseReason(mqttPacketPubAck, pp.pi, mqttReasonQuotaExceeded, rs, trace)
+				case 2:
+					c.mqttEnqueuePubResponseReason(mqttPacketPubRec, pp.pi, mqttReasonQuotaExceeded, rs, trace)
+				default:
+					c.Debugf("Discarding QoS0 PUBLISH: %s", rs)
+				}
+				return nil
+			}
 			c.maxPayloadViolation(total, maxPayload)
 			return ErrMaxPayload
 		}
@@ -7437,9 +7531,12 @@ func (c *client) mqttEnqueuePubResponseReason(packetType byte, pi uint16, reason
 		}
 	}
 
-	c.mu.Lock()
-	c.enqueueProto(buf)
-	c.mu.Unlock()
+	// Unreachable in practice: a connected client's Maximum Packet Size is bounded
+	// below by its success CONNACK (~15+ bytes) so a 4/5-byte response always fits.
+	// The check keeps every enqueue site provably compliant. [MQTT-3.1.2-24].
+	if !c.mqttEnqueueFittingProto(buf) {
+		return
+	}
 
 	if trace {
 		name := "(???)"
@@ -8608,7 +8705,10 @@ func (c *client) mqttSendRetainedMsgsToNewSubs(subs []*subscription) {
 	c.mu.Unlock()
 }
 
-func (c *client) mqttEnqueueSubAck(pi uint16, filters []*mqttFilter) {
+// mqttEnqueueSubAck enqueues a SUBACK and reports whether it was sent. A v5
+// SUBACK whose reason-code payload alone exceeds the client's Maximum Packet Size
+// is suppressed (returns false); the 3.1.1 path always sends.
+func (c *client) mqttEnqueueSubAck(pi uint16, filters []*mqttFilter) bool {
 	w := newMQTTWriter(7 + len(filters))
 	w.WriteByte(mqttPacketSubAck)
 	// The per-filter byte (f.qos) is a granted QoS (0/1/2) or a failure reason
@@ -8645,10 +8745,9 @@ func (c *client) mqttEnqueueSubAck(pi uint16, filters []*mqttFilter) {
 			props = nil
 			buf = frame()
 		}
-		c.mu.Lock()
-		c.enqueueProto(buf)
-		c.mu.Unlock()
-		return
+		// If the reason-code payload alone still overflows, the SUBACK cannot be
+		// sent [MQTT-3.1.2-24]; the subscription side effects stand.
+		return c.mqttEnqueueFittingProto(buf)
 	}
 	// packet length is 2 (for packet identifier) and 1 byte per filter.
 	w.WriteVarInt(2 + len(filters))
@@ -8659,6 +8758,7 @@ func (c *client) mqttEnqueueSubAck(pi uint16, filters []*mqttFilter) {
 	c.mu.Lock()
 	c.enqueueProto(w.Bytes())
 	c.mu.Unlock()
+	return true
 }
 
 //////////////////////////////////////////////////////////////////////////////
@@ -8746,7 +8846,10 @@ func (c *client) mqttProcessUnsubs(filters []*mqttFilter) error {
 	return sess.update(filters, false)
 }
 
-func (c *client) mqttEnqueueUnsubAck(pi uint16, filters []*mqttFilter) {
+// mqttEnqueueUnsubAck enqueues an UNSUBACK and reports whether it was sent. A v5
+// UNSUBACK whose reason-code payload alone exceeds the client's Maximum Packet
+// Size is suppressed (returns false); the 3.1.1 path always sends.
+func (c *client) mqttEnqueueUnsubAck(pi uint16, filters []*mqttFilter) bool {
 	if c.mqtt.proto == mqttProtoLevel5 {
 		// v5 UNSUBACK adds a properties block and one reason code per filter.
 		// Spec5 [3.11].
@@ -8780,10 +8883,9 @@ func (c *client) mqttEnqueueUnsubAck(pi uint16, filters []*mqttFilter) {
 			props = nil
 			buf = frame()
 		}
-		c.mu.Lock()
-		c.enqueueProto(buf)
-		c.mu.Unlock()
-		return
+		// If the reason-code payload alone still overflows, the UNSUBACK cannot be
+		// sent [MQTT-3.1.2-24]; the unsubscribe side effects stand.
+		return c.mqttEnqueueFittingProto(buf)
 	}
 	w := newMQTTWriter(4)
 	w.WriteByte(mqttPacketUnsubAck)
@@ -8792,6 +8894,7 @@ func (c *client) mqttEnqueueUnsubAck(pi uint16, filters []*mqttFilter) {
 	c.mu.Lock()
 	c.enqueueProto(w.Bytes())
 	c.mu.Unlock()
+	return true
 }
 
 func mqttUnsubscribeTrace(pi uint16, filters []*mqttFilter) string {
@@ -8819,9 +8922,9 @@ func mqttUnsubscribeTrace(pi uint16, filters []*mqttFilter) string {
 //////////////////////////////////////////////////////////////////////////////
 
 func (c *client) mqttEnqueuePingResp() {
-	c.mu.Lock()
-	c.enqueueProto(mqttPingResponse)
-	c.mu.Unlock()
+	// 2 bytes; always fits a connected client's Maximum Packet Size, checked for
+	// uniformity. [MQTT-3.1.2-24].
+	c.mqttEnqueueFittingProto(mqttPingResponse)
 }
 
 //////////////////////////////////////////////////////////////////////////////
@@ -9363,11 +9466,12 @@ func (r *mqttReader) readProperties(ctx byte) (*mqttProperties, error) {
 		case mqttPropWillDelay:
 			props.willDelay, err = r.readUint32("will delay interval")
 		case mqttPropMaxPacketSize:
-			// The client is telling us the largest packet it will accept. We
-			// honor this on outbound PUBLISH (see mqttEnqueuePublishMsgTo and
-			// serializeRetainedMsgsForSub): a PUBLISH exceeding it is discarded
-			// rather than sent. Stored on the connection as c.mqtt.maxPacketSize.
-			// Spec5 [3.1.2.11.4].
+			// The client is telling us the largest packet it will accept. We honor
+			// this on every server-generated packet: an outbound PUBLISH exceeding
+			// it is discarded (mqttEnqueuePublishMsgTo, serializeRetainedMsgsForSub),
+			// and any other packet drops its Reason String or, failing that, is not
+			// sent (mqttEnqueueFittingProto). Stored as c.mqtt.maxPacketSize. Spec5
+			// [3.1.2.11.4].
 			if props.maxPacketSize, err = r.readUint32("maximum packet size"); err == nil && props.maxPacketSize == 0 {
 				// Spec5 [3.1.2.11.4]: a Maximum Packet Size of 0 is a Protocol
 				// Error. (Absent means no property, i.e. no client-imposed limit.)

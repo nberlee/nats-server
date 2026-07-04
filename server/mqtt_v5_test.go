@@ -2077,6 +2077,62 @@ func testMQTTReadPubCompV5(t testing.TB, r *mqttReader, expPI uint16) (byte, *mq
 	return reason, props
 }
 
+// testMQTTReadPubAckV5 reads a PUBACK for expPI, returning its reason code and
+// (when present) parsed properties.
+func testMQTTReadPubAckV5(t testing.TB, r *mqttReader, expPI uint16) (byte, *mqttProperties) {
+	t.Helper()
+	b, pl := testMQTTReadPacket(t, r)
+	if pt := b & mqttPacketMask; pt != mqttPacketPubAck {
+		t.Fatalf("Expected PUBACK (%x), got %x", mqttPacketPubAck, pt)
+	}
+	start := r.pos
+	pi, err := r.readUint16("puback pi")
+	if err != nil || pi != expPI {
+		t.Fatalf("Expected PUBACK pi=%v, got %v (err=%v)", expPI, pi, err)
+	}
+	reason := byte(mqttReasonSuccess)
+	if r.pos-start < pl {
+		if reason, err = r.readByte("puback reason"); err != nil {
+			t.Fatalf("Error reading PUBACK reason: %v", err)
+		}
+	}
+	var props *mqttProperties
+	if r.pos-start < pl {
+		if props, err = r.readProperties(mqttPacketPubAck); err != nil {
+			t.Fatalf("Error reading PUBACK properties: %v", err)
+		}
+	}
+	return reason, props
+}
+
+// testMQTTReadPubRecV5 reads a PUBREC for expPI, returning its reason code and
+// (when present) parsed properties.
+func testMQTTReadPubRecV5(t testing.TB, r *mqttReader, expPI uint16) (byte, *mqttProperties) {
+	t.Helper()
+	b, pl := testMQTTReadPacket(t, r)
+	if pt := b & mqttPacketMask; pt != mqttPacketPubRec {
+		t.Fatalf("Expected PUBREC (%x), got %x", mqttPacketPubRec, pt)
+	}
+	start := r.pos
+	pi, err := r.readUint16("pubrec pi")
+	if err != nil || pi != expPI {
+		t.Fatalf("Expected PUBREC pi=%v, got %v (err=%v)", expPI, pi, err)
+	}
+	reason := byte(mqttReasonSuccess)
+	if r.pos-start < pl {
+		if reason, err = r.readByte("pubrec reason"); err != nil {
+			t.Fatalf("Error reading PUBREC reason: %v", err)
+		}
+	}
+	var props *mqttProperties
+	if r.pos-start < pl {
+		if props, err = r.readProperties(mqttPacketPubRec); err != nil {
+			t.Fatalf("Error reading PUBREC properties: %v", err)
+		}
+	}
+	return reason, props
+}
+
 // A rejected v5 CONNACK carries a Reason String explaining the failure; a
 // successful CONNACK carries none.
 func TestMQTTv5ConnAckReasonString(t *testing.T) {
@@ -2296,8 +2352,10 @@ func TestMQTTv5ReasonStringMaxPacketSize(t *testing.T) {
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
 
-	// A tiny Maximum Packet Size leaves no room for any Reason String.
-	tiny := mqttV5MaxPacketSizeProps(12)
+	// Small enough to leave no room for any Reason String (the shortest is ~38
+	// bytes), but large enough for the success CONNACK (~15 bytes, now carrying
+	// Shared Subscription Available + Topic Alias Maximum + Maximum Packet Size).
+	tiny := mqttV5MaxPacketSizeProps(30)
 
 	// SUBACK falls back: failure code present, no Reason String.
 	c, r := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "mps", cleanStart: true, props: tiny}, o.MQTT.Host, o.MQTT.Port)
@@ -2371,6 +2429,364 @@ func TestMQTTv5ReasonStringMaxPacketSize(t *testing.T) {
 	if bigProps == nil || bigProps.reasonString == _EMPTY_ {
 		t.Fatalf("Large max: expected a Reason String on SUBACK, got %+v", bigProps)
 	}
+}
+
+// The server advertises its Maximum Packet Size (derived from max_payload) in the
+// success CONNACK. Spec5 [3.2.2.3.6].
+func TestMQTTv5MaxPacketSizeAdvertised(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		maxpay int32
+	}{
+		{"default", 0},   // 0 => opts default (1MB)
+		{"explicit", 512},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			o := testMQTTDefaultOptionsV5()
+			if test.maxpay > 0 {
+				o.MaxPayload = test.maxpay
+			}
+			s := testMQTTRunServer(t, o)
+			defer testMQTTShutdownServer(s)
+
+			c, r := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "adv", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
+			defer c.Close()
+			_, reason, props := testMQTTReadConnAckV5(t, r)
+			if reason != mqttReasonSuccess {
+				t.Fatalf("Expected success, got 0x%x", reason)
+			}
+			if props == nil || !props.present[mqttPropMaxPacketSize] {
+				t.Fatalf("Expected Maximum Packet Size advertised, got %+v", props)
+			}
+			if props.maxPacketSize != uint32(o.MaxPayload) {
+				t.Fatalf("Expected Maximum Packet Size %d, got %d", o.MaxPayload, props.maxPacketSize)
+			}
+		})
+	}
+}
+
+// A packet larger than the server's advertised Maximum Packet Size is rejected
+// with a DISCONNECT 0x95 and the connection is closed; a packet at the limit is
+// accepted. Spec5 [MQTT-3.2.2-15].
+func TestMQTTv5MaxPacketSizeInboundEnforced(t *testing.T) {
+	o := testMQTTDefaultOptionsV5()
+	o.MaxPayload = 512
+	s := testMQTTRunServer(t, o)
+	defer testMQTTShutdownServer(s)
+
+	c, r := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "in", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
+	defer c.Close()
+	testMQTTReadConnAckV5(t, r)
+
+	// A SUBSCRIBE whose full packet is exactly 512 bytes is accepted. Fixed header
+	// is 2 bytes (type + one-byte remaining length is too small; the packet is
+	// >127 so remaining length takes 2 bytes -> fixed header 3). Rather than do the
+	// arithmetic by hand, pad the topic filter so the whole packet lands on 512.
+	buildSub := func(total int) []byte {
+		// vh: pi(2) + props(1 empty) + filter(len prefix 2 + N + opts 1)
+		// packet: type(1) + remlen varint + vh
+		// Solve for filter length. Try 1- and 2-byte remaining-length encodings.
+		for _, rl := range []int{1, 2} {
+			fixed := 1 + rl
+			vhLen := total - fixed
+			filterLen := vhLen - (2 + 1 + 2 + 1)
+			if filterLen < 1 {
+				continue
+			}
+			vh := newMQTTWriter(0)
+			vh.WriteUint16(1) // pi
+			vh.WriteVarInt(0) // empty properties
+			vh.WriteBytes([]byte(strings.Repeat("a", filterLen)))
+			vh.WriteByte(0) // opts: QoS 0
+			w := newMQTTWriter(0)
+			w.WriteByte(mqttPacketSub | 0x2)
+			w.WriteVarInt(vh.Len())
+			w.Write(vh.Bytes())
+			if b := w.Bytes(); len(b) == total {
+				return b
+			}
+		}
+		t.Fatalf("could not build a SUBSCRIBE of exactly %d bytes", total)
+		return nil
+	}
+
+	// Exactly at the limit: accepted (SUBACK returned).
+	if _, err := testMQTTWrite(c, buildSub(512)); err != nil {
+		t.Fatalf("Error writing SUBSCRIBE: %v", err)
+	}
+	pt, pl := testMQTTReadPacket(t, r)
+	if pt&mqttPacketMask != mqttPacketSubAck {
+		t.Fatalf("Expected SUBACK for the at-limit packet, got %x", pt)
+	}
+	r.pos += pl // consume the SUBACK body so the next read is aligned
+
+	// One byte over the limit: the read loop cuts it off and the server sends a
+	// DISCONNECT 0x95, then closes.
+	if _, err := testMQTTWrite(c, buildSub(513)); err != nil {
+		t.Fatalf("Error writing SUBSCRIBE: %v", err)
+	}
+	reason, _ := testMQTTReadDisconnectV5(t, r)
+	if reason != mqttReasonPacketTooLarge {
+		t.Fatalf("Expected DISCONNECT reason 0x%x, got 0x%x", mqttReasonPacketTooLarge, reason)
+	}
+	testMQTTExpectDisconnect(t, c)
+}
+
+// A 3.1.1 client is not subject to the MQTT 5.0 Maximum Packet Size framing
+// limit: it never advertised one, so a large post-connect packet is processed as
+// before.
+func TestMQTTv5MaxPacketSizeInboundV4Unaffected(t *testing.T) {
+	o := testMQTTDefaultOptionsV5()
+	o.MaxPayload = 512
+	s := testMQTTRunServer(t, o)
+	defer testMQTTShutdownServer(s)
+
+	// A 3.1.1 CONNECT against the v5-enabled server.
+	c, r := testMQTTConnect(t, &mqttConnInfo{clientID: "v4", cleanSess: true}, o.MQTT.Host, o.MQTT.Port)
+	defer c.Close()
+	testMQTTCheckConnAck(t, r, mqttConnAckRCConnectionAccepted, false)
+
+	// A SUBSCRIBE well over 512 bytes (topic filter padded) is still accepted:
+	// there is no v5 framing limit for a 3.1.1 client, only the CONNECT-time
+	// account payload check, which does not apply post-connect.
+	filter := strings.Repeat("a", 700)
+	testMQTTSub(t, 1, c, r, []*mqttFilter{{filter: filter, qos: 0}}, []byte{0})
+}
+
+// A v5 PUBLISH within the advertised Maximum Packet Size whose NATS re-encoding
+// exceeds the account max payload is not fatal: the message is discarded and the
+// server responds with a Quota Exceeded (0x97) ack for QoS 1/2 (silently for
+// QoS 0), keeping the connection alive. Spec5 [3.4.2.1], [3.5.2.1].
+func TestMQTTv5MaxPacketSizeQuotaExceeded(t *testing.T) {
+	payload := bytes.Repeat([]byte("x"), 2000)
+	subj, err := mqttTopicToNATSPubSubject([]byte("foo"))
+	if err != nil {
+		t.Fatalf("subject conversion: %v", err)
+	}
+	pp := &mqttPublish{topic: []byte("foo"), subject: subj, msg: payload, sz: len(payload)}
+	// The smallest re-encoded form is the QoS0 non-retained delivery: no origin
+	// marker (mqttProcessPub only stamps one for qos>0 or retained), no subject
+	// headers, no TTL. QoS1 adds the origin and QoS2 the subject headers, so both
+	// are larger. Setting max_payload one below this smallest form puts every QoS
+	// over the quota, while the raw PUBLISH packet (no NATS headers) stays under
+	// the advertised limit and so reaches the quota check, not the framing limit.
+	minEnc := mqttComputeNatsMsgSize(pp, false, 0, _EMPTY_, false)
+
+	pubOver := func(t *testing.T, c net.Conn, qos byte, pi uint16) {
+		testMQTTPublishV5(t, c, qos, pi, "foo", payload)
+	}
+
+	run := func(t *testing.T) (*Server, *Options) {
+		o := testMQTTDefaultOptionsV5()
+		o.MaxPayload = int32(minEnc - 1)
+		s := testMQTTRunServer(t, o)
+		return s, o
+	}
+
+	t.Run("qos1", func(t *testing.T) {
+		s, o := run(t)
+		defer testMQTTShutdownServer(s)
+		// A separate subscriber verifies nothing is delivered.
+		cs, rs := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "q1sub", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
+		defer cs.Close()
+		testMQTTReadConnAckV5(t, rs)
+		testMQTTSubV5(t, cs, rs, 1, []mqttV5SubFilter{{topic: "foo", opts: 1}})
+
+		c, r := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "q1", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
+		defer c.Close()
+		testMQTTReadConnAckV5(t, r)
+		pubOver(t, c, 1, 7)
+		reason, props := testMQTTReadPubAckV5(t, r, 7)
+		if reason != mqttReasonQuotaExceeded {
+			t.Fatalf("Expected PUBACK reason 0x%x, got 0x%x", mqttReasonQuotaExceeded, reason)
+		}
+		if props == nil || props.reasonString == _EMPTY_ {
+			t.Fatalf("Expected a Reason String on the quota PUBACK, got %+v", props)
+		}
+		// Connection stays up and nothing was delivered.
+		testMQTTFlush(t, c, nil, r)
+		testMQTTExpectNothing(t, rs)
+	})
+
+	t.Run("qos2", func(t *testing.T) {
+		s, o := run(t)
+		defer testMQTTShutdownServer(s)
+		c, r := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "q2", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
+		defer c.Close()
+		testMQTTReadConnAckV5(t, r)
+		pubOver(t, c, 2, 8)
+		reason, props := testMQTTReadPubRecV5(t, r, 8)
+		if reason != mqttReasonQuotaExceeded {
+			t.Fatalf("Expected PUBREC reason 0x%x, got 0x%x", mqttReasonQuotaExceeded, reason)
+		}
+		if props == nil || props.reasonString == _EMPTY_ {
+			t.Fatalf("Expected a Reason String on the quota PUBREC, got %+v", props)
+		}
+		// A failed PUBREC ends the QoS2 flow; a stray PUBREL gets PUBCOMP 0x92.
+		if _, err := testMQTTWrite(c, []byte{mqttPacketPubRel | 0x2, 2, 0, 8}); err != nil {
+			t.Fatalf("Error writing PUBREL: %v", err)
+		}
+		if creason, _ := testMQTTReadPubCompV5(t, r, 8); creason != mqttReasonPacketIDNotFound {
+			t.Fatalf("Expected PUBCOMP 0x%x, got 0x%x", mqttReasonPacketIDNotFound, creason)
+		}
+	})
+
+	t.Run("qos0", func(t *testing.T) {
+		s, o := run(t)
+		defer testMQTTShutdownServer(s)
+		// A subscriber verifies the over-quota QoS0 message is discarded, not
+		// delivered.
+		cs, rs := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "q0sub", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
+		defer cs.Close()
+		testMQTTReadConnAckV5(t, rs)
+		testMQTTSubV5(t, cs, rs, 1, []mqttV5SubFilter{{topic: "foo", opts: 0}})
+
+		c, r := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "q0", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
+		defer c.Close()
+		testMQTTReadConnAckV5(t, r)
+		pubOver(t, c, 0, 0)
+		// No ack for QoS0; the connection stays alive and nothing is delivered.
+		testMQTTFlush(t, c, nil, r)
+		testMQTTExpectNothing(t, rs)
+	})
+}
+
+// A success CONNACK that cannot fit the client's Maximum Packet Size is not sent
+// and the connection is closed, with no acceptance side effects: no Will is
+// published and no resumable session is left behind. Spec5 [MQTT-3.1.2-24].
+func TestMQTTv5MaxPacketSizeConnAckSuppressed(t *testing.T) {
+	o := testMQTTDefaultOptionsV5()
+	s := testMQTTRunServer(t, o)
+	defer testMQTTShutdownServer(s)
+
+	t.Run("new session: no CONNACK, no Will, no saved session", func(t *testing.T) {
+		// Subscriber for the Will topic.
+		cs, rs := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "csub", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
+		defer cs.Close()
+		testMQTTReadConnAckV5(t, rs)
+		testMQTTSubV5(t, cs, rs, 1, []mqttV5SubFilter{{topic: "will/topic", opts: 0}})
+
+		// CONNECT with a Will and a persistent session, but a Maximum Packet Size
+		// of 5 (too small for any success CONNACK).
+		will := &mqttWill{topic: []byte("will/topic"), message: []byte("bye"), qos: 0}
+		props := append(mqttV5MaxPacketSizeProps(5), mqttV5ConnPropsSessionExpiry(3600)...)
+		c, _ := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "supp", will: will, props: props}, o.MQTT.Host, o.MQTT.Port)
+		defer c.Close()
+		testMQTTExpectDisconnect(t, c)
+
+		// No Will published to the subscriber.
+		testMQTTExpectNothing(t, rs)
+
+		// No resumable session: a normal reconnect reports session present false.
+		c2, r2 := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "supp", cleanStart: false}, o.MQTT.Host, o.MQTT.Port)
+		defer c2.Close()
+		sp, reason, _ := testMQTTReadConnAckV5(t, r2)
+		if reason != mqttReasonSuccess {
+			t.Fatalf("Expected success on reconnect, got 0x%x", reason)
+		}
+		if sp {
+			t.Fatalf("Expected no session present after a suppressed CONNACK")
+		}
+	})
+
+	t.Run("live client not evicted by a failed reconnect", func(t *testing.T) {
+		// A persistent v5 client stays connected.
+		ca, ra := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "live", cleanStart: false, props: mqttV5ConnPropsSessionExpiry(3600)}, o.MQTT.Host, o.MQTT.Port)
+		defer ca.Close()
+		testMQTTReadConnAckV5(t, ra)
+
+		// A reconnect with the same client ID and a too-small max fails.
+		cb, _ := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "live", cleanStart: false, props: mqttV5MaxPacketSizeProps(5)}, o.MQTT.Host, o.MQTT.Port)
+		defer cb.Close()
+		testMQTTExpectDisconnect(t, cb)
+
+		// The original client must still be connected and functional.
+		testMQTTFlush(t, ca, nil, ra)
+	})
+
+	t.Run("disconnected persistent session preserved", func(t *testing.T) {
+		// Establish then cleanly close a persistent session.
+		c1, r1 := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "keep", cleanStart: false, props: mqttV5ConnPropsSessionExpiry(3600)}, o.MQTT.Host, o.MQTT.Port)
+		testMQTTReadConnAckV5(t, r1)
+		// Normal v5 DISCONNECT (reason 0x00) keeps the persistent session.
+		if _, err := testMQTTWrite(c1, []byte{mqttPacketDisconnect, 1, mqttReasonSuccess}); err != nil {
+			t.Fatalf("Error writing DISCONNECT: %v", err)
+		}
+		c1.Close()
+
+		// A reconnect with a too-small max fails and must not clear the session.
+		cf, _ := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "keep", cleanStart: false, props: mqttV5MaxPacketSizeProps(5)}, o.MQTT.Host, o.MQTT.Port)
+		defer cf.Close()
+		testMQTTExpectDisconnect(t, cf)
+
+		// A normal reconnect still resumes the session.
+		c2, r2 := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "keep", cleanStart: false}, o.MQTT.Host, o.MQTT.Port)
+		defer c2.Close()
+		sp, reason, _ := testMQTTReadConnAckV5(t, r2)
+		if reason != mqttReasonSuccess {
+			t.Fatalf("Expected success on reconnect, got 0x%x", reason)
+		}
+		if !sp {
+			t.Fatalf("Expected the persistent session to be preserved")
+		}
+	})
+}
+
+// A v5 SUBACK/UNSUBACK whose reason-code payload alone exceeds the client's
+// Maximum Packet Size is not sent; the subscription side effects still apply and
+// the connection stays alive. Spec5 [MQTT-3.1.2-24].
+func TestMQTTv5MaxPacketSizeSubAckSuppressed(t *testing.T) {
+	o := testMQTTDefaultOptionsV5()
+	s := testMQTTRunServer(t, o)
+	defer testMQTTShutdownServer(s)
+
+	// A max of 32 fits the success CONNACK (~15 bytes) but not a SUBACK/UNSUBACK
+	// carrying ~40 filter reason codes.
+	c, r := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "subsupp", cleanStart: true, props: mqttV5MaxPacketSizeProps(32)}, o.MQTT.Host, o.MQTT.Port)
+	defer c.Close()
+	testMQTTReadConnAckV5(t, r)
+
+	filters := make([]mqttV5SubFilter, 0, 40)
+	for i := 0; i < 40; i++ {
+		filters = append(filters, mqttV5SubFilter{topic: fmt.Sprintf("f%d", i), opts: 0})
+	}
+
+	// SUBSCRIBE: the SUBACK (2 + 2 + 1 + 40 = 45 bytes) exceeds 32 and is
+	// suppressed, but the subscriptions take effect.
+	vh := newMQTTWriter(0)
+	vh.WriteUint16(1)
+	vh.WriteVarInt(0)
+	for _, f := range filters {
+		vh.WriteBytes([]byte(f.topic))
+		vh.WriteByte(f.opts)
+	}
+	w := newMQTTWriter(0)
+	w.WriteByte(mqttPacketSub | 0x2)
+	w.WriteVarInt(vh.Len())
+	w.Write(vh.Bytes())
+	if _, err := testMQTTWrite(c, w.Bytes()); err != nil {
+		t.Fatalf("Error writing SUBSCRIBE: %v", err)
+	}
+	// No SUBACK arrives; the connection is still alive.
+	testMQTTExpectNothing(t, r)
+	testMQTTFlush(t, c, nil, r)
+
+	// UNSUBSCRIBE: the UNSUBACK is likewise suppressed.
+	vh = newMQTTWriter(0)
+	vh.WriteUint16(2)
+	vh.WriteVarInt(0)
+	for _, f := range filters {
+		vh.WriteBytes([]byte(f.topic))
+	}
+	w = newMQTTWriter(0)
+	w.WriteByte(mqttPacketUnsub | 0x2)
+	w.WriteVarInt(vh.Len())
+	w.Write(vh.Bytes())
+	if _, err := testMQTTWrite(c, w.Bytes()); err != nil {
+		t.Fatalf("Error writing UNSUBSCRIBE: %v", err)
+	}
+	testMQTTExpectNothing(t, r)
+	testMQTTFlush(t, c, nil, r)
 }
 
 // A Reason String derived from client-controlled text must be dropped when it
@@ -3863,8 +4279,10 @@ func TestMQTTv5MessageExpiryMaxPayload(t *testing.T) {
 	}
 
 	// One byte below the full stored size: accepted only if the TTL header were
-	// (wrongly) omitted from the check, so this asserts the TTL is counted.
-	t.Run("qos1 rejected when TTL header exceeds the limit", func(t *testing.T) {
+	// (wrongly) omitted from the check, so this asserts the TTL is counted. The
+	// raw PUBLISH is under the advertised Maximum Packet Size, so it reaches the
+	// quota check and gets a non-fatal PUBACK 0x97 rather than a disconnect.
+	t.Run("qos1 over quota when TTL header exceeds the limit", func(t *testing.T) {
 		o := testMQTTDefaultOptionsV5()
 		o.MaxPayload = int32(delivery - 1)
 		s := testMQTTRunServer(t, o)
@@ -3873,7 +4291,11 @@ func TestMQTTv5MessageExpiryMaxPayload(t *testing.T) {
 		defer c.Close()
 		testMQTTReadConnAckV5(t, r)
 		sendPub(t, c, 1)
-		testMQTTExpectDisconnect(t, c)
+		if reason, _ := testMQTTReadPubAckV5(t, r, 7); reason != mqttReasonQuotaExceeded {
+			t.Fatalf("Expected PUBACK reason 0x%x, got 0x%x", mqttReasonQuotaExceeded, reason)
+		}
+		// Connection stays alive.
+		testMQTTFlush(t, c, nil, r)
 	})
 
 	t.Run("qos1 accepted at exactly the full stored size", func(t *testing.T) {
