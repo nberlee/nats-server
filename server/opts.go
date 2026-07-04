@@ -776,6 +776,16 @@ type MQTTOpts struct {
 	// to 5 to enable (experimental) MQTT 5.0.
 	MaxProtocolVersion byte
 
+	// TopicAliasMaximum is the highest MQTT 5.0 Topic Alias value the server
+	// accepts on inbound PUBLISH packets, advertised to v5 clients in the
+	// CONNACK Topic Alias Maximum property. The server never sends topic aliases
+	// to clients. 0 means use the default (64); set to -1 to disable topic
+	// aliases entirely (the CONNACK then omits the property). Valid explicit
+	// range is [1..65535]. In a config file, topic_alias_maximum: 0 disables the
+	// feature (stored as -1). Changing this option requires a restart.
+	// Spec5 [3.2.2.3.2].
+	TopicAliasMaximum int
+
 	// Snapshot of configured TLS options.
 	tlsConfigOpts *TLSConfigOpts
 
@@ -5652,6 +5662,18 @@ func parseMQTT(v any, o *Options, errors *[]error, warnings *[]error) error {
 				*errors = append(*errors, err)
 			} else {
 				o.MQTT.MaxProtocolVersion = byte(tmp)
+			}
+		case "topic_alias_maximum", "topic_alias_max":
+			tmp := int(mv.(int64))
+			if tmp < 0 || tmp > 0xFFFF {
+				err := &configErr{tk, fmt.Sprintf("invalid value %v, should be in [0..%d] range (0 disables)", tmp, 0xFFFF)}
+				*errors = append(*errors, err)
+			} else if tmp == 0 {
+				// Explicit 0 in the config disables topic aliases; stored as -1
+				// so it is distinguishable from "unset" (which uses the default).
+				o.MQTT.TopicAliasMaximum = -1
+			} else {
+				o.MQTT.TopicAliasMaximum = tmp
 			}
 
 		default:

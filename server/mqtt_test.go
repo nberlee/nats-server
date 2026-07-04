@@ -566,6 +566,18 @@ func TestMQTTValidateOptions(t *testing.T) {
 			o.MQTT.JSAPITimeout = -10 * time.Second
 			return o
 		}, errMQTTJSAPITimeoutMustBePositive},
+		{"topic alias maximum too high", func() *Options {
+			o := mqtto.Clone()
+			o.MQTT.TopicAliasMaximum = 70000
+			return o
+		}, fmt.Errorf("mqtt topic_alias_maximum must be in [-1..%d] (0 = default %d, -1 disables), got %d",
+			0xFFFF, mqttDefaultTopicAliasMax, 70000)},
+		{"topic alias maximum too low", func() *Options {
+			o := mqtto.Clone()
+			o.MQTT.TopicAliasMaximum = -2
+			return o
+		}, fmt.Errorf("mqtt topic_alias_maximum must be in [-1..%d] (0 = default %d, -1 disables), got %d",
+			0xFFFF, mqttDefaultTopicAliasMax, -2)},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			err := validateMQTTOptions(test.getOpts())
@@ -596,6 +608,8 @@ func TestMQTTParseOptions(t *testing.T) {
 		{"max ack pending", `mqtt: {max_ack_pending: abc}`, nil, "not int64"},
 		{"max ack pending too high", `mqtt: {max_ack_pending: 12345678}`, nil, "invalid value"},
 		{"js_api_timeout bad duration", `mqtt: {js_api_timeout: abc}`, nil, "invalid duration"},
+		{"topic alias maximum bad type", `mqtt: {topic_alias_maximum: abc}`, nil, "not int64"},
+		{"topic alias maximum too high", `mqtt: {topic_alias_maximum: 123456}`, nil, "invalid value"},
 		// Positive tests
 		{"tls gen fails", `
 			mqtt {
@@ -700,6 +714,28 @@ func TestMQTTParseOptions(t *testing.T) {
 			`, func(o *MQTTOpts) error {
 				if o.MaxAckPending != 123 {
 					return fmt.Errorf("Invalid max ack pending: %v", o.MaxAckPending)
+				}
+				return nil
+			}, ""},
+		{"topic alias maximum",
+			`
+			mqtt {
+				topic_alias_maximum: 123
+			}
+			`, func(o *MQTTOpts) error {
+				if o.TopicAliasMaximum != 123 {
+					return fmt.Errorf("Invalid topic alias maximum: %v", o.TopicAliasMaximum)
+				}
+				return nil
+			}, ""},
+		{"topic alias maximum zero disables",
+			`
+			mqtt {
+				topic_alias_maximum: 0
+			}
+			`, func(o *MQTTOpts) error {
+				if o.TopicAliasMaximum != -1 {
+					return fmt.Errorf("expected 0 to be stored as -1 (disabled), got %v", o.TopicAliasMaximum)
 				}
 				return nil
 			}, ""},

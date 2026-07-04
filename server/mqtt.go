@@ -129,6 +129,7 @@ const (
 	mqttReasonTopicFilterInvalid          = byte(0x8f)
 	mqttReasonPacketIDInUse               = byte(0x91)
 	mqttReasonPacketIDNotFound            = byte(0x92)
+	mqttReasonTopicAliasInvalid           = byte(0x94)
 	mqttReasonQoSNotSupported             = byte(0x9b)
 	mqttReasonSharedSubNotSupported       = byte(0x9e)
 	mqttReasonSubIDNotSupported           = byte(0xa1)
@@ -224,6 +225,12 @@ const (
 	// This is the default for the outstanding number of pending QoS 1
 	// messages sent to a session with QoS 1 subscriptions.
 	mqttDefaultMaxAckPending = 1024
+
+	// Default MQTT 5.0 Topic Alias Maximum advertised to (and accepted from)
+	// v5 clients when the topic_alias_maximum option is unset. Bounds the
+	// per-connection alias map. For reference, mosquitto defaults to 10.
+	// Spec5 [3.2.2.3.2].
+	mqttDefaultTopicAliasMax = 64
 
 	// A session's list of subscriptions cannot have a cumulative MaxAckPending
 	// of more than this limit.
@@ -331,6 +338,7 @@ var (
 	errMQTTAuthMethodNotSupported     = errors.New("enhanced authentication (auth method) is not supported")
 	errMQTTUnsupportedSubOption       = errors.New("unsupported MQTT 5.0 subscription option")
 	errMQTTMalformedSubOption         = errors.New("malformed MQTT 5.0 subscription option")
+	errMQTTTopicAliasInvalid          = errors.New("topic alias invalid")
 )
 
 type srvMQTT struct {
@@ -640,6 +648,21 @@ type mqtt struct {
 	// server assigned one. For v5 it must be echoed back in the CONNACK as the
 	// Assigned Client Identifier property. Spec5 [3.2.2.3.7].
 	cidGenerated bool
+
+	// topicAliasMax is the MQTT 5.0 Topic Alias Maximum this server accepts from
+	// this connection, resolved from Options at CONNECT and advertised in the
+	// CONNACK. 0 means aliases are not accepted (property omitted, absent => 0).
+	// Inbound-only: the server never sends aliases, so the client's own Topic
+	// Alias Maximum is intentionally ignored. Set during CONNECT, read lock-free
+	// on the parse path like proto. Spec5 [3.2.2.3.2], [3.3.2.3.4].
+	topicAliasMax uint16
+
+	// topicAliases maps a client-assigned Topic Alias to the (copied) pre-mapping
+	// wire topic it was last bound to. Lazily allocated on first bind, bounded by
+	// topicAliasMax entries. Aliases are connection-scoped and never survive a
+	// reconnect or session takeover (c.mqtt is rebuilt per connection). Only
+	// accessed from the read loop. Spec5 [3.3.2.3.4].
+	topicAliases map[uint16][]byte
 
 	// rejectQoS2Pub tells the MQTT client to not accept QoS2 PUBLISH, instead
 	// error and terminate the connection.
@@ -1089,6 +1112,12 @@ func validateMQTTOptions(o *Options) error {
 	case 0, mqttProtoLevel, mqttProtoLevel5:
 	default:
 		return fmt.Errorf("mqtt max_protocol_version must be 0 (default), 4 or 5, got %d", mo.MaxProtocolVersion)
+	}
+	// Topic Alias Maximum: 0 = use default, -1 = disabled, 1..65535 explicit.
+	// Config-file parsing already checks this; programmatic Options do not.
+	if mo.TopicAliasMaximum < -1 || mo.TopicAliasMaximum > 0xFFFF {
+		return fmt.Errorf("mqtt topic_alias_maximum must be in [-1..%d] (0 = default %d, -1 disables), got %d",
+			0xFFFF, mqttDefaultTopicAliasMax, mo.TopicAliasMaximum)
 	}
 	// If strictly standalone and there is no JS enabled, then it won't work...
 	// For leafnodes, we could either have remote(s) and it would be ok, or no
@@ -1693,13 +1722,13 @@ func mqttVarIntFromSlice(b []byte) (int, int) {
 	return 0, -1
 }
 
-// mqttMessageExpiryOffset walks a well-formed MQTT 5.0 properties block (length
-// prefix + body) and returns the byte offset of the 4-byte Message Expiry
-// Interval value within it, or -1 if the block carries no Message Expiry
-// Interval or cannot be walked. The block is expected to have already been
-// validated (by readProperties / mqttValidateForwardProps), so property lengths
-// are trusted; anything unexpected returns -1 rather than risk a bad rewrite.
-func mqttMessageExpiryOffset(props []byte) int {
+// mqttPropValueOffset walks a well-formed MQTT 5.0 properties block (length
+// prefix + body) and returns the byte offset of the value of the first
+// occurrence of property target, or -1 if the block carries no such property or
+// cannot be walked. The block is expected to have already been validated (by
+// readProperties / mqttValidateForwardProps), so property lengths are trusted;
+// anything unexpected returns -1 rather than risk a bad rewrite.
+func mqttPropValueOffset(props []byte, target byte) int {
 	plen, n := mqttVarIntFromSlice(props)
 	if n < 0 {
 		return -1
@@ -1711,12 +1740,8 @@ func mqttMessageExpiryOffset(props []byte) int {
 	for i < end {
 		prop := props[i]
 		i++
+		valueOff := i
 		switch prop {
-		case mqttPropMessageExpiry:
-			if i+4 > end {
-				return -1
-			}
-			return i
 		case mqttPropPayloadFormat, mqttPropRequestProblemInfo, mqttPropRequestResponseInfo,
 			mqttPropMaxQoS, mqttPropRetainAvailable, mqttPropWildcardSubAvailable,
 			mqttPropSubIDAvailable, mqttPropSharedSubAvailable:
@@ -1724,7 +1749,7 @@ func mqttMessageExpiryOffset(props []byte) int {
 		case mqttPropServerKeepAlive, mqttPropReceiveMaximum, mqttPropTopicAliasMax,
 			mqttPropTopicAlias:
 			i += 2
-		case mqttPropSessionExpiry, mqttPropWillDelay, mqttPropMaxPacketSize:
+		case mqttPropMessageExpiry, mqttPropSessionExpiry, mqttPropWillDelay, mqttPropMaxPacketSize:
 			i += 4
 		case mqttPropContentType, mqttPropResponseTopic, mqttPropAssignedClientID,
 			mqttPropAuthMethod, mqttPropResponseInfo, mqttPropServerReference,
@@ -1753,6 +1778,9 @@ func mqttMessageExpiryOffset(props []byte) int {
 		if i > end {
 			return -1
 		}
+		if prop == target {
+			return valueOff
+		}
 	}
 	return -1
 }
@@ -1762,7 +1790,7 @@ func mqttMessageExpiryOffset(props []byte) int {
 // differ semantically: an absent property means the message never expires,
 // whereas an explicit value of 0 means it expires immediately. Spec5 [3.3.2.3.3].
 func mqttMessageExpiry(props []byte) (uint32, bool) {
-	off := mqttMessageExpiryOffset(props)
+	off := mqttPropValueOffset(props, mqttPropMessageExpiry)
 	if off < 0 {
 		return 0, false
 	}
@@ -1790,7 +1818,7 @@ func mqttMessageExpiryTTL(props []byte) uint32 {
 // Message Expiry Interval, props is returned unchanged (no copy), preserving the
 // verbatim fast path for messages that do not use expiry. Spec5 [3.3.2.3.3].
 func mqttSetMessageExpiry(props []byte, rem uint32) []byte {
-	off := mqttMessageExpiryOffset(props)
+	off := mqttPropValueOffset(props, mqttPropMessageExpiry)
 	if off < 0 {
 		return props
 	}
@@ -1811,7 +1839,7 @@ func mqttSetMessageExpiry(props []byte, rem uint32) []byte {
 // as with JetStream per-message TTLs, accuracy across a cluster assumes
 // synchronized clocks.
 func mqttForwardExpiry(props []byte, storeUnixNano int64) (out []byte, expired bool) {
-	off := mqttMessageExpiryOffset(props)
+	off := mqttPropValueOffset(props, mqttPropMessageExpiry)
 	if off < 0 {
 		return props, false
 	}
@@ -1883,6 +1911,33 @@ func mqttInjectSubID(props []byte, id int) []byte {
 	w.WriteVarInt(newLen)
 	w.Write(body)
 	w.Write(sb)
+	return w.Bytes()
+}
+
+// mqttStripTopicAlias returns a copy of the raw properties block (varint length
+// prefix + body, the pp.props format) with the Topic Alias property (id +
+// 2-byte value) removed and the length prefix re-encoded. It returns props
+// unchanged when no alias is present, and nil when the alias was the only
+// property (an empty block is never captured). Topic aliases are hop-local and
+// MUST NOT be forwarded to subscribers or into retained storage. The result is
+// always a fresh allocation, which doubles as the required copy out of the
+// transient reader buffer. Spec5 [3.3.2.3.4].
+func mqttStripTopicAlias(props []byte) []byte {
+	off := mqttPropValueOffset(props, mqttPropTopicAlias)
+	if off < 0 {
+		return props
+	}
+	_, n := mqttVarIntFromSlice(props)
+	// Drop the 3 alias bytes: the id byte at off-1 and its 2-byte value. The
+	// body is everything after the length prefix minus those 3 bytes.
+	newLen := len(props) - n - 3
+	if newLen <= 0 {
+		return nil
+	}
+	w := newMQTTWriter(5 + newLen)
+	w.WriteVarInt(newLen)
+	w.Write(props[n : off-1])
+	w.Write(props[off+2:])
 	return w.Bytes()
 }
 
@@ -4873,6 +4928,21 @@ func (as *mqttAccountSessionManager) setCachedRetainedMsg(subject string, rm *mq
 //
 //////////////////////////////////////////////////////////////////////////////
 
+// mqttTopicAliasMax returns the effective MQTT 5.0 Topic Alias Maximum from
+// Options: 0 (unset) => mqttDefaultTopicAliasMax, negative (explicitly
+// disabled) => 0, otherwise the configured value. Spec5 [3.2.2.3.2].
+func mqttTopicAliasMax(opts *Options) uint16 {
+	tam := opts.MQTT.TopicAliasMaximum
+	switch {
+	case tam == 0:
+		return mqttDefaultTopicAliasMax
+	case tam < 0:
+		return 0
+	default:
+		return uint16(tam)
+	}
+}
+
 // Returns a new mqttSession object with max ack pending set based on
 // option or use mqttDefaultMaxAckPending if no option set.
 func mqttSessionCreate(jsa *mqttJSA, id, idHash string, seq uint64, opts *Options) *mqttSession {
@@ -5972,6 +6042,15 @@ CHECK:
 		c.mqtt.maxPacketSize = cp.props.maxPacketSize
 	}
 
+	// MQTT 5.0 Topic Alias Maximum (inbound-only): resolve the server-side cap
+	// for this connection; advertised in the CONNACK below. The client's own
+	// Topic Alias Maximum (cp.props.topicAliasMax) is intentionally not consumed:
+	// it caps aliases the server would send, and this server never sends any.
+	// Spec5 [3.2.2.3.2].
+	if c.mqtt.proto == mqttProtoLevel5 {
+		c.mqtt.topicAliasMax = mqttTopicAliasMax(s.getOpts())
+	}
+
 	// We would need to save only if it did not exist previously, but we save
 	// always in case we are running in cluster mode. This will notify other
 	// running servers that this session is being used.
@@ -6076,13 +6155,19 @@ func (c *client) mqttEnqueueConnAckV5(rc, sp byte) {
 	//     this property: spec5 [3.2.2.3.4] allows only 0 or 1.)
 	//   - Retain Available: absent => retained messages supported.
 	//   - Wildcard Subscription Available: absent => wildcards supported.
-	//   - Topic Alias Maximum: absent => 0, i.e. we accept no topic aliases.
 	// We only emit the properties whose truthful value differs from the default.
 	// Shared subscriptions are not implemented, so advertise them as unavailable.
 	// Subscription identifiers are supported (absent => available), so we emit
 	// nothing for them. Spec5 [3.2.2.3].
 	props.sharedSubAvail = 0
 	props.present[mqttPropSharedSubAvailable] = true
+	// Topic Alias Maximum: advertise the (configured) number of inbound topic
+	// aliases we accept. Omitted when disabled: absent => 0, i.e. the client
+	// must not send any alias. Spec5 [3.2.2.3.2].
+	if tam := c.mqtt.topicAliasMax; tam > 0 {
+		props.topicAliasMax = tam
+		props.present[mqttPropTopicAliasMax] = true
+	}
 	// We intentionally do NOT advertise Maximum Packet Size. The natural
 	// candidate (Options.MaxPayload) is not the value the server actually
 	// enforces: an inbound PUBLISH is re-encoded as a NATS message with extra
@@ -6137,6 +6222,8 @@ func mqttDisconnectReasonFromErr(err error) byte {
 	case errors.Is(err, errMQTTUnknownProperty), errors.Is(err, errMQTTPropertyNotAllowed),
 		errors.Is(err, errMQTTDuplicateProperty), errors.Is(err, errMQTTProtocolError):
 		return mqttReasonProtocolError
+	case errors.Is(err, errMQTTTopicAliasInvalid):
+		return mqttReasonTopicAliasInvalid
 	}
 	return mqttReasonUnspecifiedError
 }
@@ -6286,37 +6373,12 @@ func (c *client) mqttParsePub(r *mqttReader, pl int, pp *mqttPublish, hasMapping
 	if err != nil {
 		return err
 	}
-	if len(pp.topic) == 0 {
+	v5 := c.mqtt.proto == mqttProtoLevel5
+	// For v5 an empty topic is legal when a previously bound Topic Alias
+	// resolves it, so defer the check until after properties are read. 3.1.1
+	// has no aliases, so reject an empty topic immediately.
+	if len(pp.topic) == 0 && !v5 {
 		return errMQTTTopicIsEmpty
-	}
-	if err := mqttValidateTopic(pp.topic, "topic"); err != nil {
-		return err
-	}
-	// Convert the topic to a NATS subject. This call will also check that
-	// there is no MQTT wildcards (Spec [MQTT-3.3.2-2] and [MQTT-4.7.1-1])
-	// Note that this may not result in a copy if there is no conversion.
-	// It is good because after the message is processed we won't have a
-	// reference to the buffer and we save a copy.
-	pp.subject, err = mqttTopicToNATSPubSubject(pp.topic)
-	if err != nil {
-		return err
-	}
-
-	// Check for subject mapping.
-	if hasMappings {
-		// For selectMappedSubject to work, we need to have c.pa.subject set.
-		// If there is a change, c.pa.mapped will be set after the call.
-		c.pa.subject = pp.subject
-		if changed := c.selectMappedSubject(); changed {
-			// We need to keep track of the NATS subject/mapped in the `pp` structure.
-			pp.subject = c.pa.subject
-			pp.mapped = c.pa.mapped
-			// We also now need to map the original MQTT topic to the new topic
-			// based on the new subject.
-			pp.topic = natsSubjectToMQTTTopic(pp.subject)
-		}
-		// Reset those now.
-		c.pa.subject, c.pa.mapped = nil, nil
 	}
 
 	if qos > 0 {
@@ -6332,33 +6394,92 @@ func (c *client) mqttParsePub(r *mqttReader, pl int, pp *mqttPublish, hasMapping
 	}
 
 	// MQTT 5.0: PUBLISH properties follow the packet identifier (or topic, for
-	// QoS 0) and precede the payload. Spec5 [3.3.2.3]. We parse/validate them
-	// but do not act on them yet (foundation). Reading here also advances the
-	// reader so the payload-size computation below is correct.
-	if c.mqtt.proto == mqttProtoLevel5 {
-		// Capture the raw properties block (length prefix + body) so it can be
-		// forwarded verbatim to v5 subscribers. An inbound client PUBLISH can
-		// only carry forwardable properties (Topic Alias is rejected below;
-		// Subscription Identifier is server->client only), so verbatim re-emit
-		// is spec-correct. Spec5 [3.3.2.3].
+	// QoS 0) and precede the payload. Spec5 [3.3.2.3]. Reading here also
+	// advances the reader so the payload-size computation below is correct.
+	// pp is reused across packets (c.mqtt.pp), so pp.props is assigned on every
+	// path below, never left carrying the previous packet's block.
+	pp.props = nil
+	if v5 {
 		propStart := r.pos
 		props, perr := r.readProperties(mqttPacketPub)
 		if perr != nil {
 			return perr
 		}
-		// Topic aliases are not implemented; we advertise TopicAliasMaximum=0
-		// in CONNACK, so a compliant client never sends one. Reject any alias
-		// rather than risk mis-delivery. Spec5 [3.3.2.3.4].
+		// Raw block (length prefix + body) as received: forwarded verbatim to v5
+		// subscribers unless it carries a Topic Alias, which is hop-local and
+		// stripped below. An inbound client PUBLISH can otherwise only carry
+		// forwardable properties (Subscription Identifier is server->client
+		// only), so verbatim re-emit is spec-correct. Spec5 [3.3.2.3].
+		raw := r.buf[propStart:r.pos]
 		if props != nil && props.present[mqttPropTopicAlias] {
-			return fmt.Errorf("MQTT topic alias is not supported")
-		}
-		// Keep the block only if it carries something (more than the single
-		// zero length byte). Copy: the reader buffer is transient.
-		if raw := r.buf[propStart:r.pos]; len(raw) > 1 {
-			pp.props = copyBytes(raw)
+			// A Topic Alias of 0, or above the maximum we advertised, is
+			// invalid; this also covers the disabled case (maximum 0). Spec5
+			// [3.3.2.3.4].
+			alias := props.topicAlias
+			if alias == 0 || alias > c.mqtt.topicAliasMax {
+				return fmt.Errorf("%w: %d (maximum %d)", errMQTTTopicAliasInvalid, alias, c.mqtt.topicAliasMax)
+			}
+			if len(pp.topic) > 0 {
+				// Bind (or re-bind, which the spec allows) the alias to this
+				// topic. Copy: the reader buffer is transient.
+				if c.mqtt.topicAliases == nil {
+					c.mqtt.topicAliases = make(map[uint16][]byte)
+				}
+				c.mqtt.topicAliases[alias] = copyBytes(pp.topic)
+			} else {
+				// Alias-only PUBLISH: resolve to the bound topic. An unknown
+				// alias with an empty topic is a Protocol Error. Spec5 [3.3.2.3.4].
+				topic, ok := c.mqtt.topicAliases[alias]
+				if !ok {
+					return fmt.Errorf("%w: unknown topic alias %d", errMQTTProtocolError, alias)
+				}
+				pp.topic = topic
+			}
+			// Strip the alias so it is never forwarded or stored (hop-local).
+			pp.props = mqttStripTopicAlias(raw)
 		} else {
-			pp.props = nil
+			if len(pp.topic) == 0 {
+				return errMQTTTopicIsEmpty
+			}
+			// Keep the block only if it carries something (more than the single
+			// zero length byte). Copy: the reader buffer is transient.
+			if len(raw) > 1 {
+				pp.props = copyBytes(raw)
+			}
 		}
+	}
+
+	if err := mqttValidateTopic(pp.topic, "topic"); err != nil {
+		return err
+	}
+	// Convert the topic to a NATS subject. This call will also check that
+	// there is no MQTT wildcards (Spec [MQTT-3.3.2-2] and [MQTT-4.7.1-1])
+	// Note that this may not result in a copy if there is no conversion.
+	// It is good because after the message is processed we won't have a
+	// reference to the buffer and we save a copy.
+	pp.subject, err = mqttTopicToNATSPubSubject(pp.topic)
+	if err != nil {
+		return err
+	}
+
+	// Check for subject mapping. pp is reused across packets, so reset mapped
+	// unconditionally: it is only set when a mapping applies, and a stale value
+	// from a prior mapped publish must not leak into this one.
+	pp.mapped = nil
+	if hasMappings {
+		// For selectMappedSubject to work, we need to have c.pa.subject set.
+		// If there is a change, c.pa.mapped will be set after the call.
+		c.pa.subject = pp.subject
+		if changed := c.selectMappedSubject(); changed {
+			// We need to keep track of the NATS subject/mapped in the `pp` structure.
+			pp.subject = c.pa.subject
+			pp.mapped = c.pa.mapped
+			// We also now need to map the original MQTT topic to the new topic
+			// based on the new subject.
+			pp.topic = natsSubjectToMQTTTopic(pp.subject)
+		}
+		// Reset those now.
+		c.pa.subject, c.pa.mapped = nil, nil
 	}
 
 	// The message payload will be the total packet length minus

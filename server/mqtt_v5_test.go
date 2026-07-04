@@ -3063,7 +3063,7 @@ func mqttV5PropsWithExpiry(me uint32) []byte {
 func TestMQTTv5MessageExpiryPropsHelpers(t *testing.T) {
 	block := mqttV5PropsWithExpiry(100)
 
-	off := mqttMessageExpiryOffset(block)
+	off := mqttPropValueOffset(block, mqttPropMessageExpiry)
 	if off < 0 {
 		t.Fatal("expected to find the message expiry offset")
 	}
@@ -3108,7 +3108,7 @@ func TestMQTTv5MessageExpiryPropsHelpers(t *testing.T) {
 	// A block with no Message Expiry Interval: nothing found, no-op rewrite, and
 	// no TTL. Absent must be distinguishable from an explicit 0.
 	noexp := testMQTTv5PubPropsBlock()
-	if mqttMessageExpiryOffset(noexp) != -1 {
+	if mqttPropValueOffset(noexp, mqttPropMessageExpiry) != -1 {
 		t.Fatal("did not expect a message expiry offset")
 	}
 	if got, ok := mqttMessageExpiry(noexp); ok || got != 0 {
@@ -4874,6 +4874,424 @@ func TestMQTTv5InjectSubID(t *testing.T) {
 	} {
 		if got := mqttInjectSubID(test.in, test.id); !bytes.Equal(got, test.in) {
 			t.Fatalf("%s: expected props unchanged, got %v (in %v)", test.name, got, test.in)
+		}
+	}
+}
+
+// ---- Topic Alias (Spec5 [3.3.2.3.4]) ----
+
+// mqttTopicAliasProp is the Topic Alias property bytes (id + 2-byte value).
+func mqttTopicAliasProp(alias uint16) []byte {
+	return []byte{mqttPropTopicAlias, byte(alias >> 8), byte(alias)}
+}
+
+// testMQTTSendPubV5Raw writes a v5 PUBLISH with the given raw properties block
+// (which must include its length prefix) and does NOT read any acknowledgement.
+// Suitable for QoS 0 publishes and for error cases that expect a DISCONNECT.
+func testMQTTSendPubV5Raw(t testing.TB, c net.Conn, qos byte, pi uint16, retain bool, topic string, props, payload []byte) {
+	t.Helper()
+	flags := qos << 1
+	if retain {
+		flags |= mqttPubFlagRetain
+	}
+	vh := newMQTTWriter(0)
+	vh.WriteBytes([]byte(topic))
+	if qos > 0 {
+		vh.WriteUint16(pi)
+	}
+	if len(props) > 0 {
+		vh.Write(props)
+	} else {
+		vh.WriteVarInt(0)
+	}
+	vh.Write(payload)
+	w := newMQTTWriter(0)
+	w.WriteByte(mqttPacketPub | flags)
+	w.WriteVarInt(vh.Len())
+	w.Write(vh.Bytes())
+	if _, err := testMQTTWrite(c, w.Bytes()); err != nil {
+		t.Fatalf("Error writing PUBLISH: %v", err)
+	}
+}
+
+// testMQTTReadDisconnectReason reads a v5 DISCONNECT and returns its reason code.
+func testMQTTReadDisconnectReason(t testing.TB, r *mqttReader) byte {
+	t.Helper()
+	b, _ := testMQTTReadPacket(t, r)
+	if pt := b & mqttPacketMask; pt != mqttPacketDisconnect {
+		t.Fatalf("Expected DISCONNECT (%x), got %x", mqttPacketDisconnect, pt)
+	}
+	reason, err := r.readByte("disconnect reason")
+	if err != nil {
+		t.Fatalf("Error reading disconnect reason: %v", err)
+	}
+	return reason
+}
+
+// The advertised Topic Alias Maximum in the CONNACK reflects the configured
+// option: default when unset, the explicit value otherwise, and omitted (absent
+// => 0) when disabled.
+func TestMQTTv5TopicAliasMaxAdvertised(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		opt    int
+		expSet bool
+		expVal uint16
+	}{
+		{"default", 0, true, mqttDefaultTopicAliasMax},
+		{"explicit", 5, true, 5},
+		{"disabled", -1, false, 0},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			o := testMQTTDefaultOptionsV5()
+			o.MQTT.TopicAliasMaximum = test.opt
+			s := testMQTTRunServer(t, o)
+			defer testMQTTShutdownServer(s)
+
+			c, r := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "tam", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
+			defer c.Close()
+			_, reason, props := testMQTTReadConnAckV5(t, r)
+			if reason != mqttReasonSuccess {
+				t.Fatalf("Expected success, got 0x%x", reason)
+			}
+			if props.present[mqttPropTopicAliasMax] != test.expSet {
+				t.Fatalf("Topic Alias Maximum present=%v, want %v", props.present[mqttPropTopicAliasMax], test.expSet)
+			}
+			if test.expSet && props.topicAliasMax != test.expVal {
+				t.Fatalf("Topic Alias Maximum=%d, want %d", props.topicAliasMax, test.expVal)
+			}
+		})
+	}
+}
+
+// A client binds a Topic Alias with a full-topic PUBLISH, then publishes with an
+// empty topic + the alias; the server resolves it and delivers on the bound
+// topic. Exercised at QoS 0 and QoS 1.
+func TestMQTTv5TopicAliasPublish(t *testing.T) {
+	for _, qos := range []byte{0, 1} {
+		t.Run(fmt.Sprintf("qos%d", qos), func(t *testing.T) {
+			o := testMQTTDefaultOptionsV5()
+			s := testMQTTRunServer(t, o)
+			defer testMQTTShutdownServer(s)
+
+			topic := fmt.Sprintf("ta/q%d", qos)
+			cs, rs := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "tasub", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
+			defer cs.Close()
+			testMQTTReadConnAckV5(t, rs)
+			testMQTTSubV5(t, cs, rs, 1, []mqttV5SubFilter{{topic: topic, opts: 1}})
+			testMQTTFlush(t, cs, nil, rs)
+
+			cp, rp := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "tapub", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
+			defer cp.Close()
+			testMQTTReadConnAckV5(t, rp)
+
+			// Bind alias 1 -> topic, then publish alias-only with an empty topic.
+			alias := mqttMakePropsBlock(mqttTopicAliasProp(1))
+			testMQTTPubV5Props(t, cp, rp, qos, false, 1, topic, []byte("first"), alias)
+			testMQTTPubV5Props(t, cp, rp, qos, false, 2, "", []byte("second"), alias)
+
+			// Both are delivered on the resolved topic with no alias leaked.
+			for _, exp := range []string{"first", "second"} {
+				props := testMQTTReadPubV5Props(t, cs, rs, topic, []byte(exp))
+				if props != nil && props.present[mqttPropTopicAlias] {
+					t.Fatalf("Topic Alias leaked to subscriber for %q", exp)
+				}
+			}
+		})
+	}
+}
+
+// Invalid Topic Alias values close the connection with the proper reason: 0 or
+// above the advertised maximum => 0x94 (Topic Alias invalid); an empty topic
+// with an unbound alias => 0x82 (Protocol Error).
+func TestMQTTv5TopicAliasErrors(t *testing.T) {
+	o := testMQTTDefaultOptionsV5()
+	o.MQTT.TopicAliasMaximum = 5
+	s := testMQTTRunServer(t, o)
+	defer testMQTTShutdownServer(s)
+
+	for _, test := range []struct {
+		name   string
+		topic  string
+		alias  uint16
+		reason byte
+	}{
+		{"alias zero", "foo", 0, mqttReasonTopicAliasInvalid},
+		{"alias exceeds max", "foo", 6, mqttReasonTopicAliasInvalid},
+		{"unknown alias", "", 3, mqttReasonProtocolError},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			c, r := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "tae", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
+			defer c.Close()
+			testMQTTReadConnAckV5(t, r)
+
+			props := mqttMakePropsBlock(mqttTopicAliasProp(test.alias))
+			testMQTTSendPubV5Raw(t, c, 0, 0, false, test.topic, props, []byte("m"))
+			if reason := testMQTTReadDisconnectReason(t, r); reason != test.reason {
+				t.Fatalf("Expected reason 0x%x, got 0x%x", test.reason, reason)
+			}
+		})
+	}
+}
+
+// Re-binding an existing alias to a new topic overwrites the previous binding;
+// a subsequent alias-only PUBLISH follows the new topic. Spec5 [3.3.2.3.4].
+func TestMQTTv5TopicAliasRemap(t *testing.T) {
+	o := testMQTTDefaultOptionsV5()
+	s := testMQTTRunServer(t, o)
+	defer testMQTTShutdownServer(s)
+
+	cs, rs := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "rmsub", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
+	defer cs.Close()
+	testMQTTReadConnAckV5(t, rs)
+	testMQTTSubV5(t, cs, rs, 1, []mqttV5SubFilter{{topic: "rm/#", opts: 0}})
+	testMQTTFlush(t, cs, nil, rs)
+
+	cp, rp := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "rmpub", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
+	defer cp.Close()
+	testMQTTReadConnAckV5(t, rp)
+
+	alias := mqttMakePropsBlock(mqttTopicAliasProp(1))
+	testMQTTPubV5Props(t, cp, rp, 0, false, 0, "rm/a", []byte("to-a"), alias)
+	testMQTTReadPubV5Props(t, cs, rs, "rm/a", []byte("to-a"))
+
+	// Re-bind alias 1 to rm/b, then publish alias-only.
+	testMQTTPubV5Props(t, cp, rp, 0, false, 0, "rm/b", []byte("bind-b"), alias)
+	testMQTTReadPubV5Props(t, cs, rs, "rm/b", []byte("bind-b"))
+	testMQTTPubV5Props(t, cp, rp, 0, false, 0, "", []byte("to-b"), alias)
+	testMQTTReadPubV5Props(t, cs, rs, "rm/b", []byte("to-b"))
+}
+
+// The Topic Alias property is stripped before a PUBLISH is forwarded to a
+// subscriber: other properties survive, and when the alias was the only property
+// the subscriber receives an empty block.
+func TestMQTTv5TopicAliasStrippedOnForward(t *testing.T) {
+	o := testMQTTDefaultOptionsV5()
+	s := testMQTTRunServer(t, o)
+	defer testMQTTShutdownServer(s)
+
+	cs, rs := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "stsub", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
+	defer cs.Close()
+	testMQTTReadConnAckV5(t, rs)
+	testMQTTSubV5(t, cs, rs, 1, []mqttV5SubFilter{{topic: "st/#", opts: 1}})
+	testMQTTFlush(t, cs, nil, rs)
+
+	cp, rp := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "stpub", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
+	defer cp.Close()
+	testMQTTReadConnAckV5(t, rp)
+
+	// Alias interleaved with the standard forwardable properties.
+	body := newMQTTWriter(0)
+	body.Write(mqttTopicAliasProp(7))
+	body.WriteByte(mqttPropPayloadFormat)
+	body.WriteByte(1)
+	body.WriteByte(mqttPropContentType)
+	body.WriteString("application/json")
+	body.WriteByte(mqttPropResponseTopic)
+	body.WriteString("resp/topic")
+	body.WriteByte(mqttPropCorrelationData)
+	body.WriteBytes([]byte("corr-1"))
+	body.WriteByte(mqttPropUserProperty)
+	body.WriteString("k1")
+	body.WriteString("v1")
+	body.WriteByte(mqttPropUserProperty)
+	body.WriteString("k2")
+	body.WriteString("v2")
+	testMQTTPubV5Props(t, cp, rp, 1, false, 1, "st/a", []byte("payload"), mqttMakePropsBlock(body.Bytes()))
+
+	props := testMQTTReadPubV5Props(t, cs, rs, "st/a", []byte("payload"))
+	if props != nil && props.present[mqttPropTopicAlias] {
+		t.Fatal("Topic Alias leaked to subscriber")
+	}
+	testMQTTCheckFwdProps(t, props)
+
+	// Alias-only: the subscriber must receive an empty properties block.
+	aliasOnly := mqttMakePropsBlock(mqttTopicAliasProp(7))
+	testMQTTPubV5Props(t, cp, rp, 1, false, 2, "st/b", []byte("bare"), aliasOnly)
+	if props := testMQTTReadPubV5Props(t, cs, rs, "st/b", []byte("bare")); props != nil {
+		t.Fatalf("Expected empty properties, got %+v", props)
+	}
+}
+
+// A retained PUBLISH carrying a Topic Alias stores the message alias-free: a
+// late subscriber gets the retained message with the alias stripped, and an
+// alias-only retained PUBLISH retains under the resolved topic.
+func TestMQTTv5TopicAliasStrippedInRetained(t *testing.T) {
+	o := testMQTTDefaultOptionsV5()
+	s := testMQTTRunServer(t, o)
+	defer testMQTTShutdownServer(s)
+
+	cp, rp := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "rtpub", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
+	defer cp.Close()
+	testMQTTReadConnAckV5(t, rp)
+
+	// Bind alias 1 to rt/a with a retained, property-bearing message.
+	body := newMQTTWriter(0)
+	body.Write(mqttTopicAliasProp(1))
+	body.WriteByte(mqttPropContentType)
+	body.WriteString("application/json")
+	testMQTTPubV5Props(t, cp, rp, 1, true, 1, "rt/a", []byte("kept"), mqttMakePropsBlock(body.Bytes()))
+
+	// Alias-only retained publish retains under the resolved topic rt/b... first
+	// bind alias 2 -> rt/b (non-retained), then retain alias-only.
+	alias2 := mqttMakePropsBlock(mqttTopicAliasProp(2))
+	testMQTTPubV5Props(t, cp, rp, 1, false, 2, "rt/b", []byte("ignore"), alias2)
+	testMQTTPubV5Props(t, cp, rp, 1, true, 3, "", []byte("kept-b"), alias2)
+
+	// A late subscriber receives both retained messages, alias-free.
+	cs, rs := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "rtsub", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
+	defer cs.Close()
+	testMQTTReadConnAckV5(t, rs)
+	testMQTTSubV5(t, cs, rs, 1, []mqttV5SubFilter{{topic: "rt/#", opts: 1}})
+
+	got := map[string]string{}
+	for i := 0; i < 2; i++ {
+		b, pl := testMQTTReadPacket(t, rs)
+		if pt := b & mqttPacketMask; pt != mqttPacketPub {
+			t.Fatalf("Expected retained PUBLISH, got %x", pt)
+		}
+		start := rs.pos
+		topic, _ := rs.readBytes("topic", false)
+		pi, _ := rs.readUint16("pi")
+		props, err := rs.readProperties(mqttPropsContextPubOut)
+		if err != nil {
+			t.Fatalf("Error reading retained props: %v", err)
+		}
+		if props != nil && props.present[mqttPropTopicAlias] {
+			t.Fatalf("Topic Alias leaked in retained message for %q", topic)
+		}
+		payload := rs.buf[rs.pos : start+pl]
+		got[string(topic)] = string(payload)
+		rs.pos = start + pl
+		pa := [4]byte{mqttPacketPubAck, 0x2, byte(pi >> 8), byte(pi)}
+		testMQTTWrite(cs, pa[:])
+	}
+	if got["rt/a"] != "kept" || got["rt/b"] != "kept-b" {
+		t.Fatalf("Unexpected retained delivery: %+v", got)
+	}
+}
+
+// When topic aliases are disabled (TopicAliasMaximum -1), the CONNACK omits the
+// property and any alias-bearing PUBLISH is rejected with 0x94.
+func TestMQTTv5TopicAliasDisabled(t *testing.T) {
+	o := testMQTTDefaultOptionsV5()
+	o.MQTT.TopicAliasMaximum = -1
+	s := testMQTTRunServer(t, o)
+	defer testMQTTShutdownServer(s)
+
+	c, r := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "dis", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
+	defer c.Close()
+	_, _, props := testMQTTReadConnAckV5(t, r)
+	if props.present[mqttPropTopicAliasMax] {
+		t.Fatal("Topic Alias Maximum must be omitted when disabled")
+	}
+	testMQTTSendPubV5Raw(t, c, 0, 0, false, "foo", mqttMakePropsBlock(mqttTopicAliasProp(1)), []byte("m"))
+	if reason := testMQTTReadDisconnectReason(t, r); reason != mqttReasonTopicAliasInvalid {
+		t.Fatalf("Expected 0x%x, got 0x%x", mqttReasonTopicAliasInvalid, reason)
+	}
+}
+
+// Topic aliases are connection-scoped: after a reconnect (even with the session
+// present), a previously bound alias is unknown, so an alias-only PUBLISH is a
+// Protocol Error.
+func TestMQTTv5TopicAliasConnectionScoped(t *testing.T) {
+	o := testMQTTDefaultOptionsV5()
+	s := testMQTTRunServer(t, o)
+	defer testMQTTShutdownServer(s)
+
+	ci := &mqttV5ConnInfo{clientID: "scoped", cleanStart: false}
+	c, r := testMQTTConnectV5(t, ci, o.MQTT.Host, o.MQTT.Port)
+	testMQTTReadConnAckV5(t, r)
+	alias := mqttMakePropsBlock(mqttTopicAliasProp(1))
+	testMQTTPubV5Props(t, c, r, 1, false, 1, "sc/a", []byte("m"), alias)
+	c.Close()
+
+	// Reconnect with the same client ID; the session may be present, but the
+	// alias map starts empty.
+	c2, r2 := testMQTTConnectV5(t, ci, o.MQTT.Host, o.MQTT.Port)
+	defer c2.Close()
+	testMQTTReadConnAckV5(t, r2)
+	testMQTTSendPubV5Raw(t, c2, 0, 0, false, "", alias, []byte("m"))
+	if reason := testMQTTReadDisconnectReason(t, r2); reason != mqttReasonProtocolError {
+		t.Fatalf("Expected 0x%x, got 0x%x", mqttReasonProtocolError, reason)
+	}
+}
+
+// mqttStripTopicAlias removes the Topic Alias property and re-encodes the length
+// prefix, including where stripping the 3 alias bytes shrinks the prefix across
+// the 127/128-byte varint boundary. Every other property must survive intact.
+func TestMQTTv5StripTopicAlias(t *testing.T) {
+	// A block with no alias is returned unchanged.
+	noAlias := testMQTTv5PubPropsBlock()
+	if got := mqttStripTopicAlias(noAlias); &got[0] != &noAlias[0] {
+		t.Fatal("Expected the same slice back when there is no alias")
+	}
+	// A block whose only property is the alias strips to nil.
+	if got := mqttStripTopicAlias(mqttMakePropsBlock(mqttTopicAliasProp(1))); got != nil {
+		t.Fatalf("Expected nil for an alias-only block, got %v", got)
+	}
+
+	// padUserProp appends a User Property "p"/value of valueLen bytes; its total
+	// wire size is id(1) + 2 + len("p") + 2 + valueLen = 6 + valueLen bytes.
+	padUserProp := func(w *mqttWriter, valueLen int) {
+		w.WriteByte(mqttPropUserProperty)
+		w.WriteString("p")
+		w.WriteString(strings.Repeat("x", valueLen))
+	}
+
+	// Build blocks where the alias sits first/middle/last, and where the stripped
+	// body length lands on 127/128/129 so the varint prefix must re-encode from 2
+	// bytes to 1 at the boundary. In the middle case a 2-byte Payload Format
+	// property precedes the alias.
+	for _, pos := range []string{"first", "middle", "last"} {
+		for _, strippedBodyLen := range []int{127, 128, 129, 200} {
+			t.Run(fmt.Sprintf("%s-len%d", pos, strippedBodyLen), func(t *testing.T) {
+				// Surviving body is the pad User Property (6+valueLen) plus, for the
+				// middle case, a 2-byte Payload Format property. Solve for valueLen.
+				valueLen := strippedBodyLen - 6
+				if pos == "middle" {
+					valueLen -= 2
+				}
+				if valueLen < 0 {
+					t.Skipf("cannot build a body of %d bytes", strippedBodyLen)
+				}
+				body := newMQTTWriter(0)
+				switch pos {
+				case "first":
+					body.Write(mqttTopicAliasProp(9))
+					padUserProp(body, valueLen)
+				case "middle":
+					body.WriteByte(mqttPropPayloadFormat)
+					body.WriteByte(1)
+					body.Write(mqttTopicAliasProp(9))
+					padUserProp(body, valueLen)
+				case "last":
+					padUserProp(body, valueLen)
+					body.Write(mqttTopicAliasProp(9))
+				}
+				block := mqttMakePropsBlock(body.Bytes())
+				out := mqttStripTopicAlias(block)
+				if out == nil {
+					t.Fatal("Expected a non-nil stripped block")
+				}
+				// The stripped block must re-parse cleanly with no alias and the
+				// User Property intact.
+				r := &mqttReader{}
+				r.reset(out)
+				p, err := r.readProperties(mqttPacketPub)
+				if err != nil || r.hasMore() {
+					t.Fatalf("re-parse stripped block: err=%v hasMore=%v", err, r.hasMore())
+				}
+				if p != nil && p.present[mqttPropTopicAlias] {
+					t.Fatal("alias survived stripping")
+				}
+				if len(p.user) != 1 || p.user[0].key != "p" || p.user[0].value != strings.Repeat("x", valueLen) {
+					t.Fatalf("user property not preserved: %+v", p.user)
+				}
+				if pos == "middle" && (!p.present[mqttPropPayloadFormat] || p.payloadFormat != 1) {
+					t.Fatal("payload format lost")
+				}
+			})
 		}
 	}
 }
