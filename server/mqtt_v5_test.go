@@ -6656,3 +6656,680 @@ func TestMQTTv5StripTopicAlias(t *testing.T) {
 		}
 	}
 }
+
+// ---- Outbound Topic Alias (server -> client, Spec5 [3.3.2.3.4]) ----
+
+// mqttV5TopicAliasMaxProps builds a CONNECT properties body advertising a Topic
+// Alias Maximum, i.e. how many aliases the client will accept from the server.
+func mqttV5TopicAliasMaxProps(max uint16) []byte {
+	return []byte{mqttPropTopicAliasMax, byte(max >> 8), byte(max)}
+}
+
+// testMQTTReadOutPub reads a delivered v5 PUBLISH without acknowledging it and
+// returns the raw flags byte, the (possibly empty) wire topic, the Topic Alias
+// (0 = none), the packet identifier and the payload.
+func testMQTTReadOutPub(t testing.TB, r *mqttReader) (flags byte, wireTopic string, alias, pi uint16, payload []byte) {
+	t.Helper()
+	b, pl := testMQTTReadPacket(t, r)
+	if pt := b & mqttPacketMask; pt != mqttPacketPub {
+		t.Fatalf("Expected PUBLISH (%x), got %x", mqttPacketPub, pt)
+	}
+	flags = b & mqttPacketFlagMask
+	start := r.pos
+	qos := mqttGetQoS(flags)
+	topic, err := r.readBytes("topic", false)
+	if err != nil {
+		t.Fatalf("Error reading topic: %v", err)
+	}
+	if qos > 0 {
+		if pi, err = r.readUint16("pi"); err != nil {
+			t.Fatalf("Error reading pi: %v", err)
+		}
+	}
+	props, err := r.readProperties(mqttPropsContextPubOut)
+	if err != nil {
+		t.Fatalf("Error reading PUBLISH properties: %v", err)
+	}
+	if props != nil && props.present[mqttPropTopicAlias] {
+		alias = props.topicAlias
+	}
+	payloadLen := pl - (r.pos - start)
+	if payloadLen < 0 || r.pos+payloadLen > len(r.buf) {
+		t.Fatalf("Invalid payload length %d", payloadLen)
+	}
+	payload = append([]byte(nil), r.buf[r.pos:r.pos+payloadLen]...)
+	r.pos += payloadLen
+	return flags, string(topic), alias, pi, payload
+}
+
+// testMQTTSendPubAck sends a v5 PUBACK for the given packet identifier.
+func testMQTTSendPubAck(t testing.TB, c net.Conn, pi uint16) {
+	t.Helper()
+	pa := [4]byte{mqttPacketPubAck, 0x2, byte(pi >> 8), byte(pi)}
+	if _, err := testMQTTWrite(c, pa[:]); err != nil {
+		t.Fatalf("Error writing PUBACK: %v", err)
+	}
+}
+
+// The server binds a Topic Alias on the first delivery of a topic (full topic +
+// alias) and sends alias-only (empty topic + alias) on subsequent deliveries,
+// across QoS 0 and QoS 1. Spec5 [3.3.2.3.4].
+func TestMQTTv5OutboundTopicAliasBindReuse(t *testing.T) {
+	for _, qos := range []byte{0, 1} {
+		t.Run(fmt.Sprintf("qos%d", qos), func(t *testing.T) {
+			o := testMQTTDefaultOptionsV5()
+			s := testMQTTRunServer(t, o)
+			defer testMQTTShutdownServer(s)
+
+			cs, rs := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "otasub", cleanStart: true,
+				props: mqttV5TopicAliasMaxProps(5)}, o.MQTT.Host, o.MQTT.Port)
+			defer cs.Close()
+			testMQTTReadConnAckV5(t, rs)
+			testMQTTSubV5(t, cs, rs, 1, []mqttV5SubFilter{{topic: "ota/#", opts: qos}})
+			testMQTTFlush(t, cs, nil, rs)
+
+			cp, rp := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "otapub", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
+			defer cp.Close()
+			testMQTTReadConnAckV5(t, rp)
+
+			testMQTTPubV5Props(t, cp, rp, qos, false, 1, "ota/a", []byte("m1"), nil)
+			testMQTTPubV5Props(t, cp, rp, qos, false, 2, "ota/a", []byte("m2"), nil)
+
+			// First delivery binds: full topic + alias 1.
+			_, topic, alias, pi, payload := testMQTTReadOutPub(t, rs)
+			if topic != "ota/a" || alias != 1 || string(payload) != "m1" {
+				t.Fatalf("binding delivery: topic=%q alias=%d payload=%q", topic, alias, payload)
+			}
+			if qos == 1 {
+				testMQTTSendPubAck(t, cs, pi)
+			}
+			// Second delivery reuses the alias: empty topic + alias 1.
+			_, topic, alias, pi, payload = testMQTTReadOutPub(t, rs)
+			if topic != "" || alias != 1 || string(payload) != "m2" {
+				t.Fatalf("reuse delivery: topic=%q alias=%d payload=%q", topic, alias, payload)
+			}
+			if qos == 1 {
+				testMQTTSendPubAck(t, cs, pi)
+			}
+		})
+	}
+}
+
+// The outbound alias table is shared across delivery paths on one connection: a
+// QoS 0 delivery binds the alias and a later QoS 1 delivery on the same topic
+// reuses it (the two paths run through different delivery callbacks).
+func TestMQTTv5OutboundTopicAliasMixedQoS(t *testing.T) {
+	o := testMQTTDefaultOptionsV5()
+	s := testMQTTRunServer(t, o)
+	defer testMQTTShutdownServer(s)
+
+	cs, rs := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "otmq", cleanStart: true,
+		props: mqttV5TopicAliasMaxProps(5)}, o.MQTT.Host, o.MQTT.Port)
+	defer cs.Close()
+	testMQTTReadConnAckV5(t, rs)
+	testMQTTSubV5(t, cs, rs, 1, []mqttV5SubFilter{{topic: "otmq/t", opts: 1}})
+	testMQTTFlush(t, cs, nil, rs)
+
+	cp, rp := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "otmqp", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
+	defer cp.Close()
+	testMQTTReadConnAckV5(t, rp)
+
+	// QoS0 publish -> delivered QoS0 (min with sub QoS1): binds alias 1 via the
+	// QoS0 callback.
+	testMQTTPubV5Props(t, cp, rp, 0, false, 0, "otmq/t", []byte("q0"), nil)
+	// QoS1 publish -> delivered QoS1: reuses the same alias via the QoS1 callback.
+	testMQTTPubV5Props(t, cp, rp, 1, false, 1, "otmq/t", []byte("q1"), nil)
+
+	if _, topic, alias, _, payload := testMQTTReadOutPub(t, rs); topic != "otmq/t" || alias != 1 || string(payload) != "q0" {
+		t.Fatalf("qos0 binding: topic=%q alias=%d payload=%q", topic, alias, payload)
+	}
+	_, topic, alias, pi, payload := testMQTTReadOutPub(t, rs)
+	if topic != "" || alias != 1 || string(payload) != "q1" {
+		t.Fatalf("qos1 reuse: topic=%q alias=%d payload=%q", topic, alias, payload)
+	}
+	testMQTTSendPubAck(t, cs, pi)
+}
+
+// Distinct topics receive distinct aliases, first-come-first-served.
+func TestMQTTv5OutboundTopicAliasDistinct(t *testing.T) {
+	o := testMQTTDefaultOptionsV5()
+	s := testMQTTRunServer(t, o)
+	defer testMQTTShutdownServer(s)
+
+	cs, rs := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "otd", cleanStart: true,
+		props: mqttV5TopicAliasMaxProps(5)}, o.MQTT.Host, o.MQTT.Port)
+	defer cs.Close()
+	testMQTTReadConnAckV5(t, rs)
+	testMQTTSubV5(t, cs, rs, 1, []mqttV5SubFilter{{topic: "otd/#", opts: 0}})
+	testMQTTFlush(t, cs, nil, rs)
+
+	cp, rp := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "otdp", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
+	defer cp.Close()
+	testMQTTReadConnAckV5(t, rp)
+
+	testMQTTPubV5Props(t, cp, rp, 0, false, 0, "otd/a", []byte("a"), nil)
+	testMQTTPubV5Props(t, cp, rp, 0, false, 0, "otd/b", []byte("b"), nil)
+	testMQTTPubV5Props(t, cp, rp, 0, false, 0, "otd/a", []byte("a2"), nil)
+	testMQTTPubV5Props(t, cp, rp, 0, false, 0, "otd/b", []byte("b2"), nil)
+
+	for _, exp := range []struct {
+		topic   string
+		alias   uint16
+		payload string
+	}{
+		{"otd/a", 1, "a"},
+		{"otd/b", 2, "b"},
+		{"", 1, "a2"},
+		{"", 2, "b2"},
+	} {
+		_, topic, alias, _, payload := testMQTTReadOutPub(t, rs)
+		if topic != exp.topic || alias != exp.alias || string(payload) != exp.payload {
+			t.Fatalf("got topic=%q alias=%d payload=%q, want topic=%q alias=%d payload=%q",
+				topic, alias, payload, exp.topic, exp.alias, exp.payload)
+		}
+	}
+}
+
+// A client that advertises no Topic Alias Maximum (absent, or an explicit 0)
+// never receives an alias: every delivery carries the full topic.
+func TestMQTTv5OutboundTopicAliasClientMaxZero(t *testing.T) {
+	for _, test := range []struct {
+		name  string
+		props []byte
+	}{
+		{"absent", nil},
+		{"explicit-zero", mqttV5TopicAliasMaxProps(0)},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			o := testMQTTDefaultOptionsV5()
+			s := testMQTTRunServer(t, o)
+			defer testMQTTShutdownServer(s)
+
+			cs, rs := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "otz", cleanStart: true, props: test.props},
+				o.MQTT.Host, o.MQTT.Port)
+			defer cs.Close()
+			testMQTTReadConnAckV5(t, rs)
+			testMQTTSubV5(t, cs, rs, 1, []mqttV5SubFilter{{topic: "otz/t", opts: 0}})
+			testMQTTFlush(t, cs, nil, rs)
+
+			cp, rp := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "otzp", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
+			defer cp.Close()
+			testMQTTReadConnAckV5(t, rp)
+
+			testMQTTPubV5Props(t, cp, rp, 0, false, 0, "otz/t", []byte("m1"), nil)
+			testMQTTPubV5Props(t, cp, rp, 0, false, 0, "otz/t", []byte("m2"), nil)
+			for _, exp := range []string{"m1", "m2"} {
+				_, topic, alias, _, payload := testMQTTReadOutPub(t, rs)
+				if topic != "otz/t" || alias != 0 || string(payload) != exp {
+					t.Fatalf("got topic=%q alias=%d payload=%q, want full topic no alias", topic, alias, payload)
+				}
+			}
+		})
+	}
+}
+
+// Once the alias table is full, further distinct topics are sent unaliased while
+// already-bound topics keep using their alias.
+func TestMQTTv5OutboundTopicAliasTableFull(t *testing.T) {
+	o := testMQTTDefaultOptionsV5()
+	s := testMQTTRunServer(t, o)
+	defer testMQTTShutdownServer(s)
+
+	cs, rs := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "otf", cleanStart: true,
+		props: mqttV5TopicAliasMaxProps(2)}, o.MQTT.Host, o.MQTT.Port)
+	defer cs.Close()
+	testMQTTReadConnAckV5(t, rs)
+	testMQTTSubV5(t, cs, rs, 1, []mqttV5SubFilter{{topic: "otf/#", opts: 0}})
+	testMQTTFlush(t, cs, nil, rs)
+
+	cp, rp := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "otfp", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
+	defer cp.Close()
+	testMQTTReadConnAckV5(t, rp)
+
+	// Bind a (1) and b (2) to fill the table of size 2, then c overflows.
+	testMQTTPubV5Props(t, cp, rp, 0, false, 0, "otf/a", []byte("a"), nil)
+	testMQTTPubV5Props(t, cp, rp, 0, false, 0, "otf/b", []byte("b"), nil)
+	testMQTTPubV5Props(t, cp, rp, 0, false, 0, "otf/c", []byte("c"), nil)
+	testMQTTPubV5Props(t, cp, rp, 0, false, 0, "otf/a", []byte("a2"), nil)
+
+	for _, exp := range []struct {
+		topic   string
+		alias   uint16
+		payload string
+	}{
+		{"otf/a", 1, "a"},
+		{"otf/b", 2, "b"},
+		{"otf/c", 0, "c"}, // table full: unaliased
+		{"", 1, "a2"},     // still aliased
+	} {
+		_, topic, alias, _, payload := testMQTTReadOutPub(t, rs)
+		if topic != exp.topic || alias != exp.alias || string(payload) != exp.payload {
+			t.Fatalf("got topic=%q alias=%d payload=%q, want topic=%q alias=%d payload=%q",
+				topic, alias, payload, exp.topic, exp.alias, exp.payload)
+		}
+	}
+}
+
+// The effective outbound maximum is min(client's advertised max, server option):
+// a small server cap wins over a large client max, and -1 disables aliasing.
+func TestMQTTv5OutboundTopicAliasServerCap(t *testing.T) {
+	t.Run("server-cap-wins", func(t *testing.T) {
+		o := testMQTTDefaultOptionsV5()
+		o.MQTT.TopicAliasMaximum = 1
+		s := testMQTTRunServer(t, o)
+		defer testMQTTShutdownServer(s)
+
+		cs, rs := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "otc", cleanStart: true,
+			props: mqttV5TopicAliasMaxProps(10)}, o.MQTT.Host, o.MQTT.Port)
+		defer cs.Close()
+		testMQTTReadConnAckV5(t, rs)
+		testMQTTSubV5(t, cs, rs, 1, []mqttV5SubFilter{{topic: "otc/#", opts: 0}})
+		testMQTTFlush(t, cs, nil, rs)
+
+		cp, rp := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "otcp", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
+		defer cp.Close()
+		testMQTTReadConnAckV5(t, rp)
+
+		testMQTTPubV5Props(t, cp, rp, 0, false, 0, "otc/a", []byte("a"), nil)
+		testMQTTPubV5Props(t, cp, rp, 0, false, 0, "otc/b", []byte("b"), nil)
+		for _, exp := range []struct {
+			topic string
+			alias uint16
+		}{{"otc/a", 1}, {"otc/b", 0}} {
+			_, topic, alias, _, _ := testMQTTReadOutPub(t, rs)
+			if topic != exp.topic || alias != exp.alias {
+				t.Fatalf("got topic=%q alias=%d, want topic=%q alias=%d", topic, alias, exp.topic, exp.alias)
+			}
+		}
+	})
+
+	t.Run("disabled", func(t *testing.T) {
+		o := testMQTTDefaultOptionsV5()
+		o.MQTT.TopicAliasMaximum = -1
+		s := testMQTTRunServer(t, o)
+		defer testMQTTShutdownServer(s)
+
+		cs, rs := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "otx", cleanStart: true,
+			props: mqttV5TopicAliasMaxProps(10)}, o.MQTT.Host, o.MQTT.Port)
+		defer cs.Close()
+		testMQTTReadConnAckV5(t, rs)
+		testMQTTSubV5(t, cs, rs, 1, []mqttV5SubFilter{{topic: "otx/t", opts: 0}})
+		testMQTTFlush(t, cs, nil, rs)
+
+		cp, rp := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "otxp", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
+		defer cp.Close()
+		testMQTTReadConnAckV5(t, rp)
+
+		testMQTTPubV5Props(t, cp, rp, 0, false, 0, "otx/t", []byte("m1"), nil)
+		testMQTTPubV5Props(t, cp, rp, 0, false, 0, "otx/t", []byte("m2"), nil)
+		for range []int{0, 1} {
+			_, topic, alias, _, _ := testMQTTReadOutPub(t, rs)
+			if topic != "otx/t" || alias != 0 {
+				t.Fatalf("got topic=%q alias=%d, want full topic no alias", topic, alias)
+			}
+		}
+	})
+}
+
+// Aliases are connection-scoped: after a reconnect the unacked QoS1 message is
+// redelivered with the full topic (a fresh binding), never alias-only.
+func TestMQTTv5OutboundTopicAliasReconnectResets(t *testing.T) {
+	o := testMQTTDefaultOptionsV5()
+	s := testMQTTRunServer(t, o)
+	defer testMQTTShutdownServer(s)
+
+	subProps := append(mqttV5ConnPropsSessionExpiry(30), mqttV5TopicAliasMaxProps(5)...)
+	ci := &mqttV5ConnInfo{clientID: "otr", props: subProps}
+	cs, rs := testMQTTConnectV5(t, ci, o.MQTT.Host, o.MQTT.Port)
+	testMQTTReadConnAckV5(t, rs)
+	testMQTTSubV5(t, cs, rs, 1, []mqttV5SubFilter{{topic: "otr/t", opts: 1}})
+	testMQTTFlush(t, cs, nil, rs)
+
+	cp, rp := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "otrp", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
+	defer cp.Close()
+	testMQTTReadConnAckV5(t, rp)
+	testMQTTPubV5Props(t, cp, rp, 1, false, 1, "otr/t", []byte("m"), nil)
+
+	// First delivery binds an alias; do NOT ack.
+	flags, topic, alias, _, _ := testMQTTReadOutPub(t, rs)
+	if topic != "otr/t" || alias != 1 || flags&mqttPubFlagDup != 0 {
+		t.Fatalf("first delivery: topic=%q alias=%d flags=%x", topic, alias, flags)
+	}
+	cs.Close()
+
+	// Reconnect: the redelivery is DUP and carries the full topic with a fresh
+	// binding, because c.mqtt (and its alias table) is rebuilt per connection.
+	cs2, rs2 := testMQTTConnectV5(t, ci, o.MQTT.Host, o.MQTT.Port)
+	defer cs2.Close()
+	if sp, _, _ := testMQTTReadConnAckV5(t, rs2); !sp {
+		t.Fatal("Expected session present on reconnect")
+	}
+	flags, topic, alias, pi, _ := testMQTTReadOutPub(t, rs2)
+	if flags&mqttPubFlagDup == 0 {
+		t.Fatal("redelivery should be DUP")
+	}
+	if topic != "otr/t" || alias != 1 {
+		t.Fatalf("redelivery: topic=%q alias=%d, want full topic re-bound", topic, alias)
+	}
+	testMQTTSendPubAck(t, cs2, pi)
+}
+
+// Retained-message deliveries are never aliased; a later live publish on the same
+// topic then binds the alias.
+func TestMQTTv5OutboundTopicAliasRetainedUnaliased(t *testing.T) {
+	o := testMQTTDefaultOptionsV5()
+	s := testMQTTRunServer(t, o)
+	defer testMQTTShutdownServer(s)
+
+	cp, rp := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "otrp", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
+	defer cp.Close()
+	testMQTTReadConnAckV5(t, rp)
+	testMQTTPubV5Props(t, cp, rp, 0, true, 0, "otret/t", []byte("ret"), nil)
+	testMQTTFlush(t, cp, nil, rp)
+
+	cs, rs := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "otrets", cleanStart: true,
+		props: mqttV5TopicAliasMaxProps(5)}, o.MQTT.Host, o.MQTT.Port)
+	defer cs.Close()
+	testMQTTReadConnAckV5(t, rs)
+	testMQTTSubV5(t, cs, rs, 1, []mqttV5SubFilter{{topic: "otret/t", opts: 0}})
+
+	// Retained delivery: full topic, no alias.
+	_, topic, alias, _, payload := testMQTTReadOutPub(t, rs)
+	if topic != "otret/t" || alias != 0 || string(payload) != "ret" {
+		t.Fatalf("retained: topic=%q alias=%d payload=%q, want unaliased", topic, alias, payload)
+	}
+	// A live publish on the same topic now binds alias 1.
+	testMQTTPubV5Props(t, cp, rp, 0, false, 0, "otret/t", []byte("live"), nil)
+	_, topic, alias, _, payload = testMQTTReadOutPub(t, rs)
+	if topic != "otret/t" || alias != 1 || string(payload) != "live" {
+		t.Fatalf("live: topic=%q alias=%d payload=%q, want full topic + alias 1", topic, alias, payload)
+	}
+}
+
+// A Subscription Identifier and a Topic Alias coexist on a delivered PUBLISH: the
+// binding frame carries both, and the alias-only reuse keeps the identifier.
+func TestMQTTv5OutboundTopicAliasWithSubID(t *testing.T) {
+	o := testMQTTDefaultOptionsV5()
+	s := testMQTTRunServer(t, o)
+	defer testMQTTShutdownServer(s)
+
+	cs, rs := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "otsid", cleanStart: true,
+		props: mqttV5TopicAliasMaxProps(5)}, o.MQTT.Host, o.MQTT.Port)
+	defer cs.Close()
+	testMQTTReadConnAckV5(t, rs)
+	testMQTTSubV5Props(t, cs, rs, 1, mqttV5SubIDProps(88), []mqttV5SubFilter{{topic: "otsid/t", opts: 0}})
+	testMQTTFlush(t, cs, nil, rs)
+
+	cp, rp := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "otsidp", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
+	defer cp.Close()
+	testMQTTReadConnAckV5(t, rp)
+	testMQTTPubV5Props(t, cp, rp, 0, false, 0, "otsid/t", []byte("m1"), nil)
+	testMQTTPubV5Props(t, cp, rp, 0, false, 0, "otsid/t", []byte("m2"), nil)
+
+	// Read the binding delivery fully via the props-aware reader to inspect subID.
+	assertSubIDAndAlias := func(expTopic string, expAlias uint16, expPayload string) {
+		t.Helper()
+		b, pl := testMQTTReadPacket(t, rs)
+		if pt := b & mqttPacketMask; pt != mqttPacketPub {
+			t.Fatalf("Expected PUBLISH, got %x", pt)
+		}
+		off := rs.pos
+		topic, err := rs.readBytes("topic", false)
+		if err != nil {
+			t.Fatalf("topic: %v", err)
+		}
+		props, err := rs.readProperties(mqttPropsContextPubOut)
+		if err != nil {
+			t.Fatalf("props: %v", err)
+		}
+		payloadLen := pl - (rs.pos - off)
+		payload := rs.buf[rs.pos : rs.pos+payloadLen]
+		rs.pos += payloadLen
+		if string(topic) != expTopic || string(payload) != expPayload {
+			t.Fatalf("topic=%q payload=%q, want %q/%q", topic, payload, expTopic, expPayload)
+		}
+		if props == nil || !props.present[mqttPropTopicAlias] || props.topicAlias != expAlias {
+			t.Fatalf("alias missing/wrong: %+v", props)
+		}
+		if len(props.subIDs) != 1 || props.subIDs[0] != 88 {
+			t.Fatalf("subID missing/wrong: %+v", props)
+		}
+	}
+	assertSubIDAndAlias("otsid/t", 1, "m1")
+	assertSubIDAndAlias("", 1, "m2")
+}
+
+// A 3.1.1 subscriber and a v5 subscriber advertising a Topic Alias Maximum share
+// a topic: the 3.1.1 client always gets the full topic and no properties, while
+// the v5 client is aliased on reuse.
+func TestMQTTv5OutboundTopicAlias311Unaffected(t *testing.T) {
+	o := testMQTTDefaultOptionsV5()
+	s := testMQTTRunServer(t, o)
+	defer testMQTTShutdownServer(s)
+
+	c3, r3 := testMQTTConnect(t, &mqttConnInfo{clientID: "ot311", cleanSess: true}, o.MQTT.Host, o.MQTT.Port)
+	defer c3.Close()
+	testMQTTCheckConnAck(t, r3, mqttConnAckRCConnectionAccepted, false)
+	testMQTTSub(t, 1, c3, r3, []*mqttFilter{{filter: "otm/t", qos: 0}}, []byte{0})
+	testMQTTFlush(t, c3, nil, r3)
+
+	c5, r5 := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "otm5", cleanStart: true,
+		props: mqttV5TopicAliasMaxProps(5)}, o.MQTT.Host, o.MQTT.Port)
+	defer c5.Close()
+	testMQTTReadConnAckV5(t, r5)
+	testMQTTSubV5(t, c5, r5, 1, []mqttV5SubFilter{{topic: "otm/t", opts: 0}})
+	testMQTTFlush(t, c5, nil, r5)
+
+	cp, rp := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "otmp", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
+	defer cp.Close()
+	testMQTTReadConnAckV5(t, rp)
+	testMQTTPubV5Props(t, cp, rp, 0, false, 0, "otm/t", []byte("m1"), nil)
+	testMQTTPubV5Props(t, cp, rp, 0, false, 0, "otm/t", []byte("m2"), nil)
+
+	// 3.1.1: full topic both times, no properties section (checked by the 3.1.1
+	// reader, which does not expect one).
+	testMQTTCheckPubMsg(t, c3, r3, "otm/t", 0, []byte("m1"))
+	testMQTTCheckPubMsg(t, c3, r3, "otm/t", 0, []byte("m2"))
+
+	// v5: bind then alias-only.
+	_, topic, alias, _, _ := testMQTTReadOutPub(t, r5)
+	if topic != "otm/t" || alias != 1 {
+		t.Fatalf("v5 binding: topic=%q alias=%d", topic, alias)
+	}
+	_, topic, alias, _, _ = testMQTTReadOutPub(t, r5)
+	if topic != "" || alias != 1 {
+		t.Fatalf("v5 reuse: topic=%q alias=%d", topic, alias)
+	}
+}
+
+// Maximum Packet Size interaction: aliasing never causes an extra drop. The
+// binding frame (+3 bytes) and the alias-only frame (which can be larger than the
+// plain frame for a short topic) both fall back to the plain full-topic frame
+// when they would exceed the client's limit, and a fresh binding is never
+// committed when its frame is dropped.
+func TestMQTTv5OutboundTopicAliasMaxPacketSize(t *testing.T) {
+	// mps builds a CONNECT props body carrying both a Maximum Packet Size and a
+	// Topic Alias Maximum.
+	mps := func(max uint32) []byte {
+		return append(mqttV5MaxPacketSizeProps(max), mqttV5TopicAliasMaxProps(5)...)
+	}
+	// frameLen returns the wire size the server measures (header + payload) for a
+	// delivered v5 PUBLISH with the given topic and properties block.
+	aliasProps, _ := mqttInjectTopicAlias(nil, 1)
+	frameLen := func(topic []byte, props []byte, payloadLen int) int {
+		_, h := mqttMakePublishHeader(0, 0, false, false, true, topic, props, payloadLen)
+		return len(h) + payloadLen
+	}
+
+	t.Run("binding-frame-too-big", func(t *testing.T) {
+		topic := "mpz/aa"
+		p1 := strings.Repeat("x", 40)
+		// Size the client's max so the plain frame fits exactly but the binding
+		// frame (+3) does not.
+		maxPkt := frameLen([]byte(topic), nil, len(p1))
+		if frameLen([]byte(topic), aliasProps, len(p1)) <= maxPkt {
+			t.Fatal("test setup: binding frame should exceed maxPkt")
+		}
+		o := testMQTTDefaultOptionsV5()
+		s := testMQTTRunServer(t, o)
+		defer testMQTTShutdownServer(s)
+
+		cs, rs := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "mpzb", cleanStart: true, props: mps(uint32(maxPkt))},
+			o.MQTT.Host, o.MQTT.Port)
+		defer cs.Close()
+		testMQTTReadConnAckV5(t, rs)
+		testMQTTSubV5(t, cs, rs, 1, []mqttV5SubFilter{{topic: "mpz/#", opts: 0}})
+		testMQTTFlush(t, cs, nil, rs)
+
+		cp, rp := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "mpzbp", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
+		defer cp.Close()
+		testMQTTReadConnAckV5(t, rp)
+
+		// msg1: plain fits, binding does not -> delivered unaliased, no binding.
+		testMQTTPubV5Props(t, cp, rp, 0, false, 0, topic, []byte(p1), nil)
+		// msg2: empty payload, binding frame now fits -> fresh binding alias 1.
+		testMQTTPubV5Props(t, cp, rp, 0, false, 0, topic, []byte(""), nil)
+		// msg3: alias-only fits -> confirms the binding was committed on msg2.
+		testMQTTPubV5Props(t, cp, rp, 0, false, 0, topic, []byte(""), nil)
+
+		_, tp, al, _, _ := testMQTTReadOutPub(t, rs)
+		if tp != topic || al != 0 {
+			t.Fatalf("msg1: topic=%q alias=%d, want unaliased (no binding)", tp, al)
+		}
+		_, tp, al, _, _ = testMQTTReadOutPub(t, rs)
+		if tp != topic || al != 1 {
+			t.Fatalf("msg2: topic=%q alias=%d, want full topic + alias 1", tp, al)
+		}
+		_, tp, al, _, _ = testMQTTReadOutPub(t, rs)
+		if tp != "" || al != 1 {
+			t.Fatalf("msg3: topic=%q alias=%d, want alias-only", tp, al)
+		}
+	})
+
+	t.Run("alias-only-frame-too-big", func(t *testing.T) {
+		topic := "z" // 1-byte topic: alias-only frame is larger than plain
+		p1 := strings.Repeat("x", 40)
+		p2 := strings.Repeat("y", 45)
+		// max = plain frame of msg2 (fits exactly). Binding of msg1 must fit; the
+		// alias-only frame of msg2 must exceed it.
+		maxPkt := frameLen([]byte(topic), nil, len(p2))
+		if frameLen([]byte(topic), aliasProps, len(p1)) > maxPkt {
+			t.Fatal("test setup: binding frame of msg1 should fit")
+		}
+		if frameLen(nil, aliasProps, len(p2)) <= maxPkt {
+			t.Fatal("test setup: alias-only frame of msg2 should exceed maxPkt")
+		}
+		o := testMQTTDefaultOptionsV5()
+		s := testMQTTRunServer(t, o)
+		defer testMQTTShutdownServer(s)
+
+		cs, rs := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "mpza", cleanStart: true, props: mps(uint32(maxPkt))},
+			o.MQTT.Host, o.MQTT.Port)
+		defer cs.Close()
+		testMQTTReadConnAckV5(t, rs)
+		testMQTTSubV5(t, cs, rs, 1, []mqttV5SubFilter{{topic: "z", opts: 0}})
+		testMQTTFlush(t, cs, nil, rs)
+
+		cp, rp := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "mpzap", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
+		defer cp.Close()
+		testMQTTReadConnAckV5(t, rp)
+
+		testMQTTPubV5Props(t, cp, rp, 0, false, 0, topic, []byte(p1), nil) // binds alias 1
+		testMQTTPubV5Props(t, cp, rp, 0, false, 0, topic, []byte(p2), nil) // alias-only too big -> full topic
+		testMQTTPubV5Props(t, cp, rp, 0, false, 0, topic, []byte(""), nil) // small -> alias-only again
+
+		_, tp, al, _, _ := testMQTTReadOutPub(t, rs)
+		if tp != topic || al != 1 {
+			t.Fatalf("msg1: topic=%q alias=%d, want binding alias 1", tp, al)
+		}
+		_, tp, al, _, pl := testMQTTReadOutPub(t, rs)
+		if tp != topic || al != 0 || string(pl) != p2 {
+			t.Fatalf("msg2: topic=%q alias=%d, want full topic no alias (binding kept)", tp, al)
+		}
+		_, tp, al, _, _ = testMQTTReadOutPub(t, rs)
+		if tp != "" || al != 1 {
+			t.Fatalf("msg3: topic=%q alias=%d, want alias-only (binding survived)", tp, al)
+		}
+	})
+
+	t.Run("plain-frame-exceeds-drops-without-binding", func(t *testing.T) {
+		topic := "mpz/cc"
+		small := strings.Repeat("s", 40)
+		big := strings.Repeat("b", 60)
+		// max = binding frame of the small message (fits exactly). The big message's
+		// plain fallback must exceed it so it is dropped entirely.
+		maxPkt := frameLen([]byte(topic), aliasProps, len(small))
+		if frameLen([]byte(topic), nil, len(big)) <= maxPkt {
+			t.Fatal("test setup: plain frame of big message should exceed maxPkt")
+		}
+		o := testMQTTDefaultOptionsV5()
+		s := testMQTTRunServer(t, o)
+		defer testMQTTShutdownServer(s)
+
+		cs, rs := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "mpzc", cleanStart: true, props: mps(uint32(maxPkt))},
+			o.MQTT.Host, o.MQTT.Port)
+		defer cs.Close()
+		testMQTTReadConnAckV5(t, rs)
+		testMQTTSubV5(t, cs, rs, 1, []mqttV5SubFilter{{topic: "mpz/#", opts: 0}})
+		testMQTTFlush(t, cs, nil, rs)
+
+		cp, rp := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "mpzcp", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
+		defer cp.Close()
+		testMQTTReadConnAckV5(t, rp)
+
+		// big is dropped (plain fallback exceeds the limit) and must not bind an
+		// alias; small then arrives first as a fresh full-topic binding (alias 1).
+		testMQTTPubV5Props(t, cp, rp, 0, false, 0, topic, []byte(big), nil)
+		testMQTTPubV5Props(t, cp, rp, 0, false, 0, topic, []byte(small), nil)
+
+		_, tp, al, _, pl := testMQTTReadOutPub(t, rs)
+		if tp != topic || al != 1 || string(pl) != small {
+			t.Fatalf("first delivery: topic=%q alias=%d payload=%q, want the small message re-binding (big dropped, no alias committed)", tp, al, pl)
+		}
+	})
+}
+
+// mqttInjectTopicAlias appends a Topic Alias to a raw properties block, or
+// synthesizes one, and reports ok=false on a structurally invalid block.
+func TestMQTTInjectTopicAlias(t *testing.T) {
+	reparse := func(t *testing.T, block []byte) *mqttProperties {
+		t.Helper()
+		r := &mqttReader{}
+		r.reset(block)
+		p, err := r.readProperties(mqttPropsContextPubOut)
+		if err != nil || r.hasMore() {
+			t.Fatalf("re-parse: err=%v hasMore=%v", err, r.hasMore())
+		}
+		return p
+	}
+
+	// nil/empty input synthesizes a block with just the alias.
+	for _, in := range [][]byte{nil, {0}} {
+		out, ok := mqttInjectTopicAlias(in, 7)
+		if !ok {
+			t.Fatalf("expected ok for input %v", in)
+		}
+		p := reparse(t, out)
+		if p == nil || !p.present[mqttPropTopicAlias] || p.topicAlias != 7 {
+			t.Fatalf("synthesized block missing alias: %+v", p)
+		}
+	}
+
+	// An existing block gains the alias while keeping its other properties. Use a
+	// block that already carries a Subscription Identifier (as it would after
+	// mqttInjectSubID) to prove the helper does not reject it.
+	withSubID := mqttInjectSubID(nil, 5)
+	out, ok := mqttInjectTopicAlias(withSubID, 3)
+	if !ok {
+		t.Fatal("expected ok for a block carrying a subID")
+	}
+	p := reparse(t, out)
+	if p == nil || p.topicAlias != 3 || len(p.subIDs) != 1 || p.subIDs[0] != 5 {
+		t.Fatalf("expected alias 3 and subID 5, got %+v", p)
+	}
+
+	// A block whose length prefix does not match its size is rejected.
+	if _, ok := mqttInjectTopicAlias([]byte{0x7f, 0x01}, 1); ok {
+		t.Fatal("expected ok=false for a malformed block")
+	}
+}

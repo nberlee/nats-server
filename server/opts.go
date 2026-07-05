@@ -778,12 +778,14 @@ type MQTTOpts struct {
 
 	// TopicAliasMaximum is the highest MQTT 5.0 Topic Alias value the server
 	// accepts on inbound PUBLISH packets, advertised to v5 clients in the
-	// CONNACK Topic Alias Maximum property. The server never sends topic aliases
-	// to clients. 0 means use the default (64); set to -1 to disable topic
-	// aliases entirely (the CONNACK then omits the property). Valid explicit
-	// range is [1..65535]. In a config file, topic_alias_maximum: 0 disables the
-	// feature (stored as -1). Changing this option requires a restart.
-	// Spec5 [3.2.2.3.2].
+	// CONNACK Topic Alias Maximum property. It also caps the aliases the server
+	// sends outbound: the effective outbound maximum per connection is the min of
+	// this value and the client's advertised Topic Alias Maximum. 0 means use the
+	// default (64); set to -1 to disable topic aliases entirely, both directions
+	// (the CONNACK then omits the property and the server sends none). Valid
+	// explicit range is [1..65535]. In a config file, topic_alias_maximum: 0
+	// disables the feature (stored as -1). Changing this option requires a restart.
+	// Spec5 [3.2.2.3.2], [3.1.2.11.2].
 	TopicAliasMaximum int
 
 	// KeepAliveMaximum is the highest keep alive (in seconds) the server allows

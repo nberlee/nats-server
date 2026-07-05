@@ -683,12 +683,12 @@ type mqtt struct {
 	// Assigned Client Identifier property. Spec5 [3.2.2.3.7].
 	cidGenerated bool
 
-	// topicAliasMax is the MQTT 5.0 Topic Alias Maximum this server accepts from
-	// this connection, resolved from Options at CONNECT and advertised in the
-	// CONNACK. 0 means aliases are not accepted (property omitted, absent => 0).
-	// Inbound-only: the server never sends aliases, so the client's own Topic
-	// Alias Maximum is intentionally ignored. Set during CONNECT, read lock-free
-	// on the parse path like proto. Spec5 [3.2.2.3.2], [3.3.2.3.4].
+	// topicAliasMax is the inbound MQTT 5.0 Topic Alias Maximum this server
+	// accepts from this connection, resolved from Options at CONNECT and
+	// advertised in the CONNACK. 0 means aliases are not accepted (property
+	// omitted, absent => 0). Set during CONNECT, read lock-free on the parse path
+	// like proto. The outbound direction (aliases the server sends) is
+	// outTopicAliasMax. Spec5 [3.2.2.3.2], [3.3.2.3.4].
 	topicAliasMax uint16
 
 	// topicAliases maps a client-assigned Topic Alias to the (copied) pre-mapping
@@ -697,6 +697,24 @@ type mqtt struct {
 	// reconnect or session takeover (c.mqtt is rebuilt per connection). Only
 	// accessed from the read loop. Spec5 [3.3.2.3.4].
 	topicAliases map[uint16][]byte
+
+	// outTopicAliasMax is how many MQTT 5.0 Topic Aliases the server may use on
+	// PUBLISH packets it sends TO this connection: the client's CONNECT Topic
+	// Alias Maximum bounded by the server-side cap (the min of the two, so a
+	// client advertising 65535 cannot force the server to hold 65535 topics).
+	// 0 => the server sends no aliases. Set once during CONNECT, read lock-free
+	// on delivery goroutines like maxPacketSize. Spec5 [3.1.2.11.2], [3.3.2.3.4].
+	outTopicAliasMax uint16
+
+	// outTopicAliases maps a full MQTT topic to the outbound alias the server
+	// bound it to on this connection. Guarded by the client lock (c.mu): deliveries
+	// arrive on multiple publisher goroutines, and the alias assignment must be
+	// atomic with queueOutbound so the binding PUBLISH (full topic + alias) is
+	// always buffered before any alias-only PUBLISH referencing it. Lazily
+	// allocated on first bind; first-come-first-served, values 1..outTopicAliasMax,
+	// no eviction (a topic beyond the table is sent unaliased). Connection-scoped:
+	// aliases never survive a reconnect or session takeover. Spec5 [3.3.2.3.4].
+	outTopicAliases map[string]uint16
 
 	// serverKeepAlive is the keep alive (seconds) this server enforces when it
 	// overrides a v5 client's requested value; advertised in the CONNACK Server
@@ -1964,11 +1982,12 @@ func mqttForwardExpiry(props []byte, storeUnixNano int64) (out []byte, expired b
 // mqttInjectSubID returns a raw v5 properties block (variable-int length prefix
 // + body) equal to props with a Subscription Identifier property (0x0B, varint
 // id) appended to the body and the length prefix re-encoded, synthesizing a
-// fresh block when props is empty. It is always the last rewrite before framing:
-// offset-based rewrites (mqttSetMessageExpiry / mqttForwardExpiry) must run on
-// the original block first. props is returned unchanged when the id is out of
-// range, the block is unsafe to forward (see mqttValidateForwardProps), or the
-// injected block would exceed the maximum varint length. Spec5 [3.8.2.1.2].
+// fresh block when props is empty. Offset-based rewrites (mqttSetMessageExpiry /
+// mqttForwardExpiry) must run on the original block first; only a Topic Alias
+// (mqttInjectTopicAlias) may be appended after this. props is returned unchanged
+// when the id is out of range, the block is unsafe to forward (see
+// mqttValidateForwardProps), or the injected block would exceed the maximum
+// varint length. Spec5 [3.8.2.1.2].
 func mqttInjectSubID(props []byte, id int) []byte {
 	if id <= 0 || id > mqttMaxVarInt {
 		return props
@@ -2006,6 +2025,46 @@ func mqttInjectSubID(props []byte, id int) []byte {
 	w.Write(body)
 	w.Write(sb)
 	return w.Bytes()
+}
+
+// mqttInjectTopicAlias returns a raw v5 properties block (varint length prefix +
+// body) equal to props with a Topic Alias property (0x23, 2-byte value) appended
+// and the length prefix re-encoded, synthesizing a fresh block when props is
+// nil/empty. ok is false (props returned unchanged) when the block cannot be
+// safely extended; the caller must then send the full topic unaliased rather
+// than an empty-topic frame with no alias. Unlike mqttInjectSubID it performs
+// only the structural prefix/length check, NOT mqttValidateForwardProps: it runs
+// after mqttInjectSubID, whose output legitimately carries a Subscription
+// Identifier the forward validator rejects, and every block reaching here was
+// already validated upstream. Caller precondition: props must not already carry
+// a Topic Alias (this appends blindly) — inbound aliases are stripped before
+// forwarding and mqttValidateForwardProps rejects NATS-carried blocks bearing
+// one, so no current caller violates this. Spec5 [3.3.2.3.4].
+func mqttInjectTopicAlias(props []byte, alias uint16) ([]byte, bool) {
+	// The Topic Alias property: id 0x23 followed by its 2-byte value.
+	sb := []byte{mqttPropTopicAlias, byte(alias >> 8), byte(alias)}
+
+	// An absent (nil) or empty (single 0 length byte) block synthesizes one that
+	// carries just the alias; a longer block must have a length prefix consistent
+	// with its size before we extend it.
+	var body []byte
+	if n := len(props); n > 1 {
+		plen, off := mqttVarIntFromSlice(props)
+		if off < 0 || off+plen != n {
+			return props, false
+		}
+		body = props[off:]
+	}
+
+	newLen := len(body) + len(sb)
+	if newLen > mqttMaxVarInt {
+		return props, false
+	}
+	w := newMQTTWriter(5 + newLen)
+	w.WriteVarInt(newLen)
+	w.Write(body)
+	w.Write(sb)
+	return w.Bytes(), true
 }
 
 // mqttStripTopicAlias returns a copy of the raw properties block (varint length
@@ -4390,6 +4449,10 @@ func (as *mqttAccountSessionManager) serializeRetainedMsgsForSub(rms map[string]
 		// Need to use the subject for the retained message, not the `sub` subject.
 		// We can find the published retained message in rm.sub.subject.
 		// Set the RETAIN flag: [MQTT-3.3.1-8].
+		// Retained frames are intentionally not aliased: they are buffered into
+		// sub.mqtt.prm here (under the session lock) and flushed later under cc.mu,
+		// so binding an alias here could order the binding after live frames already
+		// queued. A full topic is always legal; the first live message binds instead.
 		flags, headerBytes := mqttMakePublishHeader(pi, qos, false, true, v5, []byte(rm.Topic), props, len(rm.Msg))
 
 		// MQTT 5.0 Maximum Packet Size: skip a retained message that would exceed
@@ -5999,11 +6062,15 @@ func (s *Server) mqttProcessConnect(c *client, cp *mqttConnectProto, trace bool)
 			c.mqtt.serverKeepAlive = uint16(kam)
 			cp.rd = mqttKeepAliveRD(uint16(kam))
 		}
-		// Topic Alias Maximum (inbound-only): the server-side cap for this
-		// connection. The client's own Topic Alias Maximum is intentionally not
-		// consumed: it caps aliases the server would send, and this server never
-		// sends any. Spec5 [3.2.2.3.2].
+		// Topic Alias Maximum, both directions. Inbound: the server-side cap for
+		// aliases the client may send us, advertised in the CONNACK. Outbound: the
+		// client's CONNECT Topic Alias Maximum (absent => 0) caps aliases we may
+		// send it, bounded by the same server-side cap to limit per-connection
+		// memory. Spec5 [3.2.2.3.2], [3.1.2.11.2].
 		c.mqtt.topicAliasMax = mqttTopicAliasMax(s.getOpts())
+		if cp.props != nil {
+			c.mqtt.outTopicAliasMax = min(cp.props.topicAliasMax, c.mqtt.topicAliasMax)
+		}
 		// Maximum Packet Size we advertise and enforce on inbound; captured once so
 		// the encoded and enforced values are identical even across a reload.
 		c.mqtt.maxInPacketSize = c.mqttServerMaxPacketSize()
@@ -8401,17 +8468,42 @@ func (c *client) mqttEnqueuePublishMsgTo(cc *client, sub *subscription, pi uint1
 		props = mqttInjectSubID(props, subID)
 	}
 
-	flags, headerBytes := mqttMakePublishHeader(pi, qos, dup, retain, v5, topic, props, len(msg))
+	// MQTT 5.0 outbound Topic Alias: for a v5 client that advertised a Topic Alias
+	// Maximum, the alias table lookup/assignment and framing must be atomic with
+	// queueOutbound so a binding PUBLISH (full topic + alias) is always buffered
+	// before any alias-only PUBLISH referencing it. That work moves under cc.mu
+	// below. Every other receiver keeps the original path: frame and size-check
+	// before the lock. Spec5 [3.3.2.3.4].
+	useAlias := v5 && cc.mqtt.outTopicAliasMax > 0 && len(topic) > 0
 
-	// MQTT 5.0 Maximum Packet Size: never send a PUBLISH larger than the client
-	// is willing to accept. Discard it instead and let the caller complete the
-	// delivery. Spec5 [3.1.2.11.4]. mqtt.maxPacketSize is 0 for 3.1.1 or when the
-	// client did not advertise a limit.
-	if mp := cc.mqtt.maxPacketSize; mp != 0 && len(headerBytes)+len(msg) > int(mp) {
-		return false
+	var flags byte
+	var headerBytes []byte
+	var alias uint16
+	if !useAlias {
+		flags, headerBytes = mqttMakePublishHeader(pi, qos, dup, retain, v5, topic, props, len(msg))
+		// MQTT 5.0 Maximum Packet Size: never send a PUBLISH larger than the client
+		// is willing to accept. Discard it instead and let the caller complete the
+		// delivery. Spec5 [3.1.2.11.4]. mqtt.maxPacketSize is 0 for 3.1.1 or when the
+		// client did not advertise a limit.
+		if mp := cc.mqtt.maxPacketSize; mp != 0 && len(headerBytes)+len(msg) > int(mp) {
+			return false
+		}
 	}
 
 	cc.mu.Lock()
+	if useAlias {
+		// Build under the lock so the binding commit and queueOutbound cannot be
+		// interleaved by a concurrent delivery on the same topic. ok is false only
+		// when even the plain full-topic frame exceeds Maximum Packet Size, matching
+		// the pre-lock discard above; a fresh binding is committed only when its
+		// frame is actually queued.
+		var ok bool
+		flags, headerBytes, alias, ok = cc.mqttMakeAliasedPublishHeader(pi, qos, dup, retain, topic, props, len(msg))
+		if !ok {
+			cc.mu.Unlock()
+			return false
+		}
+	}
 	if sub.mqtt.prm != nil {
 		for _, data := range sub.mqtt.prm {
 			cc.queueOutbound(data)
@@ -8431,7 +8523,13 @@ func (c *client) mqttEnqueuePublishMsgTo(cc *client, sub *subscription, pi uint1
 			pi:    pi,
 			sz:    len(msg),
 		}
-		cc.traceOutOp("PUBLISH", []byte(mqttPubTrace(&pp)))
+		// Trace the resolved full topic (clearer than the empty wire topic) and note
+		// the alias when one was used.
+		tr := mqttPubTrace(&pp)
+		if alias > 0 {
+			tr += fmt.Sprintf(" alias=%v", alias)
+		}
+		cc.traceOutOp("PUBLISH", []byte(tr))
 	}
 	return true
 }
@@ -8489,6 +8587,53 @@ func mqttMakePublishHeader(pi uint16, qos byte, dup, retained, v5 bool, topic, p
 	headerBuf := newMQTTWriter(mqttInitialPubHeader + len(topic) + len(props))
 	flags := headerBuf.WritePublishHeader(pi, qos, dup, retained, v5, topic, props, msgLen)
 	return flags, headerBuf.Bytes()
+}
+
+// mqttMakeAliasedPublishHeader frames an outbound v5 PUBLISH applying this
+// connection's outbound Topic Alias table, returning the flags, header, the
+// alias used (0 = none/full topic), and ok=false when the packet must be dropped
+// because even the plain full-topic frame exceeds the client's Maximum Packet
+// Size. cc.mu must be held: the table read/write is atomic with the caller's
+// queueOutbound so a binding frame is buffered before any alias-only frame that
+// references it, and a fresh alias is committed only once its binding frame has
+// passed the size check. Aliasing never causes an extra drop — the plain frame
+// is always the fallback. Spec5 [3.3.2.3.4].
+func (cc *client) mqttMakeAliasedPublishHeader(pi uint16, qos byte, dup, retain bool, topic, props []byte, msgLen int) (byte, []byte, uint16, bool) {
+	mp := int(cc.mqtt.maxPacketSize)
+	fits := func(h []byte) bool { return mp == 0 || len(h)+msgLen <= mp }
+
+	// Already bound: send an empty topic + the alias. The alias-only frame can be
+	// larger than the plain frame for a 1-2 byte topic (+3 alias bytes, -len(topic)
+	// topic bytes), so it too is size-checked; on overflow fall through to the
+	// plain frame while keeping the binding.
+	if a, bound := cc.mqtt.outTopicAliases[string(topic)]; bound {
+		if ap, ok := mqttInjectTopicAlias(props, a); ok {
+			flags, h := mqttMakePublishHeader(pi, qos, dup, retain, true, nil, ap, msgLen)
+			if fits(h) {
+				return flags, h, a, true
+			}
+		}
+	} else if len(cc.mqtt.outTopicAliases) < int(cc.mqtt.outTopicAliasMax) {
+		// Unbound with room: bind the next alias (FCFS, table size + 1, never 0 and
+		// never above the client's max since outTopicAliasMax = min(client, server)).
+		// The binding frame carries the full topic; commit only if it fits.
+		a := uint16(len(cc.mqtt.outTopicAliases) + 1)
+		if ap, ok := mqttInjectTopicAlias(props, a); ok {
+			flags, h := mqttMakePublishHeader(pi, qos, dup, retain, true, topic, ap, msgLen)
+			if fits(h) {
+				if cc.mqtt.outTopicAliases == nil {
+					cc.mqtt.outTopicAliases = make(map[string]uint16)
+				}
+				cc.mqtt.outTopicAliases[string(topic)] = a
+				return flags, h, a, true
+			}
+		}
+	}
+
+	// Table full, injection failed, or an aliased frame did not fit: send the plain
+	// full-topic frame. alias is 0 so the trace does not claim an alias was sent.
+	flags, h := mqttMakePublishHeader(pi, qos, dup, retain, true, topic, props, msgLen)
+	return flags, h, 0, fits(h)
 }
 
 // Process the SUBSCRIBE packet.
@@ -9406,8 +9551,9 @@ const mqttPropsContextWill = byte(0x01)
 
 // mqttPropsContextPubOut is a pseudo "packet type" for a server-to-client
 // (outbound) PUBLISH, which unlike an inbound PUBLISH may carry a server-injected
-// Subscription Identifier. Used to parse/validate delivered PUBLISH blocks (e.g.
-// in tests). It cannot collide with real packet types (multiples of 0x10).
+// Subscription Identifier and a server-assigned Topic Alias. Used to
+// parse/validate delivered PUBLISH blocks (e.g. in tests). It cannot collide
+// with real packet types (multiples of 0x10).
 const mqttPropsContextPubOut = byte(0x02)
 
 // mqttPropertyAllowed reports whether property prop may appear in the given
@@ -9450,7 +9596,10 @@ func mqttPropertyAllowed(prop, ctx byte) bool {
 	case mqttPropReceiveMaximum, mqttPropTopicAliasMax, mqttPropMaxPacketSize:
 		return ctx == mqttPacketConnect || ctx == mqttPacketConnectAck
 	case mqttPropTopicAlias:
-		return ctx == mqttPacketPub
+		// Valid on a client PUBLISH and, from the server, on a delivered PUBLISH
+		// (mqttPropsContextPubOut). mqttValidateForwardProps still rejects a
+		// publisher-smuggled alias via the mqttPacketPub context.
+		return ctx == mqttPacketPub || ctx == mqttPropsContextPubOut
 	case mqttPropUserProperty:
 		// Allowed in every packet that carries a properties section.
 		return true
