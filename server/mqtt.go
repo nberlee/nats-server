@@ -225,6 +225,20 @@ const (
 	mqttPubRelDeliverySubjectPrefix = mqttPrefix + "deliver.pubrel."
 	mqttPubRelConsumerDurablePrefix = "$MQTT_PUBREL_"
 
+	// Internal names for MQTT 5.0 Shared Subscriptions ("$share/{ShareName}/
+	// {filter}"). All three are derived deterministically from a hash of the
+	// ShareName and the underlying NATS subject (see mqttSharedNames), so every
+	// group member across the cluster converges on a single JetStream consumer.
+	// The deliver subject lives under the $MQTT. prefix so it is treated as an
+	// internal subject users cannot subscribe to. Spec5 [4.8.2].
+	mqttSharedSubDeliverPrefix      = mqttPrefix + "qsub." // "$MQTT.qsub."
+	mqttSharedConsumerDurablePrefix = "$MQTT_SHARED_"
+	// mqttSharedQueuePrefix marks the generated NATS queue-group name as
+	// server-internal so an MQTT client cannot allow/deny it and cannot join a
+	// plain NATS queue group by naming it. Used as the DeliverGroup and as the
+	// queue name on both the raw QoS0 sub and the shared deliver subscription.
+	mqttSharedQueuePrefix = "$mqttshare."
+
 	// As per spec, MQTT server may not redeliver QoS 1 and 2 messages to
 	// clients, except after client reconnects. However, NATS Server will
 	// redeliver unacknowledged messages after this default interval. This can
@@ -275,6 +289,7 @@ const (
 	mqttJSASessPersist    = "SP"
 	mqttJSARetainedMsgDel = "RD"
 	mqttJSAStreamNames    = "SN"
+	mqttJSAConsumerList   = "CLS"
 
 	// This is how long to keep a client in the flappers map before closing the
 	// connection. This prevent quick reconnect from those clients that keep
@@ -320,6 +335,14 @@ var (
 	// How often to re-run the session-expiry sweep for an account. A var so
 	// tests can shorten it.
 	mqttSessionExpirySweepInterval = 15 * time.Minute
+	// How old a consumer must be before the orphan sweep may delete it: a plain
+	// session durable is created before the record save that references it, so a
+	// young unreferenced consumer may just be mid-SUBSCRIBE. A var so tests can
+	// shorten it.
+	mqttOrphanSweepGrace = 5 * time.Minute
+	// Test hook: when set, sess.save() consults it and fails with the returned
+	// error instead of persisting. Used to exercise persistence-failure rollback.
+	mqttTestSessSaveHook func(sess *mqttSession) error
 )
 
 var (
@@ -354,6 +377,7 @@ var (
 	errMQTTAuthMethodNotSupported     = errors.New("enhanced authentication (auth method) is not supported")
 	errMQTTUnsupportedSubOption       = errors.New("unsupported MQTT 5.0 subscription option")
 	errMQTTMalformedSubOption         = errors.New("malformed MQTT 5.0 subscription option")
+	errMQTTMalformedSharedSub         = errors.New("malformed shared subscription")
 	errMQTTTopicAliasInvalid          = errors.New("topic alias invalid")
 	errMQTTReceiveMaxExceeded         = errors.New("receive maximum exceeded")
 )
@@ -463,8 +487,19 @@ type mqttSession struct {
 	noLocalSubs map[string]struct{} // Set of SUBSCRIBE filters that carry the v5 No Local option
 	rapSubs     map[string]struct{} // Set of SUBSCRIBE filters that carry the v5 Retain As Published option
 	subIDs      map[string]int      // SUBSCRIBE filter -> v5 Subscription Identifier (absent = none)
+	// sharedSubs holds MQTT 5.0 Shared Subscriptions, keyed by session key
+	// ("$share/{ShareName}/{NATS subject}") so distinct groups (and a plain
+	// subscription) on the same subject do not collide. Kept separate from subs
+	// so an older server reading the persisted record never subscribes to a
+	// "$share/..." key as a literal topic. rapSubs/subIDs are shared with plain
+	// subscriptions but keyed by session key (collision-free). Spec5 [4.8.2].
+	sharedSubs map[string]byte
 
-	cons                   map[string]*ConsumerConfig
+	cons map[string]*ConsumerConfig
+	// sharedCharged tracks the MaxAckPending this session has added to tmaxack
+	// for each shared group durable it joined (durable -> amount), so a release
+	// subtracts exactly what was charged and only once. In-memory only. Spec5 [4.8.2].
+	sharedCharged          map[string]int
 	pubRelConsumer         *ConsumerConfig
 	pubRelSubscribed       bool
 	pubRelDeliverySubject  string
@@ -524,12 +559,19 @@ type mqttPersistedSession struct {
 	// v5 Subscription Identifier. All kept separate from Subs (rather than packed
 	// into its QoS byte) so an older server reading this record still sees a valid
 	// 0..2 QoS and simply ignores these fields. Spec5 [3.8.3.1], [3.8.2.1.2].
-	NoLocal           []string                   `json:"no_local,omitempty"`
-	RetainAsPublished []string                   `json:"retain_as_published,omitempty"`
-	SubIDs            map[string]int             `json:"sub_ids,omitempty"`
-	Cons              map[string]*ConsumerConfig `json:"cons,omitempty"`
-	PubRel            *ConsumerConfig            `json:"pubrel,omitempty"`
-	Will              *mqttPersistedWill         `json:"will,omitempty"`
+	NoLocal           []string       `json:"no_local,omitempty"`
+	RetainAsPublished []string       `json:"retain_as_published,omitempty"`
+	SubIDs            map[string]int `json:"sub_ids,omitempty"`
+	// SharedSubs is the sole persisted authority for MQTT 5.0 Shared
+	// Subscriptions (session key -> QoS). The group consumer's durable, deliver
+	// subject, and queue name are all derived deterministically from each key
+	// (see mqttSharedNames), so no consumer config is persisted for them — and
+	// they are deliberately excluded from Cons, since an older server would
+	// otherwise delete the group durable in clear(). Spec5 [4.8.2].
+	SharedSubs map[string]byte            `json:"shared_subs,omitempty"`
+	Cons       map[string]*ConsumerConfig `json:"cons,omitempty"`
+	PubRel     *ConsumerConfig            `json:"pubrel,omitempty"`
+	Will       *mqttPersistedWill         `json:"will,omitempty"`
 	// Session Expiry Interval (seconds) and disconnect Unix time (0 while
 	// connected): together the expiry deadline, restart-safe. Spec5 [3.1.2.11.2].
 	ExpiryInterval uint32 `json:"expiry,omitempty"`
@@ -595,6 +637,13 @@ type mqttSub struct {
 	// quickly accessed using sess.subsMu.RLock, or under the main session lock.
 	qos   byte
 	jsDur string
+
+	// shared marks this subscription as belonging to an MQTT 5.0 Shared
+	// Subscription group. Read in the delivery callbacks like qos. When set on a
+	// QoS0 (raw-subject) sub, the callback must not deliver stored (QoS 1/2
+	// published) messages — those arrive through the shared JS consumer instead.
+	// Spec5 [4.8.2].
+	shared bool
 
 	// closed marks the subscription as torn down (QoS downgrade to 0, or
 	// unsubscribe) so QoS 1/2 delivery callbacks stop tracking new messages for
@@ -847,8 +896,22 @@ type mqttPendingWill struct {
 }
 
 // mqttSharedSubPrefix is the MQTT 5.0 Shared Subscription topic filter prefix
-// ("$share/{ShareName}/{filter}"). Shared subscriptions are not implemented.
+// ("$share/{ShareName}/{filter}"). Spec5 [4.8.2].
 var mqttSharedSubPrefix = []byte("$share/")
+
+// mqttSharedNames returns the deterministic, cluster-wide names for a shared
+// subscription group on a given underlying NATS subject: the queue-group name
+// (also used as the JS consumer DeliverGroup), the consumer's deliver subject,
+// and the durable consumer name. Keyed by a hash of ShareName + subject so all
+// members converge on one consumer; 16 chars to make an accidental collision
+// (which would merge two distinct shared subscriptions) negligible. Spec5 [4.8.2].
+func mqttSharedNames(group, subject string) (queue, deliver, durable string) {
+	qkey := getHashSize(group+" "+subject, 16)
+	queue = mqttSharedQueuePrefix + qkey
+	deliver = mqttSharedSubDeliverPrefix + qkey
+	durable = mqttSharedConsumerDurablePrefix + qkey
+	return queue, deliver, durable
+}
 
 type mqttFilter struct {
 	filter string
@@ -874,8 +937,27 @@ type mqttFilter struct {
 	// (UN)SUBACK packet-level Reason String carries the first failed filter's
 	// text. Spec5 [3.9.2.2.2].
 	reasonStr string
+	// shared is set when the filter is an MQTT 5.0 Shared Subscription
+	// ("$share/{ShareName}/{filter}", v5 only). group holds the ShareName. When
+	// shared, filter holds the NATS subject of the underlying topic filter only
+	// (the "$share/" prefix and ShareName are stripped), so all existing
+	// per-subject logic applies unchanged. Spec5 [4.8.2].
+	shared bool
+	group  string
 	// Used only for tracing and should not be used after parsing of (un)sub protocols.
 	ttopic []byte
+}
+
+// sessionKey returns the key used for this filter in the session's subscription
+// maps and as the NATS subscription sid. A shared subscription embeds its
+// ShareName so distinct groups (and a plain subscription) on the same subject do
+// not collide; a plain subscription just uses its NATS subject (which never
+// contains '/'). Spec5 [4.8.2].
+func (f *mqttFilter) sessionKey() string {
+	if f.shared {
+		return string(mqttSharedSubPrefix) + f.group + "/" + f.filter
+	}
+	return f.filter
 }
 
 type mqttPublish struct {
@@ -1677,7 +1759,13 @@ func (s *Server) mqttHandleClosedClient(c *client) {
 		if err := sess.clear(true); err != nil {
 			c.Errorf(err.Error())
 		}
-	} else if expiry != mqttSessionNeverExpire {
+	} else {
+		// Session survives the disconnect: drop pending QoS 1/2 state for shared
+		// group consumers without acking, so a resume does not NAK-steal messages
+		// that AckWait redelivers to other members (and so PIs are freed). Spec5 [4.8.2].
+		sess.purgeSharedPending()
+	}
+	if !doClean && expiry != mqttSessionNeverExpire {
 		// Finite Session Expiry Interval: keep the session (so a reconnect can
 		// resume it) and arm a cleanup timer. Persist the disconnect time so the
 		// deadline survives a restart; a failed save only loses restart-survival.
@@ -2542,19 +2630,24 @@ func (s *Server) mqttCreateAccountSessionManager(acc *Account, quitCh chan struc
 	}
 
 	// Re-arm session-expiry timers and delayed Wills persisted before a
-	// restart, without delaying the connecting client. Then re-sweep expiries
-	// periodically: it catches deadlines that never got a timer (e.g. records
-	// orphaned when their owner crashed while the client was connected).
+	// restart, without delaying the connecting client. Then re-sweep
+	// periodically: expiries catch deadlines that never got a timer (e.g.
+	// records orphaned when their owner crashed while the client was
+	// connected), and the orphaned-consumer sweep reconciles durables leaked in
+	// crash windows (re-run so it also catches orphans skipped by the grace
+	// window at startup).
 	s.startGoRoutine(func() {
 		defer s.grWG.Done()
 		as.sweepSessionExpiries(s)
 		as.sweepPendingWills(s)
+		as.sweepOrphanedConsumers(s)
 		tt := time.NewTicker(mqttSessionExpirySweepInterval)
 		defer tt.Stop()
 		for {
 			select {
 			case <-tt.C:
 				as.sweepSessionExpiries(s)
+				as.sweepOrphanedConsumers(s)
 			case <-closeCh:
 				return
 			case <-s.quitCh:
@@ -2818,6 +2911,30 @@ func (jsa *mqttJSA) deleteStream(name string) (bool, error) {
 	return sdr.Success, sdr.ToError()
 }
 
+// consumerList returns ConsumerInfo for every consumer of the stream, walking
+// the paged CONSUMER.LIST API to completion.
+func (jsa *mqttJSA) consumerList(streamName string) ([]*ConsumerInfo, error) {
+	var all []*ConsumerInfo
+	for {
+		req, err := json.Marshal(&JSApiConsumersRequest{ApiPagedRequest: ApiPagedRequest{Offset: len(all)}})
+		if err != nil {
+			return nil, err
+		}
+		cli, err := jsa.newRequest(mqttJSAConsumerList, fmt.Sprintf(JSApiConsumerListT, streamName), 0, req)
+		if err != nil {
+			return nil, err
+		}
+		clr := cli.(*JSApiConsumerListResponse)
+		if clr.Error != nil {
+			return nil, clr.ToError()
+		}
+		all = append(all, clr.Consumers...)
+		if len(all) >= clr.Total || len(clr.Consumers) == 0 {
+			return all, nil
+		}
+	}
+}
+
 func (jsa *mqttJSA) loadLastMsgFor(streamName string, subject string) (*StoredMsg, error) {
 	mreq := &JSApiMsgGetRequest{LastFor: subject}
 	req, err := json.Marshal(mreq)
@@ -3036,6 +3153,12 @@ func (as *mqttAccountSessionManager) processJSAPIReplies(_ *subscription, pc *cl
 		out(resp)
 	case mqttJSAStreamNames:
 		var resp = &JSApiStreamNamesResponse{}
+		if err := json.Unmarshal(msg, resp); err != nil {
+			resp.Error = NewJSInvalidJSONError(err)
+		}
+		out(resp)
+	case mqttJSAConsumerList:
+		var resp = &JSApiConsumerListResponse{}
 		if err := json.Unmarshal(msg, resp); err != nil {
 			resp.Error = NewJSInvalidJSONError(err)
 		}
@@ -3646,6 +3769,7 @@ func (as *mqttAccountSessionManager) expireSessionFromRecord(s *Server, idHash s
 	sess.domainTk = as.domainTk
 	sess.clean = ps.Clean
 	sess.subs = ps.Subs
+	sess.sharedSubs = ps.SharedSubs
 	sess.cons = ps.Cons
 	sess.pubRelConsumer = ps.PubRel
 	if err := sess.clear(true); err != nil {
@@ -3725,6 +3849,100 @@ func (as *mqttAccountSessionManager) sweepSessionExpiries(s *Server) {
 	}
 	if swept > 0 {
 		s.Debugf("MQTT session expiry sweep re-armed %v timer(s)", swept)
+	}
+}
+
+// sweepOrphanedConsumers deletes MQTT-owned durables on the messages stream
+// that no session references anymore: a crash between a confirmed record
+// save/delete and the consumer teardown (UNSUBSCRIBE, session end, 3.1.1
+// forced leave) leaks the durable forever. Consumers are listed BEFORE the
+// record walk: a shared join persists its record before (re)creating the
+// group durable — and repairs a lost race with a delete by re-issuing the
+// idempotent create — so a listed consumer the walk does not reference was
+// orphaned at list time. Plain session durables are created before the record
+// save that references them, so only consumers older than
+// mqttOrphanSweepGrace are eligible; consumers held by local in-memory
+// sessions count as referenced too. Any indeterminate scan aborts the sweep
+// (fail closed: never delete on a partial view). Runs from the account
+// session manager's sweep go routine. Spec5 [4.8.2].
+func (as *mqttAccountSessionManager) sweepOrphanedConsumers(s *Server) {
+	consumers, err := as.jsa.consumerList(mqttStreamName)
+	if err != nil {
+		s.Debugf("MQTT orphaned consumer sweep ended: %v", err)
+		return
+	}
+	// Candidates: MQTT-shaped (a shared group durable, or a session durable
+	// delivering to "$MQTT.sub.") and older than the grace window. Anything
+	// else on the stream is not ours to judge. A consumer the clustered LIST
+	// could not report (Missing) is not a candidate until a later sweep sees it.
+	cutoff := time.Now().Add(-mqttOrphanSweepGrace)
+	candidates := make(map[string]struct{})
+	for _, ci := range consumers {
+		if ci == nil || ci.Config == nil || !ci.Created.Before(cutoff) {
+			continue
+		}
+		if !strings.HasPrefix(ci.Name, mqttSharedConsumerDurablePrefix) &&
+			!strings.HasPrefix(ci.Config.DeliverSubject, mqttSubPrefix) {
+			continue
+		}
+		candidates[ci.Name] = struct{}{}
+	}
+	if len(candidates) == 0 {
+		return
+	}
+	// A local session's in-memory state may be newer than its persisted record
+	// (a save may be in flight); count its consumers as referenced.
+	as.mu.RLock()
+	sesss := make([]*mqttSession, 0, len(as.sessions))
+	for _, sess := range as.sessions {
+		sesss = append(sesss, sess)
+	}
+	as.mu.RUnlock()
+	for _, sess := range sesss {
+		sess.mu.Lock()
+		for _, cc := range sess.cons {
+			delete(candidates, cc.Durable)
+		}
+		for key := range sess.sharedSubs {
+			for _, dur := range mqttSharedDurablesForKey(key) {
+				delete(candidates, dur)
+			}
+		}
+		sess.mu.Unlock()
+	}
+	// Walk every session record; any referenced durable is not an orphan.
+	filter := mqttSessStreamSubjectPrefix + as.domainTk + ">"
+	for seq := uint64(1); len(candidates) > 0; {
+		smsg, err := as.jsa.loadNextMsgFromSeq(mqttSessStreamName, filter, seq)
+		if err != nil {
+			if isErrorOtherThan(err, JSNoMessageFoundErr) {
+				s.Debugf("MQTT orphaned consumer sweep ended: %v", err)
+				return
+			}
+			break
+		}
+		seq = smsg.Sequence + 1
+		ps := &mqttPersistedSession{}
+		if err := json.Unmarshal(smsg.Data, ps); err != nil {
+			// An undecodable record may still reference candidates: abort.
+			s.Warnf("MQTT orphaned consumer sweep: unable to decode session record at sequence %v: %v", smsg.Sequence, err)
+			return
+		}
+		for _, cc := range ps.Cons {
+			delete(candidates, cc.Durable)
+		}
+		for key := range ps.SharedSubs {
+			for _, dur := range mqttSharedDurablesForKey(key) {
+				delete(candidates, dur)
+			}
+		}
+	}
+	for dur := range candidates {
+		if _, err := as.jsa.deleteConsumer(mqttStreamName, dur, false); isErrorOtherThan(err, JSConsumerNotFoundErr) {
+			s.Warnf("MQTT orphaned consumer sweep: unable to delete consumer %q: %v", dur, err)
+			continue
+		}
+		s.Debugf("MQTT orphaned consumer sweep deleted consumer %q", dur)
 	}
 }
 
@@ -4009,14 +4227,14 @@ func (as *mqttAccountSessionManager) removeSession(sess *mqttSession, lock bool)
 // waiting.
 func (sess *mqttSession) processQOS12Sub(
 	c *client, // subscribing client.
-	subject, sid []byte, isReserved bool, qos byte, noLocal, retainAsPublished bool, subID int, jsDurName string, h msgHandler, // subscription parameters.
+	subject, sid, queue []byte, isReserved bool, qos byte, noLocal, retainAsPublished, shared bool, subID int, jsDurName string, h msgHandler, // subscription parameters.
 ) (*subscription, error) {
-	return sess.processSub(c, subject, sid, isReserved, qos, noLocal, retainAsPublished, subID, jsDurName, h, false, nil, false, nil)
+	return sess.processSub(c, subject, sid, queue, isReserved, qos, noLocal, retainAsPublished, shared, subID, jsDurName, h, false, nil, false, nil)
 }
 
 func (sess *mqttSession) processSub(
 	c *client, // subscribing client.
-	subject, sid []byte, isReserved bool, qos byte, noLocal, retainAsPublished bool, subID int, jsDurName string, h msgHandler, // subscription parameters.
+	subject, sid, queue []byte, isReserved bool, qos byte, noLocal, retainAsPublished, shared bool, subID int, jsDurName string, h msgHandler, // subscription parameters.
 	initShadow bool, // do we need to scan for shadow subscriptions? (not for QOS1+)
 	rms map[string]*mqttRetainedMsg, // preloaded rms (can be empty, or missing items if errors)
 	trace bool, // trace serialized retained messages in the log?
@@ -4035,7 +4253,7 @@ func (sess *mqttSession) processSub(
 	sess.subsMu.Lock()
 	defer sess.subsMu.Unlock()
 
-	sub, err := c.processSub(subject, nil, sid, h, false)
+	sub, err := c.processSub(subject, queue, sid, h, false)
 	if err != nil {
 		// c.processSub already called c.Errorf(), so no need here.
 		return nil, err
@@ -4059,6 +4277,7 @@ func (sess *mqttSession) processSub(
 		ss.mqtt.retainAsPublished = retainAsPublished
 		ss.mqtt.subID = subID
 		ss.mqtt.jsDur = jsDurName
+		ss.mqtt.shared = shared
 		// A (re)configured subscription is live; clear any prior teardown mark.
 		ss.mqtt.closed = false
 	}
@@ -4170,15 +4389,17 @@ func (as *mqttAccountSessionManager) processSubs(sess *mqttSession, c *client,
 	filters []*mqttFilter, fromSubProto, trace bool) ([]*subscription, error) {
 
 	// Helper to determine if we need to create a separate top-level
-	// subscription for a wildcard.
-	fwc := func(subject string) (bool, string, string) {
+	// subscription for a wildcard. sid is derived from the passed-in sid (which
+	// for a shared subscription embeds the ShareName) rather than from the
+	// subject, so the level-up sid stays in the same namespace as its parent.
+	fwc := func(subject, sid string) (bool, string, string) {
 		if !mqttNeedSubForLevelUp(subject) {
 			return false, _EMPTY_, _EMPTY_
 		}
 		// Say subject is "foo.>", remove the ".>" so that it becomes "foo"
 		fwcsubject := subject[:len(subject)-2]
-		// Change the sid to "foo fwc"
-		fwcsid := fwcsubject + mqttMultiLevelSidSuffix
+		// Change the sid to "foo fwc" (for a shared sub, "$share/g/foo fwc")
+		fwcsid := sid[:len(sid)-2] + mqttMultiLevelSidSuffix
 
 		return true, fwcsubject, fwcsid
 	}
@@ -4207,7 +4428,8 @@ func (as *mqttAccountSessionManager) processSubs(sess *mqttSession, c *client,
 		// include everything; I guess this would discourage? Otherwise another
 		// candidate for DO NOT DELIVER prefix list).
 		if strings.HasPrefix(f.filter, mqttSubPrefix) ||
-			strings.HasPrefix(f.filter, mqttPubRelDeliverySubjectPrefix) {
+			strings.HasPrefix(f.filter, mqttPubRelDeliverySubjectPrefix) ||
+			strings.HasPrefix(f.filter, mqttSharedSubDeliverPrefix) {
 			f.qos = mqttSubAckFailure
 			f.reasonStr = "cannot subscribe to internal server subject"
 			continue
@@ -4222,13 +4444,17 @@ func (as *mqttAccountSessionManager) processSubs(sess *mqttSession, c *client,
 			}
 		}
 
+		// Shared subscriptions never receive retained messages. Spec5 [4.8.2].
+		if f.shared {
+			continue
+		}
 		// Find retained messages. The v5 Retain Handling option controls whether
 		// they are replayed at subscribe time. sess.subs still holds the
 		// pre-SUBSCRIBE state here (sess.update runs at the end), so it is the
 		// right source for the "subscription already exists" test. Spec5 [3.8.3.1].
 		if fromSubProto && mqttShouldSendRetained(f.retainHandling, sess.subs, f.filter) {
 			as.addRetainedSubjectsForSubject(rmSubjects, f.filter)
-			if need, subject, _ := fwc(f.filter); need {
+			if need, subject, _ := fwc(f.filter, f.filter); need {
 				as.addRetainedSubjectsForSubject(rmSubjects, subject)
 			}
 		}
@@ -4251,6 +4477,30 @@ func (as *mqttAccountSessionManager) processSubs(sess *mqttSession, c *client,
 		sess.cons[sid] = cc
 	}
 
+	// Snapshot pre-SUBSCRIBE membership AND consumer entries so a final-save
+	// failure can restore both exactly (only meaningful when persisting, i.e.
+	// fromSubProto). Spec5 [4.8.2].
+	var snap *mqttSubSnapshot
+	var consSnap map[string]*ConsumerConfig
+	if fromSubProto {
+		snap = sess.snapshotSubs()
+		sess.mu.Lock()
+		consSnap = make(map[string]*ConsumerConfig, len(sess.cons))
+		for k, v := range sess.cons {
+			consSnap[k] = v
+		}
+		sess.mu.Unlock()
+	}
+	// Irreversible teardown of consumers removed by a QoS downgrade in this
+	// packet is deferred until the final session save is confirmed, so a failed
+	// save can restore the pre-packet consumer instead of having lost its
+	// durable/cursor. Spec5 [4.8.2].
+	type deferredDel struct {
+		sid string
+		cc  *ConsumerConfig
+	}
+	var deferredDels []deferredDel
+
 	var err error
 	subs := make([]*subscription, 0, len(filters))
 	for _, f := range filters {
@@ -4261,9 +4511,19 @@ func (as *mqttAccountSessionManager) processSubs(sess *mqttSession, c *client,
 		}
 		subject := f.filter
 		bsubject := []byte(subject)
-		sid := subject
-		bsid := bsubject
+		sid := f.sessionKey()
+		bsid := []byte(sid)
 		isReserved := isMQTTReservedSubscription(subject)
+
+		// For a shared subscription the raw QoS0 subscription is a NATS queue
+		// subscription so a QoS0-published message reaches exactly one group
+		// member. The queue name is derived (with the level-up subject handled
+		// below) and doubles as the JS consumer DeliverGroup. Spec5 [4.8.2].
+		var queue []byte
+		if f.shared {
+			q, _, _ := mqttSharedNames(f.group, subject)
+			queue = []byte(q)
+		}
 
 		// Retain Handling is per-subscription, but the preloaded rms is shared
 		// across all filters in this SUBSCRIBE and matched against each sub's
@@ -4272,10 +4532,34 @@ func (as *mqttAccountSessionManager) processSubs(sess *mqttSession, c *client,
 		// (e.g. a wildcard with RH=0) caused that subject to be loaded. So pass
 		// rms only to filters that must replay; nil otherwise. sess.subs is
 		// unchanged until sess.update at the end, so this matches the preload
-		// decision. Spec5 [3.8.3.1].
+		// decision. Shared subscriptions never replay retained. Spec5 [3.8.3.1], [4.8.2].
 		subRMS := rms
-		if !mqttShouldSendRetained(f.retainHandling, sess.subs, f.filter) {
+		if f.shared || !mqttShouldSendRetained(f.retainHandling, sess.subs, f.filter) {
 			subRMS = nil
+		}
+
+		// For a shared subscription persist membership BEFORE creating the group
+		// consumer, so a concurrent leaver's last-holder scan (possibly on another
+		// server) sees this joiner. Snapshot the prior state so a later failure of
+		// this filter restores it rather than leaving a phantom member. Spec5 [4.8.2].
+		var priorQoS byte
+		var priorExisted, priorRap bool
+		var priorSubID int
+		if fromSubProto && f.shared {
+			priorQoS, priorExisted = sess.sharedSubs[sid]
+			if priorExisted {
+				_, priorRap = sess.rapSubs[sid]
+				priorSubID = sess.subIDs[sid]
+			}
+			if err := sess.update([]*mqttFilter{f}, true); err != nil {
+				f.qos = mqttSubAckFailure
+				f.reasonStr = err.Error()
+				// update() mutated the in-memory maps before its save failed; revert
+				// them so a later save in this packet cannot persist a phantom
+				// membership. Spec5 [4.8.2].
+				sess.restoreSharedKeyInMemory(sid, priorExisted, priorQoS, priorRap, priorSubID)
+				continue
+			}
 		}
 
 		var jscons *ConsumerConfig
@@ -4286,12 +4570,22 @@ func (as *mqttAccountSessionManager) processSubs(sess *mqttSession, c *client,
 		var sub *subscription
 		var err error
 
+		// Deferred consumer deletes recorded by THIS filter, so a later per-filter
+		// failure can cancel them (restore the sess.cons entry, keep the durable).
+		filterDefStart := len(deferredDels)
+		cancelFilterDeferred := func() {
+			// The sess.cons entries were never removed (removal happens at
+			// execution time, after the confirmed save), so cancelling is just
+			// dropping this filter's descriptors.
+			deferredDels = deferredDels[:filterDefStart]
+		}
+
 		const processShadowSubs = true
 
 		as.mu.Lock()
 		sess.mu.Lock()
 		sub, err = sess.processSub(c,
-			bsubject, bsid, isReserved, f.qos, f.noLocal, f.retainAsPublished, f.subID, // main subject
+			bsubject, bsid, queue, isReserved, f.qos, f.noLocal, f.retainAsPublished, f.shared, f.subID, // main subject
 			_EMPTY_, mqttDeliverMsgCbQoS0, // no jsDur for QOS0
 			processShadowSubs,
 			subRMS, trace, as)
@@ -4301,33 +4595,67 @@ func (as *mqttAccountSessionManager) processSubs(sess *mqttSession, c *client,
 		if err != nil {
 			f.qos = mqttSubAckFailure
 			f.reasonStr = err.Error()
-			sess.cleanupFailedSub(c, sub, jscons, jssub)
+			cancelFilterDeferred()
+			doCleanup, rerr := sess.rollbackSharedSub(c, f, fromSubProto, priorExisted, priorQoS, priorRap, priorSubID)
+			if rerr != nil {
+				// Rollback persistence not confirmed: hard-error WITHOUT releasing
+				// resources, so we never delete a group durable the record may still
+				// claim membership in. Spec5 [4.8.2].
+				return subs, rerr
+			}
+			if doCleanup {
+				sess.cleanupFailedSub(c, sub, jscons, jssub)
+			}
 			continue
 		}
 
 		// This will create (if not already exist) a JS consumer for
 		// subscriptions of QoS >= 1. But if a JS consumer already exists and
 		// the subscription for same subject is now a QoS==0, then the JS
-		// consumer will be deleted.
-		jscons, jssub, err = sess.processJSConsumer(c, subject, sid, f.qos, f.noLocal, f.retainAsPublished, f.subID, fromSubProto)
+		// consumer will be deleted. Shared subscriptions always join the group
+		// consumer (even at QoS0, so stored messages are delivered at QoS0).
+		if f.shared {
+			jscons, jssub, err = sess.processSharedJSConsumer(c, f.group, subject, sid, f.qos, f.retainAsPublished, f.subID, fromSubProto)
+		} else {
+			var dd *ConsumerConfig
+			jscons, jssub, dd, err = sess.processJSConsumer(c, subject, sid, f.qos, f.noLocal, f.retainAsPublished, f.subID, fromSubProto)
+			if dd != nil {
+				deferredDels = append(deferredDels, deferredDel{sid: sid, cc: dd})
+			}
+		}
 		if err != nil {
 			f.qos = mqttSubAckFailure
 			f.reasonStr = err.Error()
-			sess.cleanupFailedSub(c, sub, jscons, jssub)
+			cancelFilterDeferred()
+			doCleanup, rerr := sess.rollbackSharedSub(c, f, fromSubProto, priorExisted, priorQoS, priorRap, priorSubID)
+			if rerr != nil {
+				// Rollback persistence not confirmed: hard-error WITHOUT releasing
+				// resources, so we never delete a group durable the record may still
+				// claim membership in. Spec5 [4.8.2].
+				return subs, rerr
+			}
+			if doCleanup {
+				sess.cleanupFailedSub(c, sub, jscons, jssub)
+			}
 			continue
 		}
 
 		// Process the wildcard subject if needed.
-		if need, fwcsubject, fwcsid := fwc(subject); need {
+		if need, fwcsubject, fwcsid := fwc(subject, sid); need {
 			var fwjscons *ConsumerConfig
 			var fwjssub *subscription
 			var fwcsub *subscription
+			var fwcqueue []byte
+			if f.shared {
+				q, _, _ := mqttSharedNames(f.group, fwcsubject)
+				fwcqueue = []byte(q)
+			}
 
 			// See note above about existing subscription.
 			as.mu.Lock()
 			sess.mu.Lock()
 			fwcsub, err = sess.processSub(c,
-				[]byte(fwcsubject), []byte(fwcsid), isReserved, f.qos, f.noLocal, f.retainAsPublished, f.subID, // FWC (top-level wildcard) subject
+				[]byte(fwcsubject), []byte(fwcsid), fwcqueue, isReserved, f.qos, f.noLocal, f.retainAsPublished, f.shared, f.subID, // FWC (top-level wildcard) subject
 				_EMPTY_, mqttDeliverMsgCbQoS0, // no jsDur for QOS0
 				processShadowSubs,
 				subRMS, trace, as)
@@ -4337,17 +4665,39 @@ func (as *mqttAccountSessionManager) processSubs(sess *mqttSession, c *client,
 				// c.processSub already called c.Errorf(), so no need here.
 				f.qos = mqttSubAckFailure
 				f.reasonStr = err.Error()
-				sess.cleanupFailedSub(c, sub, jscons, jssub)
+				cancelFilterDeferred()
+				doCleanup, rerr := sess.rollbackSharedSub(c, f, fromSubProto, priorExisted, priorQoS, priorRap, priorSubID)
+				if rerr != nil {
+					return subs, rerr
+				}
+				if doCleanup {
+					sess.cleanupFailedSub(c, sub, jscons, jssub)
+				}
 				continue
 			}
 
-			fwjscons, fwjssub, err = sess.processJSConsumer(c, fwcsubject, fwcsid, f.qos, f.noLocal, f.retainAsPublished, f.subID, fromSubProto)
+			if f.shared {
+				fwjscons, fwjssub, err = sess.processSharedJSConsumer(c, f.group, fwcsubject, fwcsid, f.qos, f.retainAsPublished, f.subID, fromSubProto)
+			} else {
+				var fwdd *ConsumerConfig
+				fwjscons, fwjssub, fwdd, err = sess.processJSConsumer(c, fwcsubject, fwcsid, f.qos, f.noLocal, f.retainAsPublished, f.subID, fromSubProto)
+				if fwdd != nil {
+					deferredDels = append(deferredDels, deferredDel{sid: fwcsid, cc: fwdd})
+				}
+			}
 			if err != nil {
 				// c.processSub already called c.Errorf(), so no need here.
 				f.qos = mqttSubAckFailure
 				f.reasonStr = err.Error()
-				sess.cleanupFailedSub(c, sub, jscons, jssub)
-				sess.cleanupFailedSub(c, fwcsub, fwjscons, fwjssub)
+				cancelFilterDeferred()
+				doCleanup, rerr := sess.rollbackSharedSub(c, f, fromSubProto, priorExisted, priorQoS, priorRap, priorSubID)
+				if rerr != nil {
+					return subs, rerr
+				}
+				if doCleanup {
+					sess.cleanupFailedSub(c, sub, jscons, jssub)
+					sess.cleanupFailedSub(c, fwcsub, fwjscons, fwjssub)
+				}
 				continue
 			}
 
@@ -4360,10 +4710,232 @@ func (as *mqttAccountSessionManager) processSubs(sess *mqttSession, c *client,
 	}
 
 	if fromSubProto {
-		err = sess.update(filters, true)
+		if err = sess.update(filters, true); err != nil {
+			// The session record could not be persisted. Rather than leave a
+			// partially-applied SUBSCRIBE live with no SUBACK sent, tear down every
+			// subscription and consumer newly created in this packet, restore the
+			// pre-packet membership and consumer entries (deferred downgrade deletes
+			// were never executed, so their durables are intact), then return the
+			// error so the connection closes. Spec5 [4.8.2].
+			sess.rollbackSubscribePacket(c, subs, consSnap, snap)
+		} else {
+			// Save confirmed: now run the irreversible teardown of consumers that
+			// this packet downgraded to QoS0.
+			for _, dd := range deferredDels {
+				sess.execDeferredConsumerDelete(c, dd.sid, dd.cc)
+			}
+		}
 	}
 
 	return subs, err
+}
+
+// rollbackSharedSub undoes the early membership persistence done for a shared
+// filter whose subscribe subsequently failed. A re-SUBSCRIBE of a filter that
+// existed before this packet is restored to its prior QoS/RAP/subID and its
+// membership kept (returns run=false, so the caller does NOT release the shared
+// consumer); a newly-added filter is removed and the caller must release its
+// resources (run=true). For non-shared filters or the CONNECT restore path this
+// is a no-op that just asks the caller to run its normal cleanup. If the rollback
+// persist fails it returns a non-nil error so the caller escalates to a hard
+// processing error rather than leaving a phantom persisted membership. Spec5 [4.8.2].
+func (sess *mqttSession) rollbackSharedSub(c *client, f *mqttFilter, fromSubProto, priorExisted bool, priorQoS byte, priorRap bool, priorSubID int) (run bool, err error) {
+	if !fromSubProto || !f.shared {
+		return true, nil
+	}
+	if priorExisted {
+		restore := &mqttFilter{shared: true, group: f.group, filter: f.filter, qos: priorQoS, retainAsPublished: priorRap, subID: priorSubID}
+		if e := sess.update([]*mqttFilter{restore}, true); e != nil {
+			return false, e
+		}
+		// A failed re-SUBSCRIBE must keep delivering with the OLD state: the
+		// processSub/processSharedJSConsumer refresh already overwrote the live
+		// subscription's QoS/RAP/subID with the attempted values, so restore them.
+		// Spec5 [4.8.2].
+		sess.restoreSharedLiveMetadata(c, f, priorQoS, priorRap, priorSubID)
+		return false, nil
+	}
+	return true, sess.update([]*mqttFilter{f}, false)
+}
+
+// restoreSharedLiveMetadata resets the live QoS/RAP/subID on a shared filter's
+// raw-subject subscription, its level-up subscription (if any), and its group
+// deliver subscription to the given prior values, after a failed re-SUBSCRIBE
+// refreshed them to the attempted values. Spec5 [4.8.2].
+func (sess *mqttSession) restoreSharedLiveMetadata(c *client, f *mqttFilter, qos byte, rap bool, subID int) {
+	sid := f.sessionKey()
+	_, deliver, _ := mqttSharedNames(f.group, f.filter)
+	setFields := func(csid string) {
+		c.mu.Lock()
+		sub := c.subs[csid]
+		c.mu.Unlock()
+		if sub == nil {
+			return
+		}
+		sess.mu.Lock()
+		sess.subsMu.Lock()
+		if sub.mqtt != nil {
+			sub.mqtt.qos = qos
+			sub.mqtt.retainAsPublished = rap
+			sub.mqtt.subID = subID
+		}
+		sess.subsMu.Unlock()
+		sess.mu.Unlock()
+	}
+	setFields(sid)     // raw-subject sub
+	setFields(deliver) // group deliver sub
+	if mqttNeedSubForLevelUp(f.filter) {
+		setFields(sid[:len(sid)-2] + mqttMultiLevelSidSuffix)
+		_, ldeliver, _ := mqttSharedNames(f.group, f.filter[:len(f.filter)-2])
+		setFields(ldeliver)
+	}
+}
+
+// mqttSubSnapshot captures the pre-SUBSCRIBE state of the session's subscription
+// maps so a failed packet can be reverted exactly. Spec5 [4.8.2].
+type mqttSubSnapshot struct {
+	subs    map[string]byte
+	shared  map[string]byte
+	rap     map[string]struct{}
+	noLocal map[string]struct{}
+	subIDs  map[string]int
+}
+
+// snapshotSubs shallow-copies every subscription map under the session lock.
+func (sess *mqttSession) snapshotSubs() *mqttSubSnapshot {
+	sess.mu.Lock()
+	defer sess.mu.Unlock()
+	s := &mqttSubSnapshot{
+		subs:    make(map[string]byte, len(sess.subs)),
+		shared:  make(map[string]byte, len(sess.sharedSubs)),
+		rap:     make(map[string]struct{}, len(sess.rapSubs)),
+		noLocal: make(map[string]struct{}, len(sess.noLocalSubs)),
+		subIDs:  make(map[string]int, len(sess.subIDs)),
+	}
+	for k, v := range sess.subs {
+		s.subs[k] = v
+	}
+	for k, v := range sess.sharedSubs {
+		s.shared[k] = v
+	}
+	for k := range sess.rapSubs {
+		s.rap[k] = struct{}{}
+	}
+	for k := range sess.noLocalSubs {
+		s.noLocal[k] = struct{}{}
+	}
+	for k, v := range sess.subIDs {
+		s.subIDs[k] = v
+	}
+	return s
+}
+
+// restoreSharedKeyInMemory reverts the in-memory shared-subscription maps for one
+// session key to the given prior state, without persisting. Used when an early
+// membership persist failed (update mutates the maps before it saves). Spec5 [4.8.2].
+func (sess *mqttSession) restoreSharedKeyInMemory(sid string, existed bool, qos byte, rap bool, subID int) {
+	sess.mu.Lock()
+	defer sess.mu.Unlock()
+	if existed {
+		if sess.sharedSubs == nil {
+			sess.sharedSubs = make(map[string]byte)
+		}
+		sess.sharedSubs[sid] = qos
+	} else {
+		delete(sess.sharedSubs, sid)
+	}
+	sess.rapSubs, _ = mqttUpdateFilterOptSet(sess.rapSubs, sid, existed && rap)
+	sess.subIDs, _ = mqttUpdateFilterSubID(sess.subIDs, sid, mqttZeroIf(!existed, subID))
+}
+
+// mqttZeroIf returns 0 when cond is true, else v. Helper for map-key clears.
+func mqttZeroIf(cond bool, v int) int {
+	if cond {
+		return 0
+	}
+	return v
+}
+
+// rollbackSubscribePacket undoes every runtime and persisted change made by a
+// SUBSCRIBE whose final session-record save failed. It restores the pre-packet
+// subscription maps and re-persists them; only if that restore save is confirmed
+// does it tear down the subscriptions and consumers that were NEWLY created in
+// this packet — so a group durable is never deleted while the persisted record
+// might still claim membership. A re-SUBSCRIBE of a pre-existing filter keeps its
+// membership and runtime state. The connection is closing regardless. Spec5 [4.8.2].
+func (sess *mqttSession) rollbackSubscribePacket(c *client, subs []*subscription, consSnap map[string]*ConsumerConfig, snap *mqttSubSnapshot) {
+	// Restore EVERYTHING the packet mutated — the membership maps AND sess.cons —
+	// before the confirm-save, so the record is written from a fully rolled-back
+	// view: a QoS0->QoS1 upgrade's new consumer must not be persisted under the
+	// restored QoS0 subs key, and a QoS1->QoS0 downgrade's restored subscription
+	// must be persisted WITH its pre-existing consumer config (its durable is
+	// intact because downgrade deletes are deferred until a confirmed save, which
+	// did not happen). The pre-packet consumer snapshot is authoritative for these
+	// QoS transitions, which the membership maps alone cannot express. Spec5 [4.8.2].
+	var added []struct {
+		sid string
+		cc  *ConsumerConfig
+	}
+	sess.mu.Lock()
+	for sid, cc := range sess.cons {
+		if _, ok := consSnap[sid]; !ok {
+			added = append(added, struct {
+				sid string
+				cc  *ConsumerConfig
+			}{sid, cc})
+		}
+	}
+	sess.subs = snap.subs
+	sess.sharedSubs = snap.shared
+	sess.rapSubs = snap.rap
+	sess.noLocalSubs = snap.noLocal
+	sess.subIDs = snap.subIDs
+	sess.cons = consSnap
+	sess.mu.Unlock()
+	if err := sess.save(); err != nil {
+		// Could not confirm the rolled-back record. Do not release/delete anything
+		// (a durable could be orphaned while the record still claims membership);
+		// put the packet's consumer entries back so the in-memory view matches the
+		// still-live resources, and let a reconnect reconcile from the record.
+		sess.mu.Lock()
+		if sess.cons == nil {
+			sess.cons = make(map[string]*ConsumerConfig)
+		}
+		for _, a := range added {
+			sess.cons[a.sid] = a.cc
+		}
+		sess.mu.Unlock()
+		c.Errorf("MQTT: unable to persist rolled-back session after SUBSCRIBE failure: %v", err)
+		return
+	}
+
+	// A raw subscription "existed before" this packet if the restored membership
+	// still holds its filter. The level-up sid ("<mainsid without .>> fwc") maps
+	// back to the main membership key ("<...>.>").
+	existedBefore := func(sid string) bool {
+		key := sid
+		if strings.HasSuffix(key, mqttMultiLevelSidSuffix) {
+			key = strings.TrimSuffix(key, mqttMultiLevelSidSuffix) + ".>"
+		}
+		if strings.HasPrefix(key, string(mqttSharedSubPrefix)) {
+			_, ok := snap.shared[key]
+			return ok
+		}
+		_, ok := snap.subs[key]
+		return ok
+	}
+	for _, sub := range subs {
+		if sub != nil && !existedBefore(string(sub.sid)) {
+			c.processUnsub(sub.sid)
+		}
+	}
+	for _, a := range added {
+		if a.cc.DeliverGroup != _EMPTY_ {
+			sess.releaseSharedConsumer(c, a.cc, nil)
+		} else {
+			sess.execDeferredConsumerDelete(c, a.sid, a.cc)
+		}
+	}
 }
 
 // Retained publish messages matching this subscription are serialized in the
@@ -4875,6 +5447,7 @@ func (as *mqttAccountSessionManager) createOrRestoreSession(clientID string, opt
 		sess := mqttSessionCreate(jsa, clientID, hash, smsg.Sequence, opts)
 		sess.domainTk = as.domainTk
 		sess.cons = ps.Cons
+		sess.sharedSubs = ps.SharedSubs
 		sess.pubRelConsumer = ps.PubRel
 		// Wait for the deletes (like the clean-start discard): a queued no-wait
 		// delete of the deterministic PUBREL durable could otherwise race the new
@@ -4894,6 +5467,7 @@ func (as *mqttAccountSessionManager) createOrRestoreSession(clientID string, opt
 	sess.noLocalSubs = mqttFilterSetFromList(ps.NoLocal)
 	sess.rapSubs = mqttFilterSetFromList(ps.RetainAsPublished)
 	sess.subIDs = ps.SubIDs
+	sess.sharedSubs = ps.SharedSubs
 	sess.cons = ps.Cons
 	sess.pubRelConsumer = ps.PubRel
 	sess.expiryInterval = ps.ExpiryInterval
@@ -5146,7 +5720,41 @@ func mqttSessionCreate(jsa *mqttJSA, id, idHash string, seq uint64, opts *Option
 //
 // Lock not held on entry.
 func (sess *mqttSession) save() error {
+	if h := mqttTestSessSaveHook; h != nil {
+		if err := h(sess); err != nil {
+			return err
+		}
+	}
 	sess.mu.Lock()
+	// Persist only consumer configs that still correspond to a live subscription:
+	//   - Shared (DeliverGroup) consumers are group-owned and reconstructed from
+	//     SharedSubs on restore; never persist them in Cons (an older server would
+	//     delete the group durable in clear()).
+	//   - A plain consumer is persisted only while its subscription exists in Subs,
+	//     so a consumer removed from Subs but not yet torn down (e.g. UNSUBSCRIBE
+	//     persisting before teardown, or a rolled-back failed SUBSCRIBE) is not
+	//     written with no matching Subs entry. The level-up sid "<X> fwc" maps back
+	//     to the main membership key "<X>.>". Spec5 [4.8.2].
+	var cons map[string]*ConsumerConfig
+	if len(sess.cons) > 0 {
+		cons = make(map[string]*ConsumerConfig, len(sess.cons))
+		for sid, cc := range sess.cons {
+			if cc.DeliverGroup != _EMPTY_ {
+				continue
+			}
+			key := sid
+			if strings.HasSuffix(key, mqttMultiLevelSidSuffix) {
+				key = strings.TrimSuffix(key, mqttMultiLevelSidSuffix) + ".>"
+			}
+			if _, ok := sess.subs[key]; !ok {
+				continue
+			}
+			cons[sid] = cc
+		}
+		if len(cons) == 0 {
+			cons = nil
+		}
+	}
 	ps := mqttPersistedSession{
 		Origin:            sess.jsa.id,
 		ID:                sess.id,
@@ -5155,7 +5763,8 @@ func (sess *mqttSession) save() error {
 		NoLocal:           mqttFilterSetToList(sess.noLocalSubs),
 		RetainAsPublished: mqttFilterSetToList(sess.rapSubs),
 		SubIDs:            sess.subIDs,
-		Cons:              sess.cons,
+		SharedSubs:        sess.sharedSubs,
+		Cons:              cons,
 		PubRel:            sess.pubRelConsumer,
 		Will:              sess.will,
 		ExpiryInterval:    sess.expiryInterval,
@@ -5197,6 +5806,7 @@ func (sess *mqttSession) save() error {
 // Lock not held on entry, but session is in the locked map.
 func (sess *mqttSession) clear(noWait bool) error {
 	var durs []string
+	var sharedDurs []string
 	var pubRelDur string
 
 	sess.mu.Lock()
@@ -5207,7 +5817,19 @@ func (sess *mqttSession) clear(noWait bool) error {
 	}
 	for sid, cc := range sess.cons {
 		delete(sess.cons, sid)
+		// A shared group consumer is not owned by this session alone; it is
+		// released (deleted only if no other member remains) after our record is
+		// gone, below. Spec5 [4.8.2].
+		if cc.DeliverGroup != _EMPTY_ {
+			continue
+		}
 		durs = append(durs, cc.Durable)
+	}
+	// Derive shared group durables from the persisted authority (sharedSubs),
+	// which also covers transient sessions rebuilt for expiry that carry no
+	// consumer configs in memory. Spec5 [4.8.2].
+	for key := range sess.sharedSubs {
+		sharedDurs = append(sharedDurs, mqttSharedDurablesForKey(key)...)
 	}
 	if sess.pubRelConsumer != nil {
 		pubRelDur = sess.pubRelConsumer.Durable
@@ -5217,6 +5839,8 @@ func (sess *mqttSession) clear(noWait bool) error {
 	sess.noLocalSubs = nil
 	sess.rapSubs = nil
 	sess.subIDs = nil
+	sess.sharedSubs = nil
+	sess.sharedCharged = nil
 	sess.pendingPublish = nil
 	sess.pendingPubRel = nil
 	sess.cpending = nil
@@ -5241,12 +5865,33 @@ func (sess *mqttSession) clear(noWait bool) error {
 	}
 
 	if seq > 0 {
-		err := sess.jsa.deleteMsg(mqttSessStreamName, seq, !noWait)
+		// When shared subscriptions are involved, wait for the record deletion to
+		// be confirmed even on the no-wait path, so the last-holder scan below
+		// cannot observe this session's own stale record and wrongly keep (or, via
+		// another member, delete) a group durable. Spec5 [4.8.2].
+		wait := !noWait || len(sharedDurs) > 0
+		err := sess.jsa.deleteMsg(mqttSessStreamName, seq, wait)
 		// Ignore the various errors indicating that the message (or sequence)
 		// is already deleted, can happen in a cluster.
 		if isErrorOtherThan(err, JSSequenceNotFoundErrF) {
 			if isErrorOtherThan(err, JSStreamMsgDeleteFailedF) || !strings.Contains(err.Error(), ErrStoreMsgNotFound.Error()) {
 				return fmt.Errorf("unable to delete session %q record at sequence %v: %v", id, seq, err)
+			}
+		}
+	}
+
+	// Release shared group consumers only after this session's record is gone, so
+	// the last-holder scan does not count this session; delete each only when no
+	// other member remains. sharedSubs was niled above, so the scan's in-memory
+	// check is empty and only other sessions' records matter. Spec5 [4.8.2].
+	if len(sharedDurs) > 0 {
+		held := sess.sharedDurablesHeldByOthers(sharedDurs)
+		for _, dur := range sharedDurs {
+			if held[dur] {
+				continue
+			}
+			if _, err := sess.jsa.deleteConsumer(mqttStreamName, dur, noWait); isErrorOtherThan(err, JSConsumerNotFoundErr) {
+				return fmt.Errorf("unable to delete shared consumer %q for session %q: %v", dur, sess.id, err)
 			}
 		}
 	}
@@ -5262,45 +5907,64 @@ func (sess *mqttSession) update(filters []*mqttFilter, add bool) error {
 	// Evaluate if we need to persist anything.
 	var needUpdate bool
 	for _, f := range filters {
+		// Shared subscriptions live in a separate map keyed by session key; plain
+		// subscriptions in subs keyed by their NATS subject. rapSubs/subIDs are
+		// shared but keyed by session key (collision-free). Spec5 [4.8.2].
+		key := f.sessionKey()
 		if add {
 			if f.qos >= mqttSubAckFailure {
 				continue
 			}
-			if qos, ok := sess.subs[f.filter]; !ok || qos != f.qos {
+			if f.shared {
+				if qos, ok := sess.sharedSubs[key]; !ok || qos != f.qos {
+					if sess.sharedSubs == nil {
+						sess.sharedSubs = make(map[string]byte)
+					}
+					sess.sharedSubs[key] = f.qos
+					needUpdate = true
+				}
+			} else if qos, ok := sess.subs[key]; !ok || qos != f.qos {
 				if sess.subs == nil {
 					sess.subs = make(map[string]byte)
 				}
-				sess.subs[f.filter] = f.qos
+				sess.subs[key] = f.qos
 				needUpdate = true
 			}
 			// Track No Local and Retain As Published in separate sets so the
 			// persisted QoS byte stays in the 0..2 range older servers understand.
-			// Spec5 [3.8.3.1].
+			// No Local never applies to shared subscriptions. Spec5 [3.8.3.1].
 			var changed bool
-			if sess.noLocalSubs, changed = mqttUpdateFilterOptSet(sess.noLocalSubs, f.filter, f.noLocal); changed {
-				needUpdate = true
+			if !f.shared {
+				if sess.noLocalSubs, changed = mqttUpdateFilterOptSet(sess.noLocalSubs, key, f.noLocal); changed {
+					needUpdate = true
+				}
 			}
-			if sess.rapSubs, changed = mqttUpdateFilterOptSet(sess.rapSubs, f.filter, f.retainAsPublished); changed {
+			if sess.rapSubs, changed = mqttUpdateFilterOptSet(sess.rapSubs, key, f.retainAsPublished); changed {
 				needUpdate = true
 			}
 			// f.subID == 0 clears any prior identifier: a re-SUBSCRIBE without one
 			// removes it. Spec5 [3.8.2.1.2].
-			if sess.subIDs, changed = mqttUpdateFilterSubID(sess.subIDs, f.filter, f.subID); changed {
+			if sess.subIDs, changed = mqttUpdateFilterSubID(sess.subIDs, key, f.subID); changed {
 				needUpdate = true
 			}
 		} else {
-			if _, ok := sess.subs[f.filter]; ok {
-				delete(sess.subs, f.filter)
+			if f.shared {
+				if _, ok := sess.sharedSubs[key]; ok {
+					delete(sess.sharedSubs, key)
+					needUpdate = true
+				}
+			} else if _, ok := sess.subs[key]; ok {
+				delete(sess.subs, key)
 				needUpdate = true
 			}
 			var changed bool
-			if sess.noLocalSubs, changed = mqttUpdateFilterOptSet(sess.noLocalSubs, f.filter, false); changed {
+			if sess.noLocalSubs, changed = mqttUpdateFilterOptSet(sess.noLocalSubs, key, false); changed {
 				needUpdate = true
 			}
-			if sess.rapSubs, changed = mqttUpdateFilterOptSet(sess.rapSubs, f.filter, false); changed {
+			if sess.rapSubs, changed = mqttUpdateFilterOptSet(sess.rapSubs, key, false); changed {
 				needUpdate = true
 			}
-			if sess.subIDs, changed = mqttUpdateFilterSubID(sess.subIDs, f.filter, 0); changed {
+			if sess.subIDs, changed = mqttUpdateFilterSubID(sess.subIDs, key, 0); changed {
 				needUpdate = true
 			}
 		}
@@ -6304,13 +6968,81 @@ CHECK:
 		return fmt.Errorf("CONNACK exceeds client maximum packet size")
 	}
 
+	// A resuming MQTT 3.1.1 client cannot express, observe, or UNSUBSCRIBE a
+	// "$share/..." filter (shared-subscription parsing is v5-only), so restoring
+	// shared membership would create deliveries it can never manage and a phantom
+	// holder no UNSUBSCRIBE could clear. Force-leave any persisted shared
+	// subscriptions instead: remove them (transactionally) and release the group
+	// consumers. On save failure keep membership and close the connection so a
+	// later reconnect retries. Spec5 [4.8.2].
+	if c.mqtt.proto != mqttProtoLevel5 && len(es.sharedSubs) > 0 {
+		es.mu.Lock()
+		prior := es.sharedSubs
+		es.sharedSubs = nil
+		es.mu.Unlock()
+		if err := es.save(); err != nil {
+			es.mu.Lock()
+			es.sharedSubs = prior
+			es.mu.Unlock()
+			return formatError(err)
+		}
+		// Also drop the resident session's in-memory shared consumer state
+		// (cons entries, tmaxack charge, pending deliveries): a later v5
+		// resubscribe of the same filter must not find a stale cons entry and
+		// skip recreating a durable this forced leave may delete below.
+		es.mu.Lock()
+		for sid, cc := range es.cons {
+			if cc.DeliverGroup == _EMPTY_ {
+				continue
+			}
+			delete(es.cons, sid)
+			if seqPis, ok := es.cpending[cc.Durable]; ok {
+				delete(es.cpending, cc.Durable)
+				for _, pi := range seqPis {
+					delete(es.pendingPublish, pi)
+				}
+			}
+			if amt, ok := es.sharedCharged[cc.Durable]; ok {
+				es.tmaxack -= amt
+				if es.tmaxack < 0 {
+					es.tmaxack = 0
+				}
+				delete(es.sharedCharged, cc.Durable)
+			}
+		}
+		es.mu.Unlock()
+		var durs []string
+		for key := range prior {
+			durs = append(durs, mqttSharedDurablesForKey(key)...)
+		}
+		held := es.sharedDurablesHeldByOthers(durs)
+		for _, dur := range durs {
+			if held[dur] {
+				continue
+			}
+			if _, err := es.jsa.deleteConsumer(mqttStreamName, dur, true); isErrorOtherThan(err, JSConsumerNotFoundErr) {
+				c.Errorf("MQTT: unable to delete shared consumer %q on 3.1.1 forced leave: %v", dur, err)
+			}
+		}
+		c.Warnf("MQTT: dropped %d shared subscription(s) not supported for a 3.1.1 session resume", len(prior))
+	}
+
 	// Process possible saved subscriptions.
-	if l := len(es.subs); l > 0 {
+	if l := len(es.subs) + len(es.sharedSubs); l > 0 {
 		filters := make([]*mqttFilter, 0, l)
 		for subject, qos := range es.subs {
 			_, noLocal := es.noLocalSubs[subject]
 			_, rap := es.rapSubs[subject]
 			filters = append(filters, &mqttFilter{filter: subject, qos: qos, noLocal: noLocal, retainAsPublished: rap, subID: es.subIDs[subject]})
+		}
+		// Restore shared subscriptions (v5 only; a 3.1.1 resume force-left them
+		// above). The persisted key is the sole authority; parse it back into
+		// group + underlying subject. Spec5 [4.8.2].
+		for key, qos := range es.sharedSubs {
+			if group, subject, ok := mqttParseSharedKey(key); ok {
+				_, rap := es.rapSubs[key]
+				filters = append(filters, &mqttFilter{shared: true, group: group, filter: subject, qos: qos, retainAsPublished: rap, subID: es.subIDs[key]})
+			}
 		}
 		if _, err := asm.processSubs(es, c, filters, false, trace); err != nil {
 			return err
@@ -6390,11 +7122,10 @@ func (c *client) mqttMakeConnAckV5Frame(rc, sp byte, reasonStr string) []byte {
 	//   - Retain Available: absent => retained messages supported.
 	//   - Wildcard Subscription Available: absent => wildcards supported.
 	// We only emit the properties whose truthful value differs from the default.
-	// Shared subscriptions are not implemented, so advertise them as unavailable.
-	// Subscription identifiers are supported (absent => available), so we emit
-	// nothing for them. Spec5 [3.2.2.3].
-	props.sharedSubAvail = 0
-	props.present[mqttPropSharedSubAvailable] = true
+	//   - Shared Subscription Available: absent => available. We implement them,
+	//     so we emit nothing. Spec5 [3.2.2.3.11], [4.8.2].
+	//   - Subscription Identifiers: absent => available (implemented), emit nothing.
+	// Spec5 [3.2.2.3].
 	// Topic Alias Maximum: advertise the (configured) number of inbound topic
 	// aliases we accept. Success only (resolved on the accept path); omitted when
 	// disabled: absent => 0, i.e. the client must not send any alias. Spec5
@@ -6565,7 +7296,7 @@ func (c *client) mqttEnqueueDisconnect(reason byte, reasonStr string) {
 func mqttDisconnectReasonFromErr(err error) byte {
 	switch {
 	case errors.Is(err, errMQTTMalformedVarInt), errors.Is(err, errMQTTMalformedProperties),
-		errors.Is(err, errMQTTMalformedSubOption):
+		errors.Is(err, errMQTTMalformedSubOption), errors.Is(err, errMQTTMalformedSharedSub):
 		return mqttReasonMalformedPacket
 	case errors.Is(err, errMQTTUnknownProperty), errors.Is(err, errMQTTPropertyNotAllowed),
 		errors.Is(err, errMQTTDuplicateProperty), errors.Is(err, errMQTTProtocolError):
@@ -7951,6 +8682,30 @@ func (c *client) mqttParseSubsOrUnsubs(r *mqttReader, b byte, pl int, sub bool) 
 		if err := mqttValidateTopic(topic, "topic filter"); err != nil {
 			return 0, nil, err
 		}
+		// MQTT 5.0 Shared Subscription: "$share/{ShareName}/{filter}". v5 only;
+		// for 3.1.1 "$share/..." has no special meaning and is treated as a
+		// literal topic filter. Detect and strip the prefix + ShareName before
+		// conversion so all downstream per-subject logic sees only the underlying
+		// filter. Applies to both SUBSCRIBE and UNSUBSCRIBE. Spec5 [4.8.2].
+		var shared bool
+		var shareName []byte
+		innerTopic := topic
+		if c.mqtt.proto == mqttProtoLevel5 && bytes.HasPrefix(topic, mqttSharedSubPrefix) {
+			rest := topic[len(mqttSharedSubPrefix):]
+			idx := bytes.IndexByte(rest, mqttTopicLevelSep)
+			// ShareName must be non-empty, must not contain '+' or '#', and must
+			// be followed by a non-empty topic filter. Any violation is a
+			// Malformed Packet (fail the whole packet). Spec5 [MQTT-4.8.2-1],
+			// [MQTT-4.8.2-2].
+			if idx <= 0 || idx == len(rest)-1 ||
+				bytes.IndexByte(rest[:idx], mqttSingleLevelWC) >= 0 ||
+				bytes.IndexByte(rest[:idx], mqttMultiLevelWC) >= 0 {
+				return 0, nil, fmt.Errorf("%w: %q", errMQTTMalformedSharedSub, topic)
+			}
+			shared = true
+			shareName = rest[:idx]
+			innerTopic = rest[idx+1:]
+		}
 		var qos, reason byte
 		var reasonStr string
 		var retainHandling byte
@@ -7960,7 +8715,7 @@ func (c *client) mqttParseSubsOrUnsubs(r *mqttReader, b byte, pl int, sub bool) 
 		// but we don't fail the parsing. When processing the sub, we will
 		// have an error then, and the processing of subs code will send
 		// the proper mqttSubAckFailure flag for this given subscription.
-		filter, err := mqttFilterToNATSSubject(topic)
+		filter, err := mqttFilterToNATSSubject(innerTopic)
 		if err != nil {
 			c.Errorf("invalid topic %q: %v", topic, err)
 		}
@@ -7989,20 +8744,11 @@ func (c *client) mqttParseSubsOrUnsubs(r *mqttReader, b byte, pl int, sub bool) 
 				noLocal = opts&0x04 != 0
 				retainAsPublished = opts&0x08 != 0
 				// No Local on a Shared Subscription is a Protocol Error
-				// [MQTT-3.8.3-4]: fail the whole packet, stricter than the
-				// per-filter 0x9E rejection below.
-				if noLocal && bytes.HasPrefix(topic, mqttSharedSubPrefix) {
+				// [MQTT-3.8.3-4]: fail the whole packet.
+				if noLocal && shared {
 					return 0, nil, fmt.Errorf("%w: No Local set on a shared subscription", errMQTTProtocolError)
 				}
 				qos = opts & 0x03
-				// Shared Subscriptions are advertised as unavailable in
-				// CONNACK, so flag the filter for a 0x9E SUBACK reason code
-				// rather than subscribe to "$share/..." as a literal topic.
-				// Spec5 [3.9.3], [4.13.2].
-				if bytes.HasPrefix(topic, mqttSharedSubPrefix) {
-					reason = mqttReasonSharedSubNotSupported
-					reasonStr = "shared subscriptions are not supported"
-				}
 			} else {
 				qos, err = r.readByte("QoS")
 				if err != nil {
@@ -8014,7 +8760,7 @@ func (c *client) mqttParseSubsOrUnsubs(r *mqttReader, b byte, pl int, sub bool) 
 				return 0, nil, fmt.Errorf("subscribe QoS value must be 0, 1 or 2, got %v", qos)
 			}
 		}
-		f := &mqttFilter{ttopic: topic, filter: string(filter), qos: qos, retainHandling: retainHandling, noLocal: noLocal, retainAsPublished: retainAsPublished, subID: subID, reason: reason, reasonStr: reasonStr}
+		f := &mqttFilter{ttopic: topic, filter: string(filter), qos: qos, retainHandling: retainHandling, noLocal: noLocal, retainAsPublished: retainAsPublished, subID: subID, reason: reason, reasonStr: reasonStr, shared: shared, group: string(shareName)}
 		filters = append(filters, f)
 	}
 	// Spec [MQTT-3.8.3-3], [MQTT-3.10.3-2]
@@ -8080,6 +8826,11 @@ func mqttDeliverMsgCbQoS0(sub *subscription, pc *client, _ *Account, subject, re
 	noLocal := sub.mqtt.noLocal
 	retainAsPublished := sub.mqtt.retainAsPublished
 	subID := sub.mqtt.subID
+	// For a shared subscription the raw-subject sub must deliver only
+	// QoS0-published messages; stored (QoS 1/2 published) messages arrive through
+	// the shared JS consumer instead, so treat shared like a QoS1+ sub below when
+	// deciding to defer to the QoS 1/2 callback. Spec5 [4.8.2].
+	shared := sub.mqtt.shared
 	ignore := mqttMustIgnoreForReservedSub(sub, subject)
 	sess.subsMu.RUnlock()
 
@@ -8107,7 +8858,7 @@ func mqttDeliverMsgCbQoS0(sub *subscription, pc *client, _ *Account, subject, re
 		// QoS>0 and the sub has the QoS>0 then the message will be delivered by
 		// mqttDeliverMsgCbQoS12.
 		msgQoS := mqttGetQoS(pc.mqtt.pp.flags)
-		if subQoS > 0 && msgQoS > 0 {
+		if (subQoS > 0 || shared) && msgQoS > 0 {
 			return
 		}
 		topic = pc.mqtt.pp.topic
@@ -8133,7 +8884,7 @@ func mqttDeliverMsgCbQoS0(sub *subscription, pc *client, _ *Account, subject, re
 		// Check the subscription's QoS. If the message was published with a
 		// QoS>0 (in the header) and the sub has the QoS>0 then the message will
 		// be delivered by mqttDeliverMsgCbQoS12.
-		if subQoS > 0 && h != nil && h.qos > 0 {
+		if (subQoS > 0 || shared) && h != nil && h.qos > 0 {
 			return
 		}
 
@@ -8228,7 +8979,12 @@ func mqttDeliverMsgCbQoS12(sub *subscription, pc *client, _ *Account, subject, r
 	if qos > sub.mqtt.qos {
 		qos = sub.mqtt.qos
 	}
-	if qos == 0 {
+	// A QoS0 member of a shared subscription still consumes stored messages
+	// through the group consumer; it just delivers them at QoS0 and acks the JS
+	// message (handled below after the reserved/deny checks). For a non-shared
+	// QoS0 result the direct NATS subscription delivers instead. Spec5 [4.8.2].
+	sharedQoS0 := qos == 0 && sub.mqtt.shared
+	if qos == 0 && !sharedQoS0 {
 		sess.mu.Unlock()
 		return
 	}
@@ -8279,6 +9035,29 @@ func mqttDeliverMsgCbQoS12(sub *subscription, pc *client, _ *Account, subject, r
 	// Subscription Identifier: capture under the lock, injected on enqueue below.
 	// Spec5 [3.8.2.1.2].
 	subID := sub.mqtt.subID
+
+	if sharedQoS0 {
+		// Deliver at QoS0 (no packet identifier, no tracking) and ack the JS
+		// message so the group consumer does not redeliver it. Spec5 [4.8.2].
+		sess.mu.Unlock()
+		originalTopic := natsSubjectStrToMQTTTopic(strippedSubj)
+		var props []byte
+		if h != nil {
+			props = h.props
+		}
+		if len(props) > 0 {
+			_, _, _, ts, _ := ackReplyInfo(reply)
+			if p, expired := mqttForwardExpiry(props, ts); expired {
+				sess.jsa.sendAck(reply)
+				return
+			} else {
+				props = p
+			}
+		}
+		pc.mqttEnqueuePublishMsgTo(cc, sub, 0, 0, false, retainAsPub, subID, originalTopic, msg, props)
+		sess.jsa.sendAck(reply)
+		return
+	}
 
 	pi, dup, started := sess.trackPublish(sub.mqtt.jsDur, reply)
 	sess.mu.Unlock()
@@ -8678,7 +9457,15 @@ func (sess *mqttSession) cleanupFailedSub(c *client, sub *subscription, cc *Cons
 		c.processUnsub(jssub.sid)
 	}
 	if cc != nil {
-		sess.deleteConsumer(cc)
+		// A shared group consumer must never be deleted outright on a local
+		// failure — other members may hold it. Route through the last-holder
+		// release (the caller has already rolled back this session's membership).
+		// Spec5 [4.8.2].
+		if cc.DeliverGroup != _EMPTY_ {
+			sess.releaseSharedConsumer(c, cc, nil)
+		} else {
+			sess.deleteConsumer(cc)
+		}
 	}
 }
 
@@ -8774,7 +9561,7 @@ func (sess *mqttSession) ensurePubRelConsumerSubscription(c *client) error {
 // Session lock is acquired and released as needed. Session is in the locked
 // map.
 func (sess *mqttSession) processJSConsumer(c *client, subject, sid string,
-	qos byte, noLocal, retainAsPublished bool, subID int, fromSubProto bool) (*ConsumerConfig, *subscription, error) {
+	qos byte, noLocal, retainAsPublished bool, subID int, fromSubProto bool) (*ConsumerConfig, *subscription, *ConsumerConfig, error) {
 
 	sess.mu.Lock()
 	cc, exists := sess.cons[sid]
@@ -8788,42 +9575,20 @@ func (sess *mqttSession) processJSConsumer(c *client, subject, sid string,
 		// If current QoS is 0, it means that we need to delete the existing
 		// one (that was QoS > 0)
 		if qos == 0 {
-			// The JS durable consumer's delivery subject is on a NUID of
-			// the form: mqttSubPrefix + <nuid>. It is also used as the sid
-			// for the NATS subscription, so use that for the lookup.
-			c.mu.Lock()
-			sub := c.subs[cc.DeliverSubject]
-			c.mu.Unlock()
-
-			// Delete the consumer entry, mark its delivery subscription closed,
-			// and purge its pending QoS 1/2 deliveries — all under the session
-			// lock. Otherwise those packet identifiers leak and count against the
-			// in-flight cap for the life of the session (as mqttProcessUnsubs
-			// purges on unsubscribe). deleteConsumer is asynchronous, so an
-			// in-flight delivery callback could re-populate the maps after the
-			// purge; marking sub.mqtt.closed (guarded by sess.mu and sess.subsMu,
-			// same as delivery) makes mqttDeliverMsgCbQoS12 skip instead. The flag
-			// leaves sub.mqtt valid so an already-committed enqueue does not panic.
-			sess.mu.Lock()
-			delete(sess.cons, sid)
-			if sub != nil && sub.mqtt != nil {
-				sess.subsMu.Lock()
-				sub.mqtt.closed = true
-				sess.subsMu.Unlock()
+			// When processing a SUBSCRIBE packet, DEFER the whole teardown
+			// (including removing the sess.cons entry) until the packet's final
+			// session save is confirmed: the save can still fail and its rollback
+			// must restore the pre-packet QoS1/2 state, and any save issued
+			// mid-packet (a later shared filter's early persist) must serialize a
+			// record consistent with reality — Subs still says QoS1/2 until the
+			// final update, so the consumer entry must stay alongside it. The
+			// caller executes execDeferredConsumerDelete after the confirmed save.
+			// Spec5 [4.8.2].
+			if fromSubProto {
+				return nil, nil, cc, nil
 			}
-			if seqPis, ok := sess.cpending[cc.Durable]; ok {
-				delete(sess.cpending, cc.Durable)
-				for _, pi := range seqPis {
-					delete(sess.pendingPublish, pi)
-				}
-			}
-			sess.mu.Unlock()
-
-			sess.deleteConsumer(cc)
-			if sub != nil {
-				c.processUnsub(sub.sid)
-			}
-			return nil, nil, nil
+			sess.execDeferredConsumerDelete(c, sid, cc)
+			return nil, nil, nil, nil
 		}
 		// If this is called when processing SUBSCRIBE protocol, then if
 		// the JS consumer already exists, we are done (it was created
@@ -8852,13 +9617,13 @@ func (sess *mqttSession) processJSConsumer(c *client, subject, sid string,
 				sess.subsMu.Unlock()
 				sess.mu.Unlock()
 			}
-			return nil, nil, nil
+			return nil, nil, nil, nil
 		}
 	}
 	// Here it means we don't have a JS consumer and if we are QoS 0,
 	// we have nothing to do.
 	if qos == 0 {
-		return nil, nil, nil
+		return nil, nil, nil, nil
 	}
 	var err error
 	var inbox string
@@ -8885,7 +9650,7 @@ func (sess *mqttSession) processJSConsumer(c *client, subject, sid string,
 
 		// Check that the limit of subs' maxAckPending are not going over the limit
 		if after := tmaxack + maxAckPending; after > mqttMaxAckTotalLimit {
-			return nil, nil, fmt.Errorf("max_ack_pending for all consumers would be %v which exceeds the limit of %v",
+			return nil, nil, nil, fmt.Errorf("max_ack_pending for all consumers would be %v which exceeds the limit of %v",
 				after, mqttMaxAckTotalLimit)
 		}
 
@@ -8908,7 +9673,7 @@ func (sess *mqttSession) processJSConsumer(c *client, subject, sid string,
 		}
 		if _, err := sess.jsa.createDurableConsumer(ccr); err != nil {
 			c.Errorf("Unable to add JetStream consumer for subscription on %q: err=%v", subject, err)
-			return nil, nil, err
+			return nil, nil, nil, err
 		}
 		cc = &ccr.Config
 		tmaxack += maxAckPending
@@ -8918,16 +9683,390 @@ func (sess *mqttSession) processJSConsumer(c *client, subject, sid string,
 	// for the JS durable's deliver subject.
 	sess.mu.Lock()
 	sess.tmaxack = tmaxack
-	sub, err := sess.processQOS12Sub(c, []byte(inbox), []byte(inbox),
-		isMQTTReservedSubscription(subject), qos, noLocal, retainAsPublished, subID, cc.Durable, mqttDeliverMsgCbQoS12)
+	sub, err := sess.processQOS12Sub(c, []byte(inbox), []byte(inbox), nil,
+		isMQTTReservedSubscription(subject), qos, noLocal, retainAsPublished, false, subID, cc.Durable, mqttDeliverMsgCbQoS12)
 	sess.mu.Unlock()
 
 	if err != nil {
 		sess.deleteConsumer(cc)
 		c.Errorf("Unable to create subscription for JetStream consumer on %q: %v", subject, err)
+		return nil, nil, nil, err
+	}
+	return cc, sub, nil, nil
+}
+
+// execDeferredConsumerDelete performs the irreversible teardown of a plain
+// QoS1/2 consumer whose session entry was already removed (QoS downgrade to 0):
+// mark its delivery subscription closed, purge its pending QoS 1/2 deliveries
+// (so the packet identifiers do not leak against the in-flight cap), delete the
+// durable, and unsubscribe the delivery subject. deleteConsumer is asynchronous,
+// so an in-flight delivery callback could re-populate the maps after the purge;
+// the closed flag (guarded by sess.mu and sess.subsMu, same as delivery) makes
+// mqttDeliverMsgCbQoS12 skip instead while leaving sub.mqtt valid for an
+// already-committed enqueue.
+func (sess *mqttSession) execDeferredConsumerDelete(c *client, sid string, cc *ConsumerConfig) {
+	c.mu.Lock()
+	sub := c.subs[cc.DeliverSubject]
+	c.mu.Unlock()
+
+	sess.mu.Lock()
+	// The entry stays in sess.cons until this irreversible teardown actually
+	// runs, so any save issued in between persists a record that still
+	// references the (still-existing) durable. Remove it only when present and
+	// still pointing at this consumer (a rollback may have reconciled the map).
+	if cur, ok := sess.cons[sid]; ok && cur == cc {
+		delete(sess.cons, sid)
+	}
+	if sub != nil && sub.mqtt != nil {
+		sess.subsMu.Lock()
+		sub.mqtt.closed = true
+		sess.subsMu.Unlock()
+	}
+	if seqPis, ok := sess.cpending[cc.Durable]; ok {
+		delete(sess.cpending, cc.Durable)
+		for _, pi := range seqPis {
+			delete(sess.pendingPublish, pi)
+		}
+	}
+	sess.mu.Unlock()
+
+	sess.deleteConsumer(cc)
+	if sub != nil {
+		c.processUnsub(sub.sid)
+	}
+}
+
+// processSharedJSConsumer creates (or joins) the single JetStream consumer that
+// backs an MQTT 5.0 Shared Subscription group for a (ShareName, subject) pair,
+// and subscribes this session to its deliver subject as a queue member so
+// JetStream delivers each stored message to exactly one connected member.
+//
+// The durable, deliver subject, and queue/DeliverGroup are all deterministic
+// (mqttSharedNames), so members across the cluster converge on one consumer. All
+// members join regardless of granted QoS: a QoS0 member still receives stored
+// (QoS 1/2 published) messages through this consumer, delivered at QoS0 (the raw
+// subject queue sub only carries QoS0-published messages). The consumer config
+// is derived from server options only — never the member's Receive Maximum —
+// since CreateOrUpdate would let each joiner rewrite the shared config. No
+// InactiveThreshold is set, so an all-offline group stalls and keeps its backlog
+// rather than being reaped. On the subscribe failure path the consumer is
+// returned so the caller's cleanup can release it. Spec5 [4.8.2].
+//
+// Runs from the client's readLoop. sess.mu not held on entry.
+func (sess *mqttSession) processSharedJSConsumer(c *client, group, subject, sid string,
+	qos byte, retainAsPublished bool, subID int, fromSubProto bool) (*ConsumerConfig, *subscription, error) {
+
+	sess.mu.Lock()
+	cc, exists := sess.cons[sid]
+	tmaxack := sess.tmaxack
+	sess.mu.Unlock()
+
+	queue, deliver, durable := mqttSharedNames(group, subject)
+
+	// Already a member with a live deliver subscription (re-SUBSCRIBE): just
+	// refresh the mutable per-subscription fields read by the delivery callback.
+	if exists {
+		c.mu.Lock()
+		sub := c.subs[cc.DeliverSubject]
+		c.mu.Unlock()
+		if sub != nil {
+			sess.mu.Lock()
+			sess.subsMu.Lock()
+			if sub.mqtt != nil {
+				sub.mqtt.qos = qos
+				sub.mqtt.retainAsPublished = retainAsPublished
+				sub.mqtt.subID = subID
+			}
+			sess.subsMu.Unlock()
+			sess.mu.Unlock()
+			return cc, sub, nil
+		}
+		// exists but no live deliver sub (session resume on a new connection):
+		// fall through to (re)subscribe without recreating or recharging.
+	}
+
+	opts := c.srv.getOpts()
+	maxAckPending := int(opts.MQTT.MaxAckPending)
+	if maxAckPending == 0 {
+		maxAckPending = mqttDefaultMaxAckPending
+	}
+	var charged bool
+	if !exists {
+		// A stream-level consumer InactiveThreshold would give the group durable
+		// a delete timer, reaping it while all members are offline. Check the
+		// LIVE stream config (it can change after startup) and refuse rather
+		// than create a reapable shared consumer. FAIL CLOSED: if the lookup
+		// itself fails we cannot prove the limit is absent, so refuse the join
+		// (the client can retry) instead of risking a reapable durable. Spec5 [4.8.2].
+		si, err := sess.jsa.lookupStream(mqttStreamName)
+		if err != nil || si == nil {
+			return nil, nil, fmt.Errorf("shared subscriptions unavailable: unable to verify messages stream consumer limits: %v", err)
+		}
+		if si.Config.ConsumerLimits.InactiveThreshold != 0 {
+			return nil, nil, fmt.Errorf("shared subscriptions unavailable: messages stream imposes a consumer inactivity limit")
+		}
+		ackWait := opts.MQTT.AckWait
+		if ackWait == 0 {
+			ackWait = mqttDefaultAckWait
+		}
+		if after := tmaxack + maxAckPending; after > mqttMaxAckTotalLimit {
+			return nil, nil, fmt.Errorf("max_ack_pending for all consumers would be %v which exceeds the limit of %v",
+				after, mqttMaxAckTotalLimit)
+		}
+		ccr := &CreateConsumerRequest{
+			Stream: mqttStreamName,
+			Config: ConsumerConfig{
+				DeliverSubject: deliver,
+				DeliverGroup:   queue,
+				Durable:        durable,
+				AckPolicy:      AckExplicit,
+				DeliverPolicy:  DeliverNew,
+				FilterSubject:  mqttStreamSubjectPrefix + subject,
+				AckWait:        ackWait,
+				MaxAckPending:  maxAckPending,
+				MemoryStorage:  opts.MQTT.ConsumerMemoryStorage,
+			},
+		}
+		// Create before subscribing: a pre-existing group durable must not deliver
+		// to (or be ack-consumed by) this member until the join is proven. Create
+		// is idempotent (ActionCreateOrUpdate). Spec5 [4.8.2].
+		if _, err := sess.jsa.createDurableConsumer(ccr); err != nil {
+			c.Errorf("Unable to add shared JetStream consumer for subscription on %q: err=%v", subject, err)
+			return nil, nil, err
+		}
+		cc = &ccr.Config
+		sess.mu.Lock()
+		sess.tmaxack = tmaxack + maxAckPending
+		if sess.sharedCharged == nil {
+			sess.sharedCharged = make(map[string]int)
+		}
+		sess.sharedCharged[durable] = maxAckPending
+		sess.mu.Unlock()
+		charged = true
+	}
+
+	sess.mu.Lock()
+	sub, err := sess.processQOS12Sub(c, []byte(deliver), []byte(deliver), []byte(queue),
+		isMQTTReservedSubscription(subject), qos, false, retainAsPublished, true, subID, durable, mqttDeliverMsgCbQoS12)
+	sess.mu.Unlock()
+	if err != nil {
+		c.Errorf("Unable to create subscription for shared JetStream consumer on %q: %v", subject, err)
+		// Return cc (only when we created it this call) so the caller's cleanup,
+		// after rolling back the early-persisted membership, can release it.
+		if charged {
+			return cc, nil, err
+		}
 		return nil, nil, err
 	}
+	// Verify/repair the join: a concurrent leaver whose last-holder scan finished
+	// before this session's membership was persisted may have issued a (queued,
+	// fire-and-forget) delete of the group durable that landed AFTER our create.
+	// Re-issue the idempotent CreateOrUpdate now that our membership is persisted
+	// and the queue interest is up: it recreates the durable if it was deleted and
+	// is a no-op otherwise, closing the join/leave race window. Spec5 [4.8.2].
+	if charged {
+		ccr := &CreateConsumerRequest{Stream: mqttStreamName, Config: *cc}
+		if _, err := sess.jsa.createDurableConsumer(ccr); err != nil {
+			c.Warnf("Unable to verify shared JetStream consumer for subscription on %q: %v", subject, err)
+		}
+	}
 	return cc, sub, nil
+}
+
+// releaseSharedConsumer removes this session's local delivery subscription and
+// pending state for a shared-subscription group consumer, and deletes the group
+// durable only if no other session still references it. Pending QoS 1/2
+// deliveries are purged WITHOUT acking, so any in-flight messages redeliver to
+// the remaining group members via AckWait. The caller must have already removed
+// the leaving filter from sess.sharedSubs so the last-holder scan does not count
+// it. Spec5 [4.8.2].
+//
+// Runs from the client's readLoop. sess.mu not held on entry.
+func (sess *mqttSession) releaseSharedConsumer(c *client, cc *ConsumerConfig, held map[string]bool) {
+	if cc == nil || cc.DeliverGroup == _EMPTY_ {
+		return
+	}
+	var sub *subscription
+	if c != nil {
+		c.mu.Lock()
+		sub = c.subs[cc.DeliverSubject]
+		c.mu.Unlock()
+	}
+	sess.mu.Lock()
+	if sub != nil && sub.mqtt != nil {
+		sess.subsMu.Lock()
+		sub.mqtt.closed = true
+		sess.subsMu.Unlock()
+	}
+	if seqPis, ok := sess.cpending[cc.Durable]; ok {
+		delete(sess.cpending, cc.Durable)
+		for _, pi := range seqPis {
+			delete(sess.pendingPublish, pi)
+		}
+	}
+	if amt, ok := sess.sharedCharged[cc.Durable]; ok {
+		sess.tmaxack -= amt
+		if sess.tmaxack < 0 {
+			sess.tmaxack = 0
+		}
+		delete(sess.sharedCharged, cc.Durable)
+	}
+	sess.mu.Unlock()
+	if c != nil && sub != nil {
+		c.processUnsub(sub.sid)
+	}
+
+	// Delete the group durable only if no other session still references it. A
+	// caller releasing several durables in one operation passes one precomputed
+	// scan result (held); nil means scan for this durable alone.
+	if held == nil {
+		held = sess.sharedDurablesHeldByOthers([]string{cc.Durable})
+	}
+	if !held[cc.Durable] {
+		if _, err := sess.jsa.deleteConsumer(mqttStreamName, cc.Durable, true); isErrorOtherThan(err, JSConsumerNotFoundErr) {
+			c.Errorf("Unable to delete shared consumer %q: %v", cc.Durable, err)
+		}
+	}
+}
+
+// purgeSharedPending drops this session's pending QoS 1/2 delivery state for its
+// shared group consumers WITHOUT acking. Called when the session survives a
+// disconnect, so a resume does not NAK-steal group messages (which AckWait
+// redelivers to other members) and so the packet identifiers are freed. Spec5 [4.8.2].
+func (sess *mqttSession) purgeSharedPending() {
+	sess.mu.Lock()
+	defer sess.mu.Unlock()
+	for _, cc := range sess.cons {
+		if cc.DeliverGroup == _EMPTY_ {
+			continue
+		}
+		if seqPis, ok := sess.cpending[cc.Durable]; ok {
+			delete(sess.cpending, cc.Durable)
+			for _, pi := range seqPis {
+				delete(sess.pendingPublish, pi)
+			}
+		}
+	}
+}
+
+// sharedConsumerHasOtherHolders reports whether any session still holds a shared
+// subscription that maps to the given group durable. See sharedDurablesHeldByOthers.
+func (sess *mqttSession) sharedConsumerHasOtherHolders(durable string) bool {
+	return sess.sharedDurablesHeldByOthers([]string{durable})[durable]
+}
+
+// sharedDurablesHeldByOthers returns which of the given group durables some
+// session still holds: this session's own remaining in-memory shared
+// subscriptions, or any other session's persisted record (which covers the
+// cluster). One record walk answers for all durables, so a caller releasing
+// several in one operation (clear, forced leave, UNSUBSCRIBE) pays a single
+// scan. Spec5 [4.8.2].
+func (sess *mqttSession) sharedDurablesHeldByOthers(durables []string) map[string]bool {
+	held := make(map[string]bool, len(durables))
+	uniq := make([]string, 0, len(durables))
+	for _, d := range durables {
+		if _, ok := held[d]; !ok {
+			held[d] = false
+			uniq = append(uniq, d)
+		}
+	}
+	pending := len(uniq)
+	markOwned := func(key string) {
+		for _, d := range uniq {
+			if !held[d] && mqttSharedKeyOwnsDurable(key, d) {
+				held[d] = true
+				pending--
+			}
+		}
+	}
+
+	sess.mu.Lock()
+	for key := range sess.sharedSubs {
+		markOwned(key)
+	}
+	sess.mu.Unlock()
+
+	filter := mqttSessStreamSubjectPrefix + sess.domainTk + ">"
+	for seq := uint64(1); pending > 0; {
+		smsg, err := sess.jsa.loadNextMsgFromSeq(mqttSessStreamName, filter, seq)
+		if err != nil {
+			// Only "no more messages" means the scan definitively found no other
+			// holder. Any other error (JS API timeout, meta-leader failover) is
+			// indeterminate — FAIL CLOSED and report every durable held, so the
+			// caller never deletes a group durable other members may still hold.
+			// Spec5 [4.8.2].
+			if isErrorOtherThan(err, JSNoMessageFoundErr) {
+				for _, d := range uniq {
+					held[d] = true
+				}
+			}
+			break
+		}
+		seq = smsg.Sequence + 1
+		ps := &mqttPersistedSession{}
+		if err := json.Unmarshal(smsg.Data, ps); err != nil {
+			continue
+		}
+		// This session's own record is covered by the in-memory check above; it
+		// may also be stale relative to a just-completed remove.
+		if ps.ID == sess.id {
+			continue
+		}
+		for key := range ps.SharedSubs {
+			markOwned(key)
+		}
+	}
+	return held
+}
+
+// mqttSharedDurablesForKey returns the group durable name(s) a shared
+// subscription session key maps to: the main durable, plus the level-up
+// durable for a "foo.>" filter ('#' semantics). Nil if the key does not parse.
+func mqttSharedDurablesForKey(key string) []string {
+	group, subject, ok := mqttParseSharedKey(key)
+	if !ok {
+		return nil
+	}
+	_, _, dur := mqttSharedNames(group, subject)
+	durs := []string{dur}
+	if mqttNeedSubForLevelUp(subject) {
+		_, _, ldur := mqttSharedNames(group, subject[:len(subject)-2])
+		durs = append(durs, ldur)
+	}
+	return durs
+}
+
+// mqttParseSharedKey splits a shared-subscription session key
+// ("$share/{ShareName}/{NATS subject}") back into its ShareName and subject.
+func mqttParseSharedKey(key string) (group, subject string, ok bool) {
+	if !strings.HasPrefix(key, string(mqttSharedSubPrefix)) {
+		return _EMPTY_, _EMPTY_, false
+	}
+	rest := key[len(mqttSharedSubPrefix):]
+	idx := strings.IndexByte(rest, mqttTopicLevelSep)
+	if idx <= 0 || idx == len(rest)-1 {
+		return _EMPTY_, _EMPTY_, false
+	}
+	return rest[:idx], rest[idx+1:], true
+}
+
+// mqttSharedKeyOwnsDurable reports whether a session holding the given shared
+// subscription key owns the given group durable. A "foo.>" filter owns both its
+// own durable and the level-up ("foo") durable created for '#' semantics.
+func mqttSharedKeyOwnsDurable(key, durable string) bool {
+	group, subject, ok := mqttParseSharedKey(key)
+	if !ok {
+		return false
+	}
+	if _, _, d := mqttSharedNames(group, subject); d == durable {
+		return true
+	}
+	if mqttNeedSubForLevelUp(subject) {
+		if _, _, d := mqttSharedNames(group, subject[:len(subject)-2]); d == durable {
+			return true
+		}
+	}
+	return false
 }
 
 // Queues the published retained messages for each subscription and signals
@@ -9032,59 +10171,135 @@ func (c *client) mqttProcessUnsubs(filters []*mqttFilter) error {
 	}
 	defer asm.unlockSession(sess)
 
+	// One record scan (heldShared, computed after the record save below) decides
+	// every shared durable this packet may release.
+	var heldShared map[string]bool
 	removeJSCons := func(sid string) {
 		cc, ok := sess.cons[sid]
-		if ok {
-			delete(sess.cons, sid)
-			sess.deleteConsumer(cc)
-
-			c.mu.Lock()
-			sub := c.subs[cc.DeliverSubject]
-			c.mu.Unlock()
-
-			// Need lock here since these are accessed by callbacks
-			sess.mu.Lock()
-			// Mark the delivery sub closed so an in-flight QoS 1/2 callback stops
-			// tracking new messages after the purge (deleteConsumer is async);
-			// same barrier as the QoS 0 downgrade path in processJSConsumer.
-			if sub != nil && sub.mqtt != nil {
-				sess.subsMu.Lock()
-				sub.mqtt.closed = true
-				sess.subsMu.Unlock()
-			}
-			if seqPis, ok := sess.cpending[cc.Durable]; ok {
-				delete(sess.cpending, cc.Durable)
-				for _, pi := range seqPis {
-					delete(sess.pendingPublish, pi)
+		if !ok {
+			// A shared filter's group durable must be released even without a
+			// local consumer entry (e.g. a per-filter restore failure left the
+			// membership persisted with no live join): derive the durable(s) from
+			// the session key — the persisted authority — like clear() does, and
+			// delete each that has no remaining holder. The membership was already
+			// removed and persisted above, so the scan is correct. Spec5 [4.8.2].
+			if strings.HasPrefix(sid, string(mqttSharedSubPrefix)) && !strings.HasSuffix(sid, mqttMultiLevelSidSuffix) {
+				for _, dur := range mqttSharedDurablesForKey(sid) {
+					if heldShared[dur] {
+						continue
+					}
+					if _, err := sess.jsa.deleteConsumer(mqttStreamName, dur, true); isErrorOtherThan(err, JSConsumerNotFoundErr) {
+						c.Errorf("Unable to delete shared consumer %q: %v", dur, err)
+					}
 				}
-				// last_pi stays monotonic (see untrackPublish); do not reset here.
 			}
-			sess.mu.Unlock()
+			return
 		}
+		delete(sess.cons, sid)
+		// A shared group consumer is released (deleted only if no other member
+		// remains); the leaving filter has already been removed from sharedSubs
+		// and persisted below, so the last-holder scan is correct. Spec5 [4.8.2].
+		if cc.DeliverGroup != _EMPTY_ {
+			sess.releaseSharedConsumer(c, cc, heldShared)
+			return
+		}
+		sess.deleteConsumer(cc)
+
+		c.mu.Lock()
+		sub := c.subs[cc.DeliverSubject]
+		c.mu.Unlock()
+
+		// Need lock here since these are accessed by callbacks
+		sess.mu.Lock()
+		// Mark the delivery sub closed so an in-flight QoS 1/2 callback stops
+		// tracking new messages after the purge (deleteConsumer is async);
+		// same barrier as the QoS 0 downgrade path in processJSConsumer.
+		if sub != nil && sub.mqtt != nil {
+			sess.subsMu.Lock()
+			sub.mqtt.closed = true
+			sess.subsMu.Unlock()
+		}
+		if seqPis, ok := sess.cpending[cc.Durable]; ok {
+			delete(sess.cpending, cc.Durable)
+			for _, pi := range seqPis {
+				delete(sess.pendingPublish, pi)
+			}
+			// last_pi stays monotonic (see untrackPublish); do not reset here.
+		}
+		sess.mu.Unlock()
 	}
+	// v5 UNSUBACK reports whether each subscription existed; the session maps are
+	// guarded by the session-manager lock held here. Spec5 [3.11.3].
 	for _, f := range filters {
-		sid := f.filter
-		// v5 UNSUBACK reports whether the subscription existed; sess.subs is
-		// guarded by the session-manager lock held here. Spec5 [3.11.3].
-		if _, ok := sess.subs[sid]; !ok {
+		sid := f.sessionKey()
+		var ok bool
+		if f.shared {
+			_, ok = sess.sharedSubs[sid]
+		} else {
+			_, ok = sess.subs[sid]
+		}
+		if !ok {
 			f.reason = mqttReasonNoSubscriptionExisted
 			f.reasonStr = "no matching subscription existed"
 		}
-		// Remove JS Consumer if one exists for this sid
+	}
+	// UNSUBSCRIBE is transactional: persist the removals FIRST, and only tear down
+	// the NATS subscriptions and (shared) consumers once the record save is
+	// confirmed. Otherwise a failed save could leave the record claiming a
+	// subscription whose live join and group durable were already removed.
+	// Snapshot every affected map so a save failure fully rolls back in memory.
+	// Spec5 [4.8.2], [3.11.3].
+	snap := sess.snapshotSubs()
+	if err := sess.update(filters, false); err != nil {
+		// Roll back the in-memory removals; nothing was torn down yet.
+		sess.mu.Lock()
+		sess.subs = snap.subs
+		sess.sharedSubs = snap.shared
+		sess.rapSubs = snap.rap
+		sess.noLocalSubs = snap.noLocal
+		sess.subIDs = snap.subIDs
+		sess.mu.Unlock()
+		// v5 reports the failure per-filter (0x83) and still sends the UNSUBACK;
+		// 3.1.1 has no per-filter code, so surface the error (connection closes).
+		if c.mqtt.proto == mqttProtoLevel5 {
+			for _, f := range filters {
+				f.reason = mqttReasonImplementationSpecificError
+				f.reasonStr = "unable to persist unsubscribe"
+			}
+			return nil
+		}
+		return err
+	}
+	// Persist confirmed: tear down each filter's subscriptions/consumers. The
+	// leaving filters are already out of sharedSubs and persisted, so one scan
+	// now decides every shared durable this packet may release; keys the session
+	// still holds (e.g. "$share/g/foo" while "$share/g/foo.>" leaves) count as
+	// holders. Spec5 [4.8.2].
+	var sharedDurs []string
+	for _, f := range filters {
+		if f.shared {
+			sharedDurs = append(sharedDurs, mqttSharedDurablesForKey(f.sessionKey())...)
+		}
+	}
+	if len(sharedDurs) > 0 {
+		heldShared = sess.sharedDurablesHeldByOthers(sharedDurs)
+	}
+	for _, f := range filters {
+		sid := f.sessionKey()
 		removeJSCons(sid)
 		if err := c.processUnsub([]byte(sid)); err != nil {
 			c.Errorf("error unsubscribing from %q: %v", sid, err)
 		}
 		if mqttNeedSubForLevelUp(sid) {
 			subject := sid[:len(sid)-2]
-			sid = subject + mqttMultiLevelSidSuffix
+			sid = sid[:len(sid)-2] + mqttMultiLevelSidSuffix
 			removeJSCons(sid)
 			if err := c.processUnsub([]byte(sid)); err != nil {
 				c.Errorf("error unsubscribing from %q: %v", subject, err)
 			}
 		}
 	}
-	return sess.update(filters, false)
+	return nil
 }
 
 // mqttEnqueueUnsubAck enqueues an UNSUBACK and reports whether it was sent. A v5

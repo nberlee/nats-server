@@ -3305,18 +3305,27 @@ func (c *client) canSubscribeInternal(subject string, optQueue ...string) bool {
 	}
 
 	// For CLIENT connections that are MQTT we will implicitly allow anything that starts with
-	// the "$MQTT.sub." or "$MQTT.deliver.pubrel." prefix. For other types of connections, we
+	// the "$MQTT.sub.", "$MQTT.deliver.pubrel." or "$MQTT.qsub." (shared-subscription
+	// delivery) prefix. For other types of connections, we
 	// will implicitly allow anything that starts with the full "$MQTT." prefix. However,
 	// we don't just return here, we skip the check for "allow" but will check "deny".
-	if (c.isMqtt() && (strings.HasPrefix(subject, mqttSubPrefix) || strings.HasPrefix(subject, mqttPubRelDeliverySubjectPrefix))) ||
+	if (c.isMqtt() && (strings.HasPrefix(subject, mqttSubPrefix) || strings.HasPrefix(subject, mqttPubRelDeliverySubjectPrefix) || strings.HasPrefix(subject, mqttSharedSubDeliverPrefix))) ||
 		(c.kind != CLIENT && strings.HasPrefix(subject, mqttPrefix)) {
 		checkAllow = false
 	}
+	// A shared-subscription raw QoS0 subscription is a NATS queue subscription
+	// whose queue name is server-generated ("$mqttshare.<hash>"). For the ALLOW
+	// side only, authorize it by the underlying subject as a plain subscription:
+	// the opaque generated name must not have to appear in the user's allow list.
+	// Queue-scoped DENY rules (e.g. "foo >") still see the real queue name below,
+	// so denying all queue subscriptions on a subject covers shared subs too.
+	// Spec5 [4.8.2].
+	mqttInternalQueue := c.isMqtt() && strings.HasPrefix(queue, mqttSharedQueuePrefix)
 	// Check allow list. If no allow list that means all are allowed. Deny can overrule.
 	if checkAllow && c.perms.sub.allow != nil {
 		r := c.perms.sub.allow.Match(subject)
 		allowed = len(r.psubs) > 0
-		if queue != _EMPTY_ && len(r.qsubs) > 0 {
+		if !mqttInternalQueue && queue != _EMPTY_ && len(r.qsubs) > 0 {
 			// If the queue appears in the allow list, then DO allow.
 			allowed = queueMatches(queue, r.qsubs)
 		}
@@ -5528,7 +5537,12 @@ func (c *client) processMsgResults(acc *Account, r *SublistResult, msg, deliver,
 			var delivered bool
 			if !skipDelivery {
 				mh := c.msgHeader(dsubj, creply, sub)
-				delivered = c.deliverMsg(prodIsMQTT, sub, acc, subject, creply, mh, msg, rplyHasGWPrefix)
+				// Deliver with dsubj (the remapped/original subject) rather than the
+				// raw pa.subject, matching the non-queue path above. For a JetStream
+				// push consumer with a DeliverGroup this hands an internal callback
+				// the stream subject instead of the deliver subject; for a plain
+				// (non-remapped) queue sub dsubj == subject, so this is a no-op.
+				delivered = c.deliverMsg(prodIsMQTT, sub, acc, dsubj, creply, mh, msg, rplyHasGWPrefix)
 				if restorePaTrace {
 					c.pa.trace = mt
 				}

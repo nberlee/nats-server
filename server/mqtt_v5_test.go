@@ -495,10 +495,10 @@ func TestMQTTv5ConnectAndCapabilities(t *testing.T) {
 	if props.present[mqttPropWildcardSubAvailable] {
 		t.Fatalf("Wildcard Subscription Available should be omitted (supported by default)")
 	}
-	// Shared subscriptions are not implemented, so must be advertised as off
-	// (their default is "available", so it must be sent explicitly as 0).
-	if !props.present[mqttPropSharedSubAvailable] || props.sharedSubAvail != 0 {
-		t.Fatalf("Expected Shared Subscription Available=0")
+	// Shared subscriptions are implemented and advertised by absence (their
+	// default is "available"), so the property must not be sent explicitly.
+	if props.present[mqttPropSharedSubAvailable] {
+		t.Fatalf("Shared Subscription Available should be omitted (supported by default)")
 	}
 	// Subscription identifiers are supported, so the property must be omitted
 	// (absent => available).
@@ -1353,39 +1353,1422 @@ func TestMQTTv5RejectsUnsupportedSubOptions(t *testing.T) {
 	}
 }
 
-// Shared Subscriptions are advertised as unavailable in CONNACK, so a
-// "$share/..." filter must be rejected with SUBACK reason code 0x9E, not
-// subscribed to as a literal topic (which would silently deliver nothing).
-// Other filters in the same SUBSCRIBE must still be granted. Spec5 [3.9.3].
-func TestMQTTv5SharedSubscriptionRejected(t *testing.T) {
+// testMQTTTryReadPublishV5 attempts to read a single PUBLISH within the timeout,
+// returning ok=false on timeout instead of failing the test. Used for
+// shared-subscription distribution assertions where a given member may or may
+// not receive a particular message.
+func testMQTTTryReadPublishV5(r *mqttReader, timeout time.Duration) (topic string, payload []byte, qos byte, pi uint16, ok bool) {
+	b, pl, ready := testMQTTReadPacketReady(r, timeout)
+	if !ready {
+		return _EMPTY_, nil, 0, 0, false
+	}
+	if pt := b & mqttPacketMask; pt != mqttPacketPub {
+		return _EMPTY_, nil, 0, 0, false
+	}
+	start := r.pos
+	qos = mqttGetQoS(b & mqttPacketFlagMask)
+	tb, err := r.readBytes("topic", false)
+	if err != nil {
+		return _EMPTY_, nil, 0, 0, false
+	}
+	if qos > 0 {
+		if pi, err = r.readUint16("pi"); err != nil {
+			return _EMPTY_, nil, 0, 0, false
+		}
+	}
+	if _, err := r.readProperties(mqttPropsContextPubOut); err != nil {
+		return _EMPTY_, nil, 0, 0, false
+	}
+	payloadLen := pl - (r.pos - start)
+	if payloadLen < 0 || r.pos+payloadLen > len(r.buf) {
+		return _EMPTY_, nil, 0, 0, false
+	}
+	got := append([]byte(nil), r.buf[r.pos:r.pos+payloadLen]...)
+	r.pos += payloadLen
+	return string(tb), got, qos, pi, true
+}
+
+// A "$share/{ShareName}/{filter}" subscription is now accepted (v5), granting
+// the requested QoS, and a message published on the underlying topic is
+// delivered to exactly one member of the group. Spec5 [4.8.2].
+func TestMQTTv5SharedSubscription(t *testing.T) {
 	o := testMQTTDefaultOptionsV5()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
 
-	c, r := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "sharesub", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
-	defer c.Close()
-	testMQTTReadConnAckV5(t, r)
+	// Two members of the same group, QoS1.
+	ca, ra := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "sharea", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
+	defer ca.Close()
+	testMQTTReadConnAckV5(t, ra)
+	cb, rb := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "shareb", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
+	defer cb.Close()
+	testMQTTReadConnAckV5(t, rb)
 
-	codes := testMQTTSubV5(t, c, r, 1, []mqttV5SubFilter{
-		{topic: "foo", opts: 1},
-		{topic: "$share/grp/foo", opts: 1},
-		{topic: "bar", opts: 0},
-	})
-	if codes[0] != 1 || codes[1] != mqttReasonSharedSubNotSupported || codes[2] != 0 {
-		t.Fatalf("Expected SUBACK codes [1, 0x9e, 0], got %x", codes)
+	for _, sub := range []struct {
+		c net.Conn
+		r *mqttReader
+	}{{ca, ra}, {cb, rb}} {
+		// A shared filter is granted alongside plain/other filters (mixed SUBACK),
+		// but only the shared filter is used for the distribution check below.
+		codes := testMQTTSubV5(t, sub.c, sub.r, 1, []mqttV5SubFilter{
+			{topic: "$share/grp/foo", opts: 1},
+			{topic: "bar", opts: 0},
+		})
+		if codes[0] != 1 || codes[1] != 0 {
+			t.Fatalf("Expected SUBACK codes [1, 0], got %x", codes)
+		}
 	}
 
-	// The rejected filter must not exist as a literal subscription: a message
-	// published to the literal topic must not be delivered.
 	cp, rp := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "sharepub", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
 	defer cp.Close()
 	testMQTTReadConnAckV5(t, rp)
-	testMQTTPublishV5(t, cp, 0, 0, "$share/grp/foo", []byte("literal"))
+
+	// Publish several QoS1 messages on the underlying topic. Each must be
+	// delivered to exactly one of the two group members (no duplicates), and
+	// over enough messages both members should receive at least one.
+	const n = 12
+	got := map[string]int{}
+	for i := 0; i < n; i++ {
+		payload := []byte(fmt.Sprintf("m%d", i))
+		testMQTTPublishV5(t, cp, 1, uint16(i+1), "foo", payload)
+		testMQTTReadPubAck(t, rp, uint16(i+1))
+		// The message lands on exactly one member. Poll both. (Which member gets
+		// a given message is up to queue routing and not asserted.)
+		topic, pl, _, pi, ok := testMQTTTryReadPublishV5(ra, 500*time.Millisecond)
+		if ok {
+			testMQTTSendPIPacket(mqttPacketPubAck, t, ca, pi)
+		} else if topic, pl, _, pi, ok = testMQTTTryReadPublishV5(rb, 500*time.Millisecond); ok {
+			testMQTTSendPIPacket(mqttPacketPubAck, t, cb, pi)
+		} else {
+			t.Fatalf("message %d not delivered to any group member", i)
+		}
+		if topic != "foo" {
+			t.Fatalf("Expected topic foo, got %q", topic)
+		}
+		got[string(pl)]++
+	}
+	if len(got) != n {
+		t.Fatalf("Expected %d distinct messages, got %d (duplicates?): %v", n, len(got), got)
+	}
+	for p, dc := range got {
+		if dc != 1 {
+			t.Fatalf("message %q delivered %d times (expected exactly once)", p, dc)
+		}
+	}
+	// No duplicate copies left unread on either connection.
+	testMQTTExpectNothing(t, ra)
+	testMQTTExpectNothing(t, rb)
+}
+
+// A group with a mix of QoS0 and QoS1 members delivers each QoS1-published
+// message exactly once to the group (no double delivery via the raw queue sub and
+// the shared consumer). Spec5 [4.8.2].
+func TestMQTTv5SharedSubscriptionMixedQoS(t *testing.T) {
+	o := testMQTTDefaultOptionsV5()
+	s := testMQTTRunServer(t, o)
+	defer testMQTTShutdownServer(s)
+
+	c0, r0 := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "mixq0", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
+	defer c0.Close()
+	testMQTTReadConnAckV5(t, r0)
+	testMQTTSubV5(t, c0, r0, 1, []mqttV5SubFilter{{topic: "$share/g/foo", opts: 0}}) // QoS0 member
+	c1, r1 := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "mixq1", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
+	defer c1.Close()
+	testMQTTReadConnAckV5(t, r1)
+	testMQTTSubV5(t, c1, r1, 1, []mqttV5SubFilter{{topic: "$share/g/foo", opts: 1}}) // QoS1 member
+
+	cp, rp := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "mixpub", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
+	defer cp.Close()
+	testMQTTReadConnAckV5(t, rp)
+
+	const n = 10
+	got := map[string]int{}
+	for i := 0; i < n; i++ {
+		payload := []byte(fmt.Sprintf("x%d", i))
+		testMQTTPublishV5(t, cp, 1, uint16(i+1), "foo", payload)
+		testMQTTReadPubAck(t, rp, uint16(i+1))
+		// Exactly one member receives it. The QoS0 member gets it at QoS0 (pi==0,
+		// no ack needed); the QoS1 member at QoS1 (must ack).
+		topic, pl, qos, pi, ok := testMQTTTryReadPublishV5(r0, 500*time.Millisecond)
+		if ok {
+			if qos != 0 {
+				t.Fatalf("QoS0 member got QoS %d", qos)
+			}
+		} else if topic, pl, qos, pi, ok = testMQTTTryReadPublishV5(r1, 500*time.Millisecond); ok {
+			if qos != 1 {
+				t.Fatalf("QoS1 member got QoS %d", qos)
+			}
+			testMQTTSendPIPacket(mqttPacketPubAck, t, c1, pi)
+		} else {
+			t.Fatalf("message %d not delivered", i)
+		}
+		if topic != "foo" {
+			t.Fatalf("Expected topic foo, got %q", topic)
+		}
+		got[string(pl)]++
+	}
+	if len(got) != n {
+		t.Fatalf("Expected %d distinct messages exactly once, got %v", n, got)
+	}
+	testMQTTExpectNothing(t, r0)
+	testMQTTExpectNothing(t, r1)
+}
+
+// A QoS2 shared subscriber receives a QoS2-published message through the group
+// consumer and completes the full PUBREC/PUBREL/PUBCOMP handshake. Spec5 [4.8.2].
+func TestMQTTv5SharedSubscriptionQoS2(t *testing.T) {
+	o := testMQTTDefaultOptionsV5()
+	s := testMQTTRunServer(t, o)
+	defer testMQTTShutdownServer(s)
+
+	c, r := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "q2share", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
+	defer c.Close()
+	testMQTTReadConnAckV5(t, r)
+	codes := testMQTTSubV5(t, c, r, 1, []mqttV5SubFilter{{topic: "$share/g/foo", opts: 2}})
+	if len(codes) != 1 || codes[0] != 2 {
+		t.Fatalf("Expected SUBACK [2], got %v", codes)
+	}
+
+	// Publisher (3.1.1 framing) sends a QoS2 message; the server completes the
+	// inbound handshake with the publisher.
+	pubc, pubr := testMQTTConnect(t, &mqttConnInfo{clientID: "q2pub", cleanSess: true}, o.MQTT.Host, o.MQTT.Port)
+	defer pubc.Close()
+	testMQTTCheckConnAck(t, pubr, mqttConnAckRCConnectionAccepted, false)
+	testMQTTPublish(t, pubc, pubr, 2, false, false, "foo", 1, []byte("q2"))
+
+	// The shared member receives it at QoS2 and completes the outbound handshake.
+	qos, pi := testMQTTReadPublishV5(t, r, "foo", []byte("q2"))
+	if qos != 2 {
+		t.Fatalf("Expected QoS2 delivery, got %d", qos)
+	}
+	testMQTTSendPIPacket(mqttPacketPubRec, t, c, pi)
+	testMQTTReadPIPacket(mqttPacketPubRel, t, r, pi)
+	testMQTTSendPIPacket(mqttPacketPubComp, t, c, pi)
+	testMQTTExpectNothing(t, r)
+}
+
+// A shared subscription with a multi-level wildcard ("$share/g/foo/#") receives
+// messages on both the level-up subject (foo) and deeper subjects (foo/bar).
+// Spec5 [4.8.2].
+func TestMQTTv5SharedSubscriptionWildcard(t *testing.T) {
+	o := testMQTTDefaultOptionsV5()
+	s := testMQTTRunServer(t, o)
+	defer testMQTTShutdownServer(s)
+
+	c, r := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "wcshare", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
+	defer c.Close()
+	testMQTTReadConnAckV5(t, r)
+	testMQTTSubV5(t, c, r, 1, []mqttV5SubFilter{{topic: "$share/g/foo/#", opts: 0}})
+
+	cp, rp := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "wcpub", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
+	defer cp.Close()
+	testMQTTReadConnAckV5(t, rp)
+
+	testMQTTPublishV5(t, cp, 0, 0, "foo/bar", []byte("deep"))
+	testMQTTReadPublishV5(t, r, "foo/bar", []byte("deep"))
+	testMQTTPublishV5(t, cp, 0, 0, "foo", []byte("levelup"))
+	testMQTTReadPublishV5(t, r, "foo", []byte("levelup"))
 	testMQTTExpectNothing(t, r)
 
-	// The granted filter still works.
-	testMQTTPublishV5(t, cp, 0, 0, "foo", []byte("msg"))
-	testMQTTReadPublishV5(t, r, "foo", []byte("msg"))
+	// UNSUBSCRIBE succeeds (removal of the level-up raw NATS sub on unsubscribe is
+	// subject to a pre-existing server-wide limitation shared with non-shared
+	// "foo/#" subscriptions, so delivery-cessation is not asserted here).
+	codes := testMQTTUnsubV5(t, c, r, 1, []string{"$share/g/foo/#"})
+	if len(codes) != 1 || codes[0] != 0 {
+		t.Fatalf("Expected UNSUBACK [0], got %v", codes)
+	}
+	// The deeper subject's subscription (main "foo.>") is removed cleanly.
+	testMQTTPublishV5(t, cp, 0, 0, "foo/bar", []byte("gone"))
+	testMQTTExpectNothing(t, r)
+}
+
+// Distinct share groups each receive their own copy of a message, and a plain
+// (non-shared) subscription on the same client coexists and gets a copy too.
+// Spec5 [4.8.2].
+func TestMQTTv5SharedSubscriptionTwoGroupsAndPlain(t *testing.T) {
+	o := testMQTTDefaultOptionsV5()
+	s := testMQTTRunServer(t, o)
+	defer testMQTTShutdownServer(s)
+
+	ca, ra := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "grpA", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
+	defer ca.Close()
+	testMQTTReadConnAckV5(t, ra)
+	testMQTTSubV5(t, ca, ra, 1, []mqttV5SubFilter{{topic: "$share/A/foo", opts: 0}})
+
+	cb, rb := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "grpB", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
+	defer cb.Close()
+	testMQTTReadConnAckV5(t, rb)
+	// Same client holds a shared sub in group B AND a plain subscription: expects
+	// two copies of a message.
+	testMQTTSubV5(t, cb, rb, 1, []mqttV5SubFilter{{topic: "$share/B/foo", opts: 0}, {topic: "foo", opts: 0}})
+
+	cp, rp := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "twogpub", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
+	defer cp.Close()
+	testMQTTReadConnAckV5(t, rp)
+	testMQTTPublishV5(t, cp, 0, 0, "foo", []byte("hello"))
+
+	// Group A's only member receives one copy.
+	testMQTTReadPublishV5(t, ra, "foo", []byte("hello"))
+	testMQTTExpectNothing(t, ra)
+	// Group B's member receives two copies (shared group B + plain).
+	testMQTTReadPublishV5(t, rb, "foo", []byte("hello"))
+	testMQTTReadPublishV5(t, rb, "foo", []byte("hello"))
+	testMQTTExpectNothing(t, rb)
+}
+
+// Shared subscriptions never receive retained messages, while a plain
+// subscription on the same topic still replays them. Spec5 [4.8.2].
+func TestMQTTv5SharedSubscriptionRetainedSuppressed(t *testing.T) {
+	o := testMQTTDefaultOptionsV5()
+	s := testMQTTRunServer(t, o)
+	defer testMQTTShutdownServer(s)
+
+	cp, rp := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "retpub", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
+	defer cp.Close()
+	testMQTTReadConnAckV5(t, rp)
+	// Publish a QoS1 retained message and wait for its PUBACK so it is stored.
+	testMQTTPubV5Props(t, cp, rp, 1, true, 1, "ret/topic", []byte("retained"), nil)
+
+	// A shared subscription must not replay the retained message.
+	cs, rs := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "retshare", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
+	defer cs.Close()
+	testMQTTReadConnAckV5(t, rs)
+	testMQTTSubV5(t, cs, rs, 1, []mqttV5SubFilter{{topic: "$share/g/ret/topic", opts: 0}})
+	testMQTTExpectNothing(t, rs)
+
+	// A plain subscription on the same topic still replays the retained message.
+	cn, rn := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "retplain", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
+	defer cn.Close()
+	testMQTTReadConnAckV5(t, rn)
+	testMQTTSubV5(t, cn, rn, 1, []mqttV5SubFilter{{topic: "ret/topic", opts: 0}})
+	testMQTTReadPublishV5(t, rn, "ret/topic", []byte("retained"))
+}
+
+// A malformed shared subscription filter is a Malformed Packet and closes the
+// connection with DISCONNECT 0x81; No Local on a shared subscription is a
+// Protocol Error 0x82. Spec5 [MQTT-4.8.2-1], [MQTT-4.8.2-2], [MQTT-3.8.3-4].
+func TestMQTTv5SharedSubscriptionMalformed(t *testing.T) {
+	o := testMQTTDefaultOptionsV5()
+	s := testMQTTRunServer(t, o)
+	defer testMQTTShutdownServer(s)
+
+	for _, bad := range []string{"$share//foo", "$share/grp", "$share/grp/", "$share/g+x/foo", "$share/g#x/foo"} {
+		t.Run(bad, func(t *testing.T) {
+			c, r := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "badshare", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
+			defer c.Close()
+			testMQTTReadConnAckV5(t, r)
+			// Send the SUBSCRIBE directly (the helper would try to read a SUBACK).
+			vh := newMQTTWriter(0)
+			vh.WriteUint16(1)
+			vh.WriteVarInt(0)
+			vh.WriteBytes([]byte(bad))
+			vh.WriteByte(0)
+			w := newMQTTWriter(0)
+			w.WriteByte(mqttPacketSub | mqttSubscribeFlags)
+			w.WriteVarInt(vh.Len())
+			w.Write(vh.Bytes())
+			if _, err := testMQTTWrite(c, w.Bytes()); err != nil {
+				t.Fatalf("Error writing SUBSCRIBE: %v", err)
+			}
+			if reason, _ := testMQTTReadDisconnectV5(t, r); reason != mqttReasonMalformedPacket {
+				t.Fatalf("Expected DISCONNECT reason 0x%x, got 0x%x", mqttReasonMalformedPacket, reason)
+			}
+		})
+	}
+}
+
+// An MQTT 3.1.1 client has no shared-subscription semantics: "$share/..." is a
+// literal topic filter. A publish to that literal topic is delivered; a publish
+// to the underlying topic is not.
+func TestMQTTSharedSubscription311Literal(t *testing.T) {
+	o := testMQTTDefaultOptions()
+	s := testMQTTRunServer(t, o)
+	defer testMQTTShutdownServer(s)
+
+	c, r := testMQTTConnect(t, &mqttConnInfo{clientID: "v3share", cleanSess: true}, o.MQTT.Host, o.MQTT.Port)
+	defer c.Close()
+	testMQTTCheckConnAck(t, r, mqttConnAckRCConnectionAccepted, false)
+	testMQTTSub(t, 1, c, r, []*mqttFilter{{filter: "$share/grp/foo", qos: 0}}, []byte{0})
+
+	cp, rp := testMQTTConnect(t, &mqttConnInfo{clientID: "v3sharepub", cleanSess: true}, o.MQTT.Host, o.MQTT.Port)
+	defer cp.Close()
+	testMQTTCheckConnAck(t, rp, mqttConnAckRCConnectionAccepted, false)
+
+	// Publishing to the underlying topic is NOT delivered (literal filter).
+	testMQTTPublish(t, cp, r, 0, false, false, "foo", 0, []byte("nope"))
+	testMQTTExpectNothing(t, r)
+	// Publishing to the literal "$share/grp/foo" topic IS delivered.
+	testMQTTPublish(t, cp, r, 0, false, false, "$share/grp/foo", 0, []byte("literal"))
+	testMQTTCheckPubMsg(t, c, r, "$share/grp/foo", 0, []byte("literal"))
+}
+
+// UNSUBSCRIBE of a shared subscription removes it (and reports 0x11 if it never
+// existed), without affecting a plain subscription on the same subject. Spec5 [4.8.2].
+func TestMQTTv5SharedSubscriptionUnsub(t *testing.T) {
+	o := testMQTTDefaultOptionsV5()
+	s := testMQTTRunServer(t, o)
+	defer testMQTTShutdownServer(s)
+
+	c, r := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "unsubshare", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
+	defer c.Close()
+	testMQTTReadConnAckV5(t, r)
+	testMQTTSubV5(t, c, r, 1, []mqttV5SubFilter{{topic: "$share/g/foo", opts: 0}, {topic: "foo", opts: 0}})
+
+	cp, rp := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "unsubpub", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
+	defer cp.Close()
+	testMQTTReadConnAckV5(t, rp)
+
+	// Both deliver initially (shared + plain => two copies).
+	testMQTTPublishV5(t, cp, 0, 0, "foo", []byte("a"))
+	testMQTTReadPublishV5(t, r, "foo", []byte("a"))
+	testMQTTReadPublishV5(t, r, "foo", []byte("a"))
+
+	// Unsubscribe only the shared filter.
+	codes := testMQTTUnsubV5(t, c, r, 1, []string{"$share/g/foo"})
+	if len(codes) != 1 || codes[0] != 0 {
+		t.Fatalf("Expected UNSUBACK [0], got %v", codes)
+	}
+	// Now only the plain subscription delivers (one copy).
+	testMQTTPublishV5(t, cp, 0, 0, "foo", []byte("b"))
+	testMQTTReadPublishV5(t, r, "foo", []byte("b"))
+	testMQTTExpectNothing(t, r)
+
+	// Unsubscribing again reports "no subscription existed".
+	codes = testMQTTUnsubV5(t, c, r, 1, []string{"$share/g/foo"})
+	if len(codes) != 1 || codes[0] != mqttReasonNoSubscriptionExisted {
+		t.Fatalf("Expected UNSUBACK [0x%x], got %v", mqttReasonNoSubscriptionExisted, codes)
+	}
+}
+
+// The group's shared JetStream consumer survives while any member remains, and
+// is deleted once the last member unsubscribes (last-holder release). Uses QoS1
+// so the shared durable (not just the raw queue sub) is exercised. Spec5 [4.8.2].
+func TestMQTTv5SharedSubscriptionLastHolder(t *testing.T) {
+	o := testMQTTDefaultOptionsV5()
+	s := testMQTTRunServer(t, o)
+	defer testMQTTShutdownServer(s)
+
+	_, _, durable := mqttSharedNames("g", "foo")
+	consumerExists := func() bool {
+		mset, err := s.GlobalAccount().lookupStream(mqttStreamName)
+		if err != nil {
+			t.Fatalf("lookup stream: %v", err)
+		}
+		return mset.lookupConsumer(durable) != nil
+	}
+
+	ca, ra := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "lhA", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
+	defer ca.Close()
+	testMQTTReadConnAckV5(t, ra)
+	testMQTTSubV5(t, ca, ra, 1, []mqttV5SubFilter{{topic: "$share/g/foo", opts: 1}})
+	cb, rb := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "lhB", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
+	defer cb.Close()
+	testMQTTReadConnAckV5(t, rb)
+	testMQTTSubV5(t, cb, rb, 1, []mqttV5SubFilter{{topic: "$share/g/foo", opts: 1}})
+
+	if !consumerExists() {
+		t.Fatal("expected shared consumer to exist after subscribe")
+	}
+
+	cp, rp := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "lhpub", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
+	defer cp.Close()
+	testMQTTReadConnAckV5(t, rp)
+
+	// A unsubscribes; the group (and its durable) is still alive via B.
+	testMQTTUnsubV5(t, ca, ra, 1, []string{"$share/g/foo"})
+	if !consumerExists() {
+		t.Fatal("shared consumer must survive while B still holds it")
+	}
+	testMQTTPublishV5(t, cp, 1, 1, "foo", []byte("one"))
+	testMQTTReadPubAck(t, rp, 1)
+	topic, pl, _, pi, ok := testMQTTTryReadPublishV5(rb, time.Second)
+	if !ok || topic != "foo" || string(pl) != "one" {
+		t.Fatalf("expected B to still receive; got ok=%v topic=%q", ok, topic)
+	}
+	testMQTTSendPIPacket(mqttPacketPubAck, t, cb, pi)
+	testMQTTExpectNothing(t, ra)
+
+	// B unsubscribes; the last holder is gone, so the shared durable is deleted.
+	testMQTTUnsubV5(t, cb, rb, 1, []string{"$share/g/foo"})
+	checkFor(t, 2*time.Second, 20*time.Millisecond, func() error {
+		if consumerExists() {
+			return fmt.Errorf("shared consumer still present after last holder left")
+		}
+		return nil
+	})
+}
+
+// Ending a session (here via a clean-start reconnect) releases its shared group
+// consumer when it was the last holder, exercising the sharedSubs-driven release
+// in clear(). Spec5 [4.8.2].
+func TestMQTTv5SharedSubscriptionSessionEndRelease(t *testing.T) {
+	o := testMQTTDefaultOptionsV5()
+	s := testMQTTRunServer(t, o)
+	defer testMQTTShutdownServer(s)
+
+	_, _, durable := mqttSharedNames("g", "foo")
+	consumerExists := func() bool {
+		mset, err := s.GlobalAccount().lookupStream(mqttStreamName)
+		if err != nil {
+			t.Fatalf("lookup stream: %v", err)
+		}
+		return mset.lookupConsumer(durable) != nil
+	}
+
+	ci := &mqttV5ConnInfo{clientID: "seShare", props: mqttV5ConnPropsSessionExpiry(300)}
+	c, r := testMQTTConnectV5(t, ci, o.MQTT.Host, o.MQTT.Port)
+	testMQTTReadConnAckV5(t, r)
+	testMQTTSubV5(t, c, r, 1, []mqttV5SubFilter{{topic: "$share/g/foo", opts: 1}})
+	if !consumerExists() {
+		t.Fatal("expected shared consumer after subscribe")
+	}
+	testMQTTDisconnect(t, c, nil)
+	c.Close()
+	// The session persists (expiry 300), so the durable must remain.
+	if !consumerExists() {
+		t.Fatal("shared consumer must persist across a disconnect with a live session")
+	}
+
+	// Reconnect with clean start: the old session is discarded (clear()), which
+	// must release the shared durable as the last holder.
+	c2, r2 := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "seShare", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
+	defer c2.Close()
+	testMQTTReadConnAckV5(t, r2)
+	checkFor(t, 2*time.Second, 20*time.Millisecond, func() error {
+		if consumerExists() {
+			return fmt.Errorf("shared consumer still present after session end")
+		}
+		return nil
+	})
+}
+
+// A persistent v5 session's shared subscriptions are force-left when the client
+// resumes as MQTT 3.1.1 (which cannot manage them), and are gone on a later v5
+// resume. Spec5 [4.8.2].
+func TestMQTTv5SharedSubscription311ForcedLeave(t *testing.T) {
+	o := testMQTTDefaultOptionsV5()
+	s := testMQTTRunServer(t, o)
+	defer testMQTTShutdownServer(s)
+
+	ci := &mqttV5ConnInfo{clientID: "flshare", props: mqttV5ConnPropsSessionExpiry(300)}
+	c, r := testMQTTConnectV5(t, ci, o.MQTT.Host, o.MQTT.Port)
+	testMQTTReadConnAckV5(t, r)
+	// QoS1 so a shared group durable and an in-memory cons entry exist.
+	testMQTTSubV5(t, c, r, 1, []mqttV5SubFilter{{topic: "$share/g/foo", opts: 1}})
+	testMQTTDisconnect(t, c, nil) // clean unbind so the same-id resume is not a takeover race
+	c.Close()
+
+	// Resume the same session as 3.1.1: shared membership must be force-left.
+	c3, r3 := testMQTTConnect(t, &mqttConnInfo{clientID: "flshare", cleanSess: false}, o.MQTT.Host, o.MQTT.Port)
+	defer c3.Close()
+	testMQTTCheckConnAck(t, r3, mqttConnAckRCConnectionAccepted, true) // session present
+	testMQTTDisconnect(t, c3, nil)
+	c3.Close()
+
+	// Resume again as v5: the shared subscription must be gone (a publish is not
+	// delivered), proving the group membership was released.
+	c2, r2 := testMQTTConnectV5(t, ci, o.MQTT.Host, o.MQTT.Port)
+	defer c2.Close()
+	testMQTTReadConnAckV5(t, r2)
+	cp, rp := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "flpub", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
+	defer cp.Close()
+	testMQTTReadConnAckV5(t, rp)
+	testMQTTPublishV5(t, cp, 0, 0, "foo", []byte("gone"))
+	testMQTTExpectNothing(t, r2)
+
+	// A fresh v5 SUBSCRIBE of the same shared filter after the forced leave must
+	// be a full (re)join: the forced leave deleted the group durable, so a stale
+	// in-memory cons entry must not make the join skip recreating it. QoS1
+	// delivery through the recreated durable proves it.
+	codes := testMQTTSubV5(t, c2, r2, 1, []mqttV5SubFilter{{topic: "$share/g/foo", opts: 1}})
+	if len(codes) != 1 || codes[0] != 1 {
+		t.Fatalf("Expected SUBACK [1] on re-join after forced leave, got %v", codes)
+	}
+	testMQTTPublishV5(t, cp, 1, 1, "foo", []byte("rejoined"))
+	testMQTTReadPubAck(t, rp, 1)
+	topic, pl, qos, pi, ok := testMQTTTryReadPublishV5(r2, 2*time.Second)
+	if !ok || topic != "foo" || string(pl) != "rejoined" || qos != 1 {
+		t.Fatalf("expected QoS1 delivery after re-join; ok=%v topic=%q qos=%d", ok, topic, qos)
+	}
+	testMQTTSendPIPacket(mqttPacketPubAck, t, c2, pi)
+}
+
+// A QoS1 message delivered to a member that disconnects without acking is
+// redelivered to another member of the group after AckWait. Spec5 [4.8.2].
+func TestMQTTv5SharedSubscriptionRedeliveryToOtherMember(t *testing.T) {
+	o := testMQTTDefaultOptionsV5()
+	o.MQTT.AckWait = 250 * time.Millisecond
+	s := testMQTTRunServer(t, o)
+	defer testMQTTShutdownServer(s)
+
+	ca, ra := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "rdA", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
+	testMQTTReadConnAckV5(t, ra)
+	cb, rb := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "rdB", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
+	defer cb.Close()
+	testMQTTReadConnAckV5(t, rb)
+	testMQTTSubV5(t, ca, ra, 1, []mqttV5SubFilter{{topic: "$share/g/foo", opts: 1}})
+	testMQTTSubV5(t, cb, rb, 1, []mqttV5SubFilter{{topic: "$share/g/foo", opts: 1}})
+
+	cp, rp := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "rdpub", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
+	defer cp.Close()
+	testMQTTReadConnAckV5(t, rp)
+	testMQTTPublishV5(t, cp, 1, 1, "foo", []byte("redeliver"))
+	testMQTTReadPubAck(t, rp, 1)
+
+	// Whichever member first receives it does NOT ack and disconnects; the message
+	// must be redelivered to the surviving member.
+	survivor := rb
+	survivorC := cb
+	if _, _, _, _, ok := testMQTTTryReadPublishV5(ra, time.Second); ok {
+		ca.Close() // A got it, didn't ack, drop it; B survives
+	} else if _, _, _, _, ok := testMQTTTryReadPublishV5(rb, time.Second); ok {
+		cb.Close() // B got it; A survives
+		survivor = ra
+		survivorC = ca
+		defer ca.Close()
+	} else {
+		ca.Close()
+		t.Fatal("neither member received the initial delivery")
+	}
+	// The survivor receives the redelivery (dup) after AckWait.
+	topic, pl, _, pi, ok := testMQTTTryReadPublishV5(survivor, 3*time.Second)
+	if !ok || topic != "foo" || string(pl) != "redeliver" {
+		t.Fatalf("expected redelivery to survivor; ok=%v topic=%q payload=%q", ok, topic, pl)
+	}
+	testMQTTSendPIPacket(mqttPacketPubAck, t, survivorC, pi)
+}
+
+// One UNSUBSCRIBE packet leaving several shared groups releases them off a
+// single last-holder scan: durables still held by another member survive,
+// the rest (including a "foo/#" filter's level-up durable) are deleted. Spec5 [4.8.2].
+func TestMQTTv5SharedSubscriptionUnsubBatch(t *testing.T) {
+	o := testMQTTDefaultOptionsV5()
+	s := testMQTTRunServer(t, o)
+	defer testMQTTShutdownServer(s)
+
+	consumerExists := func(durable string) bool {
+		t.Helper()
+		mset, err := s.GlobalAccount().lookupStream(mqttStreamName)
+		if err != nil {
+			t.Fatalf("lookup stream: %v", err)
+		}
+		return mset.lookupConsumer(durable) != nil
+	}
+
+	ca, ra := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "ubA", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
+	defer ca.Close()
+	testMQTTReadConnAckV5(t, ra)
+	testMQTTSubV5(t, ca, ra, 1, []mqttV5SubFilter{
+		{topic: "$share/g1/foo", opts: 1},
+		{topic: "$share/g2/baz", opts: 1},
+		{topic: "$share/g3/foo/#", opts: 1},
+	})
+	cb, rb := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "ubB", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
+	defer cb.Close()
+	testMQTTReadConnAckV5(t, rb)
+	testMQTTSubV5(t, cb, rb, 1, []mqttV5SubFilter{{topic: "$share/g1/foo", opts: 1}})
+
+	_, _, durG1 := mqttSharedNames("g1", "foo")
+	_, _, durG2 := mqttSharedNames("g2", "baz")
+	dursG3 := mqttSharedDurablesForKey("$share/g3/foo.>")
+	if len(dursG3) != 2 {
+		t.Fatalf("expected 2 durables for the '#' filter, got %v", dursG3)
+	}
+	for _, dur := range append([]string{durG1, durG2}, dursG3...) {
+		if !consumerExists(dur) {
+			t.Fatalf("expected durable %q after subscribe", dur)
+		}
+	}
+
+	// A leaves all three groups in one packet.
+	codes := testMQTTUnsubV5(t, ca, ra, 1, []string{"$share/g1/foo", "$share/g2/baz", "$share/g3/foo/#"})
+	if len(codes) != 3 || codes[0] != 0 || codes[1] != 0 || codes[2] != 0 {
+		t.Fatalf("Expected UNSUBACK [0 0 0], got %v", codes)
+	}
+	checkFor(t, 2*time.Second, 20*time.Millisecond, func() error {
+		for _, dur := range append([]string{durG2}, dursG3...) {
+			if consumerExists(dur) {
+				return fmt.Errorf("durable %q still present after last holder left", dur)
+			}
+		}
+		return nil
+	})
+	if !consumerExists(durG1) {
+		t.Fatal("g1 durable must survive while B still holds it")
+	}
+}
+
+// Crash windows between a confirmed record save/delete and consumer teardown
+// leak durables on the messages stream; the orphaned-consumer sweep reconciles
+// them against the session records, while sparing referenced, non-MQTT, and
+// too-young (grace window) consumers. Also exercises the sweep running at
+// account session manager startup after a restart. Spec5 [4.8.2].
+func TestMQTTv5SharedSubscriptionOrphanSweep(t *testing.T) {
+	defer func(old time.Duration) { mqttOrphanSweepGrace = old }(mqttOrphanSweepGrace)
+
+	o := testMQTTDefaultOptionsV5()
+	s := testMQTTRunServer(t, o)
+	defer testMQTTShutdownRestartedServer(&s)
+
+	// A live member: its shared durable and plain QoS1 durable are referenced.
+	// The session expiry keeps its record (and durables) alive across the
+	// restart below.
+	c, r := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "sweepLive", cleanStart: true, props: mqttV5ConnPropsSessionExpiry(300)}, o.MQTT.Host, o.MQTT.Port)
+	defer c.Close()
+	testMQTTReadConnAckV5(t, r)
+	testMQTTSubV5(t, c, r, 1, []mqttV5SubFilter{{topic: "$share/g/foo", opts: 1}, {topic: "bar", opts: 1}})
+
+	lookupMsgsStream := func() *stream {
+		t.Helper()
+		mset, err := s.GlobalAccount().lookupStream(mqttStreamName)
+		if err != nil {
+			t.Fatalf("lookup stream: %v", err)
+		}
+		return mset
+	}
+	// Inject orphans as a crash would leave them: durables no session record
+	// references — one shared-shaped, one plain-shaped — plus a consumer that
+	// is not MQTT's, which the sweep must never touch.
+	addOrphans := func(mset *stream, sharedGroup, plainDur string) string {
+		t.Helper()
+		queue, deliver, sharedDur := mqttSharedNames(sharedGroup, "foo")
+		if _, err := mset.addConsumer(&ConsumerConfig{
+			Durable:        sharedDur,
+			DeliverSubject: deliver,
+			DeliverGroup:   queue,
+			AckPolicy:      AckExplicit,
+			FilterSubject:  mqttStreamSubjectPrefix + "foo",
+		}); err != nil {
+			t.Fatalf("add shared orphan: %v", err)
+		}
+		if _, err := mset.addConsumer(&ConsumerConfig{
+			Durable:        plainDur,
+			DeliverSubject: mqttSubPrefix + plainDur,
+			AckPolicy:      AckExplicit,
+			FilterSubject:  mqttStreamSubjectPrefix + "foo",
+		}); err != nil {
+			t.Fatalf("add plain orphan: %v", err)
+		}
+		return sharedDur
+	}
+	mset := lookupMsgsStream()
+	orphanShared := addOrphans(mset, "gone", "deadbeef_orphan")
+	if _, err := mset.addConsumer(&ConsumerConfig{
+		Durable:       "not_mqtt",
+		AckPolicy:     AckExplicit,
+		FilterSubject: mqttStreamSubjectPrefix + "foo",
+	}); err != nil {
+		t.Fatalf("add non-MQTT consumer: %v", err)
+	}
+
+	sm := &s.mqtt.sessmgr
+	sm.mu.Lock()
+	asm := sm.sessions[globalAccountName]
+	sm.mu.Unlock()
+	if asm == nil {
+		t.Fatal("account session manager not found")
+	}
+
+	// Within the grace window nothing may be deleted.
+	asm.sweepOrphanedConsumers(s)
+	for _, name := range []string{orphanShared, "deadbeef_orphan", "not_mqtt"} {
+		if mset.lookupConsumer(name) == nil {
+			t.Fatalf("consumer %q swept within the grace window", name)
+		}
+	}
+
+	// Grace elapsed: only the two MQTT-shaped orphans go.
+	mqttOrphanSweepGrace = 0
+	asm.sweepOrphanedConsumers(s)
+	for _, name := range []string{orphanShared, "deadbeef_orphan"} {
+		if mset.lookupConsumer(name) != nil {
+			t.Fatalf("orphan %q survived the sweep", name)
+		}
+	}
+	if mset.lookupConsumer("not_mqtt") == nil {
+		t.Fatal("non-MQTT consumer must survive the sweep")
+	}
+	_, _, liveShared := mqttSharedNames("g", "foo")
+	if mset.lookupConsumer(liveShared) == nil {
+		t.Fatal("live shared durable must survive the sweep")
+	}
+	if n := len(mset.getConsumers()); n != 3 {
+		t.Fatalf("expected 3 consumers left (live shared, live plain, non-MQTT), got %v", n)
+	}
+
+	// A restart sweeps at account session manager creation: inject fresh
+	// orphans, restart, and let the first MQTT connect trigger the sweep.
+	orphanShared = addOrphans(mset, "gone2", "deadbeef_orphan2")
+	dir := o.StoreDir
+	c.Close()
+	s.Shutdown()
+	o.Port = -1
+	o.MQTT.Port = -1
+	o.StoreDir = dir
+	s = testMQTTRunServer(t, o)
+
+	c2, r2 := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "sweepLive"}, o.MQTT.Host, o.MQTT.Port)
+	defer c2.Close()
+	testMQTTReadConnAckV5(t, r2)
+	mset = lookupMsgsStream()
+	checkFor(t, 2*time.Second, 20*time.Millisecond, func() error {
+		for _, name := range []string{orphanShared, "deadbeef_orphan2"} {
+			if mset.lookupConsumer(name) != nil {
+				return fmt.Errorf("orphan %q still present after restart sweep", name)
+			}
+		}
+		return nil
+	})
+	if mset.lookupConsumer(liveShared) == nil {
+		t.Fatal("live shared durable must survive the restart sweep")
+	}
+	if mset.lookupConsumer("not_mqtt") == nil {
+		t.Fatal("non-MQTT consumer must survive the restart sweep")
+	}
+}
+
+// A shared join whose membership persist fails is reported as a per-filter
+// SUBACK failure, leaves no membership or durable behind, and an existing group
+// member is unaffected by another member's failed join. Spec5 [4.8.2].
+func TestMQTTv5SharedSubscriptionFailedJoinRollback(t *testing.T) {
+	o := testMQTTDefaultOptionsV5()
+	s := testMQTTRunServer(t, o)
+	defer testMQTTShutdownServer(s)
+	defer func() { mqttTestSessSaveHook = nil }()
+
+	_, _, durable := mqttSharedNames("g", "foo")
+	consumerExists := func() bool {
+		mset, err := s.GlobalAccount().lookupStream(mqttStreamName)
+		if err != nil {
+			t.Fatalf("lookup stream: %v", err)
+		}
+		return mset.lookupConsumer(durable) != nil
+	}
+
+	// Member A joins successfully.
+	ca, ra := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "fjA", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
+	defer ca.Close()
+	testMQTTReadConnAckV5(t, ra)
+	testMQTTSubV5(t, ca, ra, 1, []mqttV5SubFilter{{topic: "$share/g/foo", opts: 1}})
+	if !consumerExists() {
+		t.Fatal("expected shared consumer after A's join")
+	}
+
+	// Member B's early membership persist fails: per-filter SUBACK failure.
+	cb, rb := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "fjB", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
+	defer cb.Close()
+	testMQTTReadConnAckV5(t, rb)
+	mqttTestSessSaveHook = func(sess *mqttSession) error {
+		if sess.id == "fjB" {
+			return fmt.Errorf("injected save failure")
+		}
+		return nil
+	}
+	codes := testMQTTSubV5(t, cb, rb, 1, []mqttV5SubFilter{{topic: "$share/g/foo", opts: 1}})
+	mqttTestSessSaveHook = nil
+	if len(codes) != 1 || codes[0] != mqttSubAckFailure {
+		t.Fatalf("Expected SUBACK [0x%x], got %v", mqttSubAckFailure, codes)
+	}
+
+	// A's group is unaffected: the durable survives and A still receives.
+	if !consumerExists() {
+		t.Fatal("existing group must survive another member's failed join")
+	}
+	cp, rp := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "fjpub", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
+	defer cp.Close()
+	testMQTTReadConnAckV5(t, rp)
+	testMQTTPublishV5(t, cp, 1, 1, "foo", []byte("alive"))
+	testMQTTReadPubAck(t, rp, 1)
+	topic, pl, _, pi, ok := testMQTTTryReadPublishV5(ra, time.Second)
+	if !ok || topic != "foo" || string(pl) != "alive" {
+		t.Fatalf("expected A to receive; ok=%v topic=%q", ok, topic)
+	}
+	testMQTTSendPIPacket(mqttPacketPubAck, t, ca, pi)
+	// B, whose join failed, receives nothing.
+	testMQTTExpectNothing(t, rb)
+
+	// A leaves: last holder, durable deleted (B never became a member).
+	testMQTTUnsubV5(t, ca, ra, 1, []string{"$share/g/foo"})
+	checkFor(t, 2*time.Second, 20*time.Millisecond, func() error {
+		if consumerExists() {
+			return fmt.Errorf("durable still present after last real holder left")
+		}
+		return nil
+	})
+}
+
+// A SUBSCRIBE packet whose FINAL session save fails is fully rolled back: no
+// SUBACK (connection closes), neither the plain nor the shared filter from the
+// packet is resumed, and no consumer from the packet remains. A QoS0->QoS1
+// upgrade re-SUBSCRIBE rolls back to QoS0 with no durable; a QoS1->QoS0
+// downgrade re-SUBSCRIBE keeps the pre-existing durable. Spec5 [4.8.2].
+func TestMQTTv5SubscribeFinalSaveRollback(t *testing.T) {
+	o := testMQTTDefaultOptionsV5()
+	s := testMQTTRunServer(t, o)
+	defer testMQTTShutdownServer(s)
+	defer func() { mqttTestSessSaveHook = nil }()
+
+	// Count consumers on the messages stream whose filter matches the given NATS
+	// subject (subject-scoped so subtests do not interfere).
+	consumersFor := func(subject string) int {
+		mset, err := s.GlobalAccount().lookupStream(mqttStreamName)
+		if err != nil {
+			t.Fatalf("lookup stream: %v", err)
+		}
+		var n int
+		mset.mu.RLock()
+		for _, cons := range mset.consumers {
+			cons.mu.RLock()
+			fs := cons.cfg.FilterSubject
+			cons.mu.RUnlock()
+			if fs == mqttStreamSubjectPrefix+subject {
+				n++
+			}
+		}
+		mset.mu.RUnlock()
+		return n
+	}
+	_, _, sharedDur := mqttSharedNames("g", "foo")
+	sharedExists := func() bool {
+		mset, err := s.GlobalAccount().lookupStream(mqttStreamName)
+		if err != nil {
+			t.Fatalf("lookup stream: %v", err)
+		}
+		return mset.lookupConsumer(sharedDur) != nil
+	}
+
+	// Fail exactly the n-th save of the given session (later saves — including
+	// the rollback's own confirm-save — succeed).
+	failNthSave := func(id string, n int) {
+		var count int
+		mqttTestSessSaveHook = func(sess *mqttSession) error {
+			if sess.id != id {
+				return nil
+			}
+			count++
+			if count == n {
+				return fmt.Errorf("injected save failure")
+			}
+			return nil
+		}
+	}
+
+	t.Run("mixed shared and plain", func(t *testing.T) {
+		ci := &mqttV5ConnInfo{clientID: "fsr1", props: mqttV5ConnPropsSessionExpiry(300)}
+		c, r := testMQTTConnectV5(t, ci, o.MQTT.Host, o.MQTT.Port)
+		testMQTTReadConnAckV5(t, r)
+		// Save #1 = early shared join; save #2 = final packet update.
+		failNthSave("fsr1", 2)
+		vh := newMQTTWriter(0)
+		vh.WriteUint16(1)
+		vh.WriteVarInt(0)
+		vh.WriteBytes([]byte("$share/g/foo"))
+		vh.WriteByte(1)
+		vh.WriteBytes([]byte("plain"))
+		vh.WriteByte(1)
+		w := newMQTTWriter(0)
+		w.WriteByte(mqttPacketSub | mqttSubscribeFlags)
+		w.WriteVarInt(vh.Len())
+		w.Write(vh.Bytes())
+		if _, err := testMQTTWrite(c, w.Bytes()); err != nil {
+			t.Fatalf("Error writing SUBSCRIBE: %v", err)
+		}
+		// No SUBACK: the connection closes.
+		var buf [16]byte
+		c.SetReadDeadline(time.Now().Add(2 * time.Second))
+		if n, err := c.Read(buf[:]); err == nil && n > 0 && buf[0]&mqttPacketMask == mqttPacketSubAck {
+			t.Fatalf("Expected no SUBACK, got one")
+		}
+		c.Close()
+		mqttTestSessSaveHook = nil
+
+		// Resume: neither filter is present, and no consumers remain.
+		c2, r2 := testMQTTConnectV5(t, ci, o.MQTT.Host, o.MQTT.Port)
+		defer c2.Close()
+		testMQTTReadConnAckV5(t, r2)
+		cp, rp := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "fsrpub", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
+		defer cp.Close()
+		testMQTTReadConnAckV5(t, rp)
+		testMQTTPublishV5(t, cp, 0, 0, "foo", []byte("x"))
+		testMQTTPublishV5(t, cp, 0, 0, "plain", []byte("y"))
+		testMQTTExpectNothing(t, r2)
+		checkFor(t, 2*time.Second, 20*time.Millisecond, func() error {
+			if sharedExists() {
+				return fmt.Errorf("shared durable must not survive the failed packet")
+			}
+			if n := consumersFor("plain"); n != 0 {
+				return fmt.Errorf("expected no plain consumers, got %d", n)
+			}
+			return nil
+		})
+		testMQTTDisconnect(t, c2, nil)
+	})
+
+	t.Run("QoS upgrade rolls back", func(t *testing.T) {
+		ci := &mqttV5ConnInfo{clientID: "fsr2", props: mqttV5ConnPropsSessionExpiry(300)}
+		c, r := testMQTTConnectV5(t, ci, o.MQTT.Host, o.MQTT.Port)
+		testMQTTReadConnAckV5(t, r)
+		testMQTTSubV5(t, c, r, 1, []mqttV5SubFilter{{topic: "up/x", opts: 0}})
+		if n := consumersFor("up.x"); n != 0 {
+			t.Fatalf("QoS0 sub must have no consumer, got %d", n)
+		}
+		// Fail the (only) save of the upgrade packet.
+		failNthSave("fsr2", 1)
+		vh := newMQTTWriter(0)
+		vh.WriteUint16(2)
+		vh.WriteVarInt(0)
+		vh.WriteBytes([]byte("up/x"))
+		vh.WriteByte(1)
+		w := newMQTTWriter(0)
+		w.WriteByte(mqttPacketSub | mqttSubscribeFlags)
+		w.WriteVarInt(vh.Len())
+		w.Write(vh.Bytes())
+		if _, err := testMQTTWrite(c, w.Bytes()); err != nil {
+			t.Fatalf("Error writing SUBSCRIBE: %v", err)
+		}
+		time.Sleep(100 * time.Millisecond)
+		c.Close()
+		mqttTestSessSaveHook = nil
+		// The upgrade's consumer must have been torn down.
+		checkFor(t, 2*time.Second, 20*time.Millisecond, func() error {
+			if n := consumersFor("up.x"); n != 0 {
+				return fmt.Errorf("expected no consumer on up.x after rollback, got %d", n)
+			}
+			return nil
+		})
+		// Resume: subscription is still there at QoS0.
+		c2, r2 := testMQTTConnectV5(t, ci, o.MQTT.Host, o.MQTT.Port)
+		defer c2.Close()
+		if sp, _, _ := testMQTTReadConnAckV5(t, r2); !sp {
+			t.Fatal("expected session present")
+		}
+		cp, rp := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "fsrpub2", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
+		defer cp.Close()
+		testMQTTReadConnAckV5(t, rp)
+		testMQTTPublishV5(t, cp, 1, 1, "up/x", []byte("z"))
+		testMQTTReadPubAck(t, rp, 1)
+		if qos, _ := testMQTTReadPublishV5(t, r2, "up/x", []byte("z")); qos != 0 {
+			t.Fatalf("expected delivery at rolled-back QoS0, got QoS%d", qos)
+		}
+		// The persisted record must not have carried the failed upgrade's consumer:
+		// no consumer may exist (or have been recreated) after the resume.
+		if n := consumersFor("up.x"); n != 0 {
+			t.Fatalf("expected no consumer on up.x after resume, got %d", n)
+		}
+		testMQTTDisconnect(t, c2, nil)
+	})
+
+	t.Run("QoS downgrade keeps durable", func(t *testing.T) {
+		ci := &mqttV5ConnInfo{clientID: "fsr3", props: mqttV5ConnPropsSessionExpiry(300)}
+		c, r := testMQTTConnectV5(t, ci, o.MQTT.Host, o.MQTT.Port)
+		testMQTTReadConnAckV5(t, r)
+		testMQTTSubV5(t, c, r, 1, []mqttV5SubFilter{{topic: "down/x", opts: 1}})
+		if n := consumersFor("down.x"); n != 1 {
+			t.Fatalf("expected 1 consumer on down.x, got %d", n)
+		}
+		failNthSave("fsr3", 1)
+		vh := newMQTTWriter(0)
+		vh.WriteUint16(2)
+		vh.WriteVarInt(0)
+		vh.WriteBytes([]byte("down/x"))
+		vh.WriteByte(0)
+		w := newMQTTWriter(0)
+		w.WriteByte(mqttPacketSub | mqttSubscribeFlags)
+		w.WriteVarInt(vh.Len())
+		w.Write(vh.Bytes())
+		if _, err := testMQTTWrite(c, w.Bytes()); err != nil {
+			t.Fatalf("Error writing SUBSCRIBE: %v", err)
+		}
+		time.Sleep(100 * time.Millisecond)
+		c.Close()
+		mqttTestSessSaveHook = nil
+		// The pre-existing durable must have survived the failed downgrade.
+		if n := consumersFor("down.x"); n != 1 {
+			t.Fatalf("expected the pre-existing consumer to survive, got %d", n)
+		}
+		// Resume: QoS1 delivery still works.
+		c2, r2 := testMQTTConnectV5(t, ci, o.MQTT.Host, o.MQTT.Port)
+		defer c2.Close()
+		if sp, _, _ := testMQTTReadConnAckV5(t, r2); !sp {
+			t.Fatal("expected session present")
+		}
+		cp, rp := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "fsrpub3", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
+		defer cp.Close()
+		testMQTTReadConnAckV5(t, rp)
+		testMQTTPublishV5(t, cp, 1, 1, "down/x", []byte("w"))
+		testMQTTReadPubAck(t, rp, 1)
+		topic, pl, qos, pi, ok := testMQTTTryReadPublishV5(r2, 2*time.Second)
+		if !ok || topic != "down/x" || string(pl) != "w" || qos != 1 {
+			t.Fatalf("expected QoS1 delivery after failed downgrade; ok=%v topic=%q qos=%d", ok, topic, qos)
+		}
+		testMQTTSendPIPacket(mqttPacketPubAck, t, c2, pi)
+		// The persisted record must have kept the pre-existing consumer config:
+		// exactly one consumer after the resume (no orphan + fresh duplicate).
+		if n := consumersFor("down.x"); n != 1 {
+			t.Fatalf("expected exactly 1 consumer on down.x after resume, got %d", n)
+		}
+		testMQTTDisconnect(t, c2, nil)
+	})
+}
+
+// A shared wildcard subscription must not match topics beginning with '$'.
+// Spec [MQTT-4.7.2-1], Spec5 [4.8.2].
+func TestMQTTv5SharedSubscriptionReservedTopics(t *testing.T) {
+	o := testMQTTDefaultOptionsV5()
+	s := testMQTTRunServer(t, o)
+	defer testMQTTShutdownServer(s)
+
+	c, r := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "resshare", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
+	defer c.Close()
+	testMQTTReadConnAckV5(t, r)
+	testMQTTSubV5(t, c, r, 1, []mqttV5SubFilter{{topic: "$share/g/#", opts: 0}})
+
+	cp, rp := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "respub", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
+	defer cp.Close()
+	testMQTTReadConnAckV5(t, rp)
+	// A '$'-prefixed topic must not be delivered to the shared wildcard.
+	testMQTTPublishV5(t, cp, 0, 0, "$sys/x", []byte("reserved"))
+	testMQTTExpectNothing(t, r)
+	// A normal topic is.
+	testMQTTPublishV5(t, cp, 0, 0, "normal", []byte("ok"))
+	testMQTTReadPublishV5(t, r, "normal", []byte("ok"))
+}
+
+// When the messages stream imposes a consumer InactiveThreshold (which would
+// give the group durable a delete timer), a shared subscribe is refused with a
+// per-filter failure and leaves no membership. Spec5 [4.8.2].
+func TestMQTTv5SharedSubscriptionStreamConsumerLimits(t *testing.T) {
+	o := testMQTTDefaultOptionsV5()
+	s := testMQTTRunServer(t, o)
+	defer testMQTTShutdownServer(s)
+
+	// First connect initializes the account's MQTT streams.
+	c, r := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "climshare", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
+	defer c.Close()
+	testMQTTReadConnAckV5(t, r)
+
+	// Impose a consumer inactivity limit on the live messages stream.
+	mset, err := s.GlobalAccount().lookupStream(mqttStreamName)
+	if err != nil {
+		t.Fatalf("lookup stream: %v", err)
+	}
+	cfg := mset.config()
+	cfg.ConsumerLimits.InactiveThreshold = 5 * time.Minute
+	if err := mset.update(&cfg); err != nil {
+		t.Fatalf("stream update: %v", err)
+	}
+
+	codes := testMQTTSubV5(t, c, r, 1, []mqttV5SubFilter{{topic: "$share/g/foo", opts: 1}})
+	if len(codes) != 1 || codes[0] != mqttSubAckFailure {
+		t.Fatalf("Expected SUBACK [0x%x], got %v", mqttSubAckFailure, codes)
+	}
+	_, _, durable := mqttSharedNames("g", "foo")
+	if mset.lookupConsumer(durable) != nil {
+		t.Fatal("no shared durable must have been created")
+	}
+	// A plain QoS1 subscription is unaffected by the shared guard.
+	codes = testMQTTSubV5(t, c, r, 2, []mqttV5SubFilter{{topic: "foo", opts: 1}})
+	if len(codes) != 1 || codes[0] != 1 {
+		t.Fatalf("Expected plain SUBACK [1], got %v", codes)
+	}
+}
+
+// Shared subscriptions are authorized against the underlying topic: a user whose
+// allow list contains only the plain subject can shared-subscribe it (the
+// server-generated queue name and deliver subject never appear in user
+// permissions), while a subject outside the allow list is rejected. Spec5 [4.8.2].
+func TestMQTTv5SharedSubscriptionPermissions(t *testing.T) {
+	o := testMQTTDefaultOptionsV5()
+	o.Users = []*User{
+		{Username: "shr", Password: "pwd", Permissions: &Permissions{
+			Subscribe: &SubjectPermission{Allow: []string{"foo"}},
+			Publish:   &SubjectPermission{Allow: []string{"$MQTT.>"}},
+		}},
+		{Username: "pub", Password: "pwd", Permissions: &Permissions{
+			Publish: &SubjectPermission{Allow: []string{"foo", "$MQTT.>"}},
+		}},
+		// Queue-scoped allow only: must NOT grant shared-sub permission (the
+		// generated internal queue name is authorized as a plain subscription on
+		// the underlying subject, and "foo v1" allows no plain subs).
+		{Username: "qonly", Password: "pwd", Permissions: &Permissions{
+			Subscribe: &SubjectPermission{Allow: []string{"foo v1"}},
+			Publish:   &SubjectPermission{Allow: []string{"$MQTT.>"}},
+		}},
+		// Explicit deny on the underlying subject beats a broad allow.
+		{Username: "deny", Password: "pwd", Permissions: &Permissions{
+			Subscribe: &SubjectPermission{Allow: []string{">"}, Deny: []string{"foo"}},
+			Publish:   &SubjectPermission{Allow: []string{"$MQTT.>"}},
+		}},
+		// Queue-scoped deny ("foo >" = all queue subscriptions on foo) must cover
+		// shared subscriptions, which are queue subs on foo with a generated name.
+		{Username: "qdeny", Password: "pwd", Permissions: &Permissions{
+			Subscribe: &SubjectPermission{Allow: []string{">"}, Deny: []string{"foo >"}},
+			Publish:   &SubjectPermission{Allow: []string{"$MQTT.>"}},
+		}},
+	}
+	s := testMQTTRunServer(t, o)
+	defer testMQTTShutdownServer(s)
+
+	c, r := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "permshare", cleanStart: true, user: "shr", pass: "pwd"}, o.MQTT.Host, o.MQTT.Port)
+	defer c.Close()
+	testMQTTReadConnAckV5(t, r)
+
+	// Allowed subject: the shared subscribe is granted at QoS1 and delivers.
+	codes := testMQTTSubV5(t, c, r, 1, []mqttV5SubFilter{{topic: "$share/g/foo", opts: 1}})
+	if len(codes) != 1 || codes[0] != 1 {
+		t.Fatalf("Expected SUBACK [1], got %v", codes)
+	}
+	cp, rp := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "permpub", cleanStart: true, user: "pub", pass: "pwd"}, o.MQTT.Host, o.MQTT.Port)
+	defer cp.Close()
+	testMQTTReadConnAckV5(t, rp)
+	testMQTTPublishV5(t, cp, 1, 1, "foo", []byte("allowed"))
+	testMQTTReadPubAck(t, rp, 1)
+	topic, pl, _, pi, ok := testMQTTTryReadPublishV5(r, 2*time.Second)
+	if !ok || topic != "foo" || string(pl) != "allowed" {
+		t.Fatalf("expected delivery under allow-list; ok=%v topic=%q", ok, topic)
+	}
+	testMQTTSendPIPacket(mqttPacketPubAck, t, c, pi)
+
+	// Disallowed subject: rejected per-filter.
+	codes = testMQTTSubV5(t, c, r, 2, []mqttV5SubFilter{{topic: "$share/g/bar", opts: 1}})
+	if len(codes) != 1 || codes[0] < mqttSubAckFailure {
+		t.Fatalf("Expected SUBACK failure for disallowed subject, got %v", codes)
+	}
+
+	// Queue-scoped allow ("foo v1") does not imply shared-sub permission: the
+	// shared subscribe on foo must be rejected (client.go queue bypass strips the
+	// internal queue name and requires plain-subscribe permission).
+	cq, rq := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "permqonly", cleanStart: true, user: "qonly", pass: "pwd"}, o.MQTT.Host, o.MQTT.Port)
+	defer cq.Close()
+	testMQTTReadConnAckV5(t, rq)
+	codes = testMQTTSubV5(t, cq, rq, 1, []mqttV5SubFilter{{topic: "$share/g/foo", opts: 0}})
+	if len(codes) != 1 || codes[0] < mqttSubAckFailure {
+		t.Fatalf("Expected SUBACK failure for queue-scoped-only allow, got %v", codes)
+	}
+
+	// An explicit deny on the underlying subject rejects the shared subscribe
+	// even under a broad allow.
+	cd, rd := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "permdeny", cleanStart: true, user: "deny", pass: "pwd"}, o.MQTT.Host, o.MQTT.Port)
+	defer cd.Close()
+	testMQTTReadConnAckV5(t, rd)
+	codes = testMQTTSubV5(t, cd, rd, 1, []mqttV5SubFilter{{topic: "$share/g/foo", opts: 0}})
+	if len(codes) != 1 || codes[0] < mqttSubAckFailure {
+		t.Fatalf("Expected SUBACK failure for denied subject, got %v", codes)
+	}
+
+	// A queue-scoped deny ("foo >") also rejects the shared subscribe: shared
+	// subscriptions are queue subs on foo and must not bypass queue-form denies.
+	cqd, rqd := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "permqdeny", cleanStart: true, user: "qdeny", pass: "pwd"}, o.MQTT.Host, o.MQTT.Port)
+	defer cqd.Close()
+	testMQTTReadConnAckV5(t, rqd)
+	codes = testMQTTSubV5(t, cqd, rqd, 1, []mqttV5SubFilter{{topic: "$share/g/foo", opts: 0}})
+	if len(codes) != 1 || codes[0] < mqttSubAckFailure {
+		t.Fatalf("Expected SUBACK failure for queue-scoped deny, got %v", codes)
+	}
+	// The same user's plain subscription on foo still works (only queue subs denied).
+	codes = testMQTTSubV5(t, cqd, rqd, 2, []mqttV5SubFilter{{topic: "foo", opts: 0}})
+	if len(codes) != 1 || codes[0] != 0 {
+		t.Fatalf("Expected plain SUBACK [0] under queue-only deny, got %v", codes)
+	}
+}
+
+// Shared subscriptions work cluster-wide: members connected to different servers
+// form one group (each message delivered exactly once across the cluster, for
+// both QoS0- and QoS1-published messages), and the group durable is deleted only
+// after the last member — possibly on another server — unsubscribes. Spec5 [4.8.2].
+func TestMQTTv5SharedSubscriptionCluster(t *testing.T) {
+	cl := createJetStreamClusterWithTemplate(t, testMQTTGetClusterTemplateV5(t), "MQTT", 2)
+	defer cl.shutdown()
+
+	o0, o1 := cl.opts[0], cl.opts[1]
+
+	// Member A on server 0, member B on server 1, same group.
+	ca, ra := testMQTTConnectRetryV5(t, &mqttV5ConnInfo{clientID: "clA", cleanStart: true}, o0.MQTT.Host, o0.MQTT.Port, 5)
+	defer ca.Close()
+	testMQTTReadConnAckV5(t, ra)
+	testMQTTSubV5(t, ca, ra, 1, []mqttV5SubFilter{{topic: "$share/g/foo", opts: 1}})
+	cb, rb := testMQTTConnectRetryV5(t, &mqttV5ConnInfo{clientID: "clB", cleanStart: true}, o1.MQTT.Host, o1.MQTT.Port, 5)
+	defer cb.Close()
+	testMQTTReadConnAckV5(t, rb)
+	testMQTTSubV5(t, cb, rb, 1, []mqttV5SubFilter{{topic: "$share/g/foo", opts: 1}})
+
+	// Publisher on server 0.
+	cp, rp := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "clpub", cleanStart: true}, o0.MQTT.Host, o0.MQTT.Port)
+	defer cp.Close()
+	testMQTTReadConnAckV5(t, rp)
+
+	// QoS1-published messages: exactly one delivery per message across servers.
+	const n = 8
+	got := map[string]int{}
+	for i := 0; i < n; i++ {
+		payload := []byte(fmt.Sprintf("c%d", i))
+		testMQTTPublishV5(t, cp, 1, uint16(i+1), "foo", payload)
+		testMQTTReadPubAck(t, rp, uint16(i+1))
+		topic, pl, _, pi, ok := testMQTTTryReadPublishV5(ra, 500*time.Millisecond)
+		if ok {
+			testMQTTSendPIPacket(mqttPacketPubAck, t, ca, pi)
+		} else if topic, pl, _, pi, ok = testMQTTTryReadPublishV5(rb, time.Second); ok {
+			testMQTTSendPIPacket(mqttPacketPubAck, t, cb, pi)
+		} else {
+			t.Fatalf("message %d not delivered to any member in the cluster", i)
+		}
+		if topic != "foo" {
+			t.Fatalf("Expected topic foo, got %q", topic)
+		}
+		got[string(pl)]++
+	}
+	if len(got) != n {
+		t.Fatalf("Expected %d distinct messages exactly once, got %v", n, got)
+	}
+	testMQTTExpectNothing(t, ra)
+	testMQTTExpectNothing(t, rb)
+
+	// QoS0-published: also exactly once, via the cluster-wide raw queue group.
+	testMQTTPublishV5(t, cp, 0, 0, "foo", []byte("q0"))
+	_, pl0, _, _, okA := testMQTTTryReadPublishV5(ra, 500*time.Millisecond)
+	if !okA {
+		if _, pl0, _, _, okA = testMQTTTryReadPublishV5(rb, time.Second); !okA {
+			t.Fatal("QoS0 message not delivered to any member")
+		}
+	}
+	if string(pl0) != "q0" {
+		t.Fatalf("Expected q0, got %q", pl0)
+	}
+	testMQTTExpectNothing(t, ra)
+	testMQTTExpectNothing(t, rb)
+
+	// Cross-server last-holder: A (server 0) leaves; the durable survives via B
+	// (server 1). Then B leaves and the durable is deleted cluster-wide.
+	_, _, durable := mqttSharedNames("g", "foo")
+	consumerExists := func() bool {
+		for _, s := range cl.servers {
+			if mset, err := s.GlobalAccount().lookupStream(mqttStreamName); err == nil && mset != nil {
+				if mset.lookupConsumer(durable) != nil {
+					return true
+				}
+			}
+		}
+		return false
+	}
+	testMQTTUnsubV5(t, ca, ra, 1, []string{"$share/g/foo"})
+	if !consumerExists() {
+		t.Fatal("shared durable must survive while a member on another server holds it")
+	}
+	testMQTTPublishV5(t, cp, 1, 9, "foo", []byte("last"))
+	testMQTTReadPubAck(t, rp, 9)
+	topic, pl, _, pi, ok := testMQTTTryReadPublishV5(rb, 2*time.Second)
+	if !ok || topic != "foo" || string(pl) != "last" {
+		t.Fatalf("expected B (other server) to receive; ok=%v topic=%q", ok, topic)
+	}
+	testMQTTSendPIPacket(mqttPacketPubAck, t, cb, pi)
+
+	testMQTTUnsubV5(t, cb, rb, 1, []string{"$share/g/foo"})
+	checkFor(t, 5*time.Second, 50*time.Millisecond, func() error {
+		if consumerExists() {
+			return fmt.Errorf("shared durable still present after last member left")
+		}
+		return nil
+	})
+}
+
+// A client must not be able to subscribe to the internal shared-subscription
+// deliver subject and divert group deliveries. Spec5 [4.8.2].
+func TestMQTTv5SharedSubscriptionDeliverSubjectRejected(t *testing.T) {
+	o := testMQTTDefaultOptionsV5()
+	s := testMQTTRunServer(t, o)
+	defer testMQTTShutdownServer(s)
+
+	c, r := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "qsubevil", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
+	defer c.Close()
+	testMQTTReadConnAckV5(t, r)
+	// "$MQTT/qsub/x" converts to the internal NATS subject "$MQTT.qsub.x" and
+	// must be rejected as an internal server subject.
+	codes := testMQTTSubV5(t, c, r, 1, []mqttV5SubFilter{{topic: "$MQTT/qsub/x", opts: 0}})
+	if len(codes) != 1 || codes[0] != mqttSubAckFailure {
+		t.Fatalf("Expected SUBACK [0x%x], got %v", mqttSubAckFailure, codes)
+	}
+}
+
+// A persistent session's shared subscription survives a disconnect/reconnect:
+// membership resumes and a QoS1 message published while offline is delivered.
+// Spec5 [4.8.2].
+func TestMQTTv5SharedSubscriptionSessionResume(t *testing.T) {
+	o := testMQTTDefaultOptionsV5()
+	s := testMQTTRunServer(t, o)
+	defer testMQTTShutdownServer(s)
+
+	ci := &mqttV5ConnInfo{clientID: "resumeshare", props: mqttV5ConnPropsSessionExpiry(300)}
+	c, r := testMQTTConnectV5(t, ci, o.MQTT.Host, o.MQTT.Port)
+	if sp, _, _ := testMQTTReadConnAckV5(t, r); sp {
+		t.Fatal("Did not expect session present on first connect")
+	}
+	testMQTTSubV5(t, c, r, 1, []mqttV5SubFilter{{topic: "$share/g/foo", opts: 1}})
+
+	// Disconnect (session persists via the 300s expiry). Clean DISCONNECT so the
+	// same-id resume below is not a takeover race.
+	testMQTTDisconnect(t, c, nil)
+	c.Close()
+
+	// Publish a QoS1 message while the only member is offline; it is stored in
+	// the group consumer and stalls until a member reconnects.
+	cp, rp := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "resumepub", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
+	defer cp.Close()
+	testMQTTReadConnAckV5(t, rp)
+	testMQTTPublishV5(t, cp, 1, 1, "foo", []byte("offline"))
+	testMQTTReadPubAck(t, rp, 1)
+
+	// Reconnect the same session: membership resumes and the backlog is delivered.
+	c2, r2 := testMQTTConnectV5(t, ci, o.MQTT.Host, o.MQTT.Port)
+	defer c2.Close()
+	if sp, _, _ := testMQTTReadConnAckV5(t, r2); !sp {
+		t.Fatal("Expected session present on resume")
+	}
+	topic, pl, _, pi, ok := testMQTTTryReadPublishV5(r2, 2*time.Second)
+	if !ok || topic != "foo" || string(pl) != "offline" {
+		t.Fatalf("Expected resumed delivery of foo/offline, got topic=%q payload=%q ok=%v", topic, pl, ok)
+	}
+	testMQTTSendPIPacket(mqttPacketPubAck, t, c2, pi)
+}
+
+// A QoS0-published message on the underlying topic is distributed to exactly one
+// group member via the raw NATS queue subscription. Spec5 [4.8.2].
+func TestMQTTv5SharedSubscriptionQoS0Distribution(t *testing.T) {
+	o := testMQTTDefaultOptionsV5()
+	s := testMQTTRunServer(t, o)
+	defer testMQTTShutdownServer(s)
+
+	ca, ra := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "q0a", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
+	defer ca.Close()
+	testMQTTReadConnAckV5(t, ra)
+	testMQTTSubV5(t, ca, ra, 1, []mqttV5SubFilter{{topic: "$share/g/foo", opts: 0}})
+	cb, rb := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "q0b", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
+	defer cb.Close()
+	testMQTTReadConnAckV5(t, rb)
+	testMQTTSubV5(t, cb, rb, 1, []mqttV5SubFilter{{topic: "$share/g/foo", opts: 0}})
+
+	cp, rp := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "q0pub", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
+	defer cp.Close()
+	testMQTTReadConnAckV5(t, rp)
+
+	const n = 10
+	got := map[string]int{}
+	for i := 0; i < n; i++ {
+		payload := []byte(fmt.Sprintf("q%d", i))
+		testMQTTPublishV5(t, cp, 0, 0, "foo", payload)
+		topic, pl, _, _, ok := testMQTTTryReadPublishV5(ra, 500*time.Millisecond)
+		if !ok {
+			topic, pl, _, _, ok = testMQTTTryReadPublishV5(rb, 500*time.Millisecond)
+		}
+		if !ok || topic != "foo" {
+			t.Fatalf("message %d not delivered to any member (topic=%q)", i, topic)
+		}
+		got[string(pl)]++
+	}
+	if len(got) != n {
+		t.Fatalf("Expected %d distinct QoS0 messages delivered once each, got %v", n, got)
+	}
+	testMQTTExpectNothing(t, ra)
+	testMQTTExpectNothing(t, rb)
 }
 
 // The v5 Retain Handling subscription option controls whether retained messages
@@ -2204,8 +3587,9 @@ func TestMQTTv5DisconnectReasonString(t *testing.T) {
 	}
 }
 
-// A SUBACK with a rejected (shared subscription) filter carries the failure text
-// as the packet-level Reason String, alongside the per-filter 0x9E code.
+// A SUBACK with a rejected filter (here a reserved internal subject) carries the
+// failure text as the packet-level Reason String, alongside the per-filter 0x80
+// code, while a valid filter in the same packet is still granted.
 func TestMQTTv5SubAckReasonString(t *testing.T) {
 	o := testMQTTDefaultOptionsV5()
 	s := testMQTTRunServer(t, o)
@@ -2216,11 +3600,11 @@ func TestMQTTv5SubAckReasonString(t *testing.T) {
 	testMQTTReadConnAckV5(t, r)
 
 	codes, props := testMQTTSubV5PropsEx(t, c, r, 1, nil, []mqttV5SubFilter{
-		{topic: "$share/g/foo", opts: 1},
+		{topic: "$MQTT/sub/x", opts: 1},
 		{topic: "bar", opts: 1},
 	})
-	if len(codes) != 2 || codes[0] != mqttReasonSharedSubNotSupported || codes[1] != 1 {
-		t.Fatalf("Expected codes [0x%x, 1], got %v", mqttReasonSharedSubNotSupported, codes)
+	if len(codes) != 2 || codes[0] != mqttSubAckFailure || codes[1] != 1 {
+		t.Fatalf("Expected codes [0x%x, 1], got %v", mqttSubAckFailure, codes)
 	}
 	if props == nil || props.reasonString == _EMPTY_ {
 		t.Fatalf("Expected a Reason String on the SUBACK, got %+v", props)
@@ -2282,9 +3666,9 @@ func TestMQTTv5ReasonStringRequestProblemInfo(t *testing.T) {
 	testMQTTReadConnAckV5(t, r)
 
 	// SUBACK: failure code present, but no Reason String.
-	codes, sprops := testMQTTSubV5PropsEx(t, c, r, 1, nil, []mqttV5SubFilter{{topic: "$share/g/foo", opts: 1}})
-	if len(codes) != 1 || codes[0] != mqttReasonSharedSubNotSupported {
-		t.Fatalf("Expected code [0x%x], got %v", mqttReasonSharedSubNotSupported, codes)
+	codes, sprops := testMQTTSubV5PropsEx(t, c, r, 1, nil, []mqttV5SubFilter{{topic: "$MQTT/sub/x", opts: 1}})
+	if len(codes) != 1 || codes[0] != mqttSubAckFailure {
+		t.Fatalf("Expected code [0x%x], got %v", mqttSubAckFailure, codes)
 	}
 	if sprops != nil && sprops.reasonString != _EMPTY_ {
 		t.Fatalf("RPI=0: expected no Reason String on SUBACK, got %q", sprops.reasonString)
@@ -2353,18 +3737,18 @@ func TestMQTTv5ReasonStringMaxPacketSize(t *testing.T) {
 	defer testMQTTShutdownServer(s)
 
 	// Small enough to leave no room for any Reason String (the shortest is ~38
-	// bytes), but large enough for the success CONNACK (~18 bytes, now carrying
-	// Shared Subscription Available + Topic Alias Maximum + Maximum Packet Size +
-	// Receive Maximum).
+	// bytes), but large enough for the success CONNACK (~16 bytes, now carrying
+	// Topic Alias Maximum + Maximum Packet Size + Receive Maximum; Shared
+	// Subscription Available is advertised by absence).
 	tiny := mqttV5MaxPacketSizeProps(30)
 
 	// SUBACK falls back: failure code present, no Reason String.
 	c, r := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "mps", cleanStart: true, props: tiny}, o.MQTT.Host, o.MQTT.Port)
 	defer c.Close()
 	testMQTTReadConnAckV5(t, r)
-	codes, sprops := testMQTTSubV5PropsEx(t, c, r, 1, nil, []mqttV5SubFilter{{topic: "$share/g/foo", opts: 1}})
-	if len(codes) != 1 || codes[0] != mqttReasonSharedSubNotSupported {
-		t.Fatalf("Expected code [0x%x], got %v", mqttReasonSharedSubNotSupported, codes)
+	codes, sprops := testMQTTSubV5PropsEx(t, c, r, 1, nil, []mqttV5SubFilter{{topic: "$MQTT/sub/x", opts: 1}})
+	if len(codes) != 1 || codes[0] != mqttSubAckFailure {
+		t.Fatalf("Expected code [0x%x], got %v", mqttSubAckFailure, codes)
 	}
 	if sprops != nil && sprops.reasonString != _EMPTY_ {
 		t.Fatalf("Tiny max: expected no Reason String on SUBACK, got %q", sprops.reasonString)
@@ -2426,7 +3810,7 @@ func TestMQTTv5ReasonStringMaxPacketSize(t *testing.T) {
 	c3, r3 := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "mps3", cleanStart: true, props: mqttV5MaxPacketSizeProps(1024)}, o.MQTT.Host, o.MQTT.Port)
 	defer c3.Close()
 	testMQTTReadConnAckV5(t, r3)
-	_, bigProps := testMQTTSubV5PropsEx(t, c3, r3, 1, nil, []mqttV5SubFilter{{topic: "$share/g/foo", opts: 1}})
+	_, bigProps := testMQTTSubV5PropsEx(t, c3, r3, 1, nil, []mqttV5SubFilter{{topic: "$MQTT/sub/x", opts: 1}})
 	if bigProps == nil || bigProps.reasonString == _EMPTY_ {
 		t.Fatalf("Large max: expected a Reason String on SUBACK, got %+v", bigProps)
 	}
@@ -2439,7 +3823,7 @@ func TestMQTTv5MaxPacketSizeAdvertised(t *testing.T) {
 		name   string
 		maxpay int32
 	}{
-		{"default", 0},   // 0 => opts default (1MB)
+		{"default", 0}, // 0 => opts default (1MB)
 		{"explicit", 512},
 	} {
 		t.Run(test.name, func(t *testing.T) {
