@@ -129,6 +129,7 @@ const (
 	mqttReasonTopicFilterInvalid          = byte(0x8f)
 	mqttReasonPacketIDInUse               = byte(0x91)
 	mqttReasonPacketIDNotFound            = byte(0x92)
+	mqttReasonReceiveMaxExceeded          = byte(0x93)
 	mqttReasonTopicAliasInvalid           = byte(0x94)
 	mqttReasonPacketTooLarge              = byte(0x95)
 	mqttReasonQuotaExceeded               = byte(0x97)
@@ -233,6 +234,13 @@ const (
 	// This is the default for the outstanding number of pending QoS 1
 	// messages sent to a session with QoS 1 subscriptions.
 	mqttDefaultMaxAckPending = 1024
+
+	// Default MQTT 5.0 Receive Maximum advertised to v5 clients when the
+	// receive_maximum option is unset: the in-flight QoS 1/2 window a compliant
+	// client self-limits to, of which the server enforces the observable part
+	// (QoS 2 held awaiting PUBREL). Symmetric with the outbound
+	// mqttDefaultMaxAckPending. Spec5 [3.2.2.3.3].
+	mqttDefaultReceiveMax = 1024
 
 	// Default MQTT 5.0 Topic Alias Maximum advertised to (and accepted from)
 	// v5 clients when the topic_alias_maximum option is unset. Bounds the
@@ -347,6 +355,7 @@ var (
 	errMQTTUnsupportedSubOption       = errors.New("unsupported MQTT 5.0 subscription option")
 	errMQTTMalformedSubOption         = errors.New("malformed MQTT 5.0 subscription option")
 	errMQTTTopicAliasInvalid          = errors.New("topic alias invalid")
+	errMQTTReceiveMaxExceeded         = errors.New("receive maximum exceeded")
 )
 
 type srvMQTT struct {
@@ -694,6 +703,25 @@ type mqtt struct {
 	// Keep Alive property. 0 = no override (property omitted). Set during
 	// CONNECT, read on the CONNACK path only. Spec5 [3.2.2.3.14].
 	serverKeepAlive uint16
+
+	// recvMaxIn is the server's Receive Maximum advertised in this connection's
+	// success CONNACK and enforced on inbound QoS 1/2 PUBLISH. 0 => not advertised
+	// or enforced (3.1.1, or disabled). Resolved once at CONNECT (like
+	// topicAliasMax) so the advertised and enforced values match across a reload.
+	// Read loop only. Spec5 [3.2.2.3.3], [4.9].
+	recvMaxIn uint16
+
+	// qos2InFlight holds the inbound QoS 2 packet identifiers between PUBREC and
+	// PUBREL: the portion of the client's consumed send quota the server can
+	// durably observe, checked against recvMaxIn [MQTT-4.9]. QoS 1 is not
+	// tracked: its quota slot is returned when the client receives the PUBACK,
+	// which the server cannot observe (no post-PUBACK signal flows back), so pure
+	// QoS 1 overrun is left to the client's own compliance (and a flood to the
+	// slow-consumer limits); a QoS 1 PUBLISH is still rejected when held QoS 2
+	// messages already fill the quota. Lazily allocated, bounded by recvMaxIn,
+	// connection-scoped (c.mqtt is rebuilt per connection => a fresh quota each
+	// network connection). Read loop only.
+	qos2InFlight map[uint16]struct{}
 
 	// rejectQoS2Pub tells the MQTT client to not accept QoS2 PUBLISH, instead
 	// error and terminate the connection.
@@ -1154,6 +1182,13 @@ func validateMQTTOptions(o *Options) error {
 	if mo.TopicAliasMaximum < -1 || mo.TopicAliasMaximum > 0xFFFF {
 		return fmt.Errorf("mqtt topic_alias_maximum must be in [-1..%d] (0 = default %d, -1 disables), got %d",
 			0xFFFF, mqttDefaultTopicAliasMax, mo.TopicAliasMaximum)
+	}
+	// Receive Maximum: 0 = use default, -1 (or config 0) = disabled, 1..65535
+	// explicit. Config-file parsing already checks this; programmatic Options do
+	// not.
+	if mo.ReceiveMaximum < -1 || mo.ReceiveMaximum > 0xFFFF {
+		return fmt.Errorf("mqtt receive_maximum must be in [-1..%d] (0 = default %d, -1 disables), got %d",
+			0xFFFF, mqttDefaultReceiveMax, mo.ReceiveMaximum)
 	}
 	// Keep Alive Maximum: 0 = no override, 1..65535 explicit. No -1 sentinel is
 	// needed (unlike topic_alias_maximum): there is no non-zero default, so
@@ -5008,6 +5043,21 @@ func mqttTopicAliasMax(opts *Options) uint16 {
 	}
 }
 
+// mqttReceiveMax returns the effective MQTT 5.0 Receive Maximum from Options: 0
+// (unset) => mqttDefaultReceiveMax, negative (explicitly disabled) => 0,
+// otherwise the configured value. Spec5 [3.2.2.3.3].
+func mqttReceiveMax(opts *Options) uint16 {
+	rm := opts.MQTT.ReceiveMaximum
+	switch {
+	case rm == 0:
+		return mqttDefaultReceiveMax
+	case rm < 0:
+		return 0
+	default:
+		return uint16(rm)
+	}
+}
+
 // Returns a new mqttSession object with max ack pending set based on
 // option or use mqttDefaultMaxAckPending if no option set.
 func mqttSessionCreate(jsa *mqttJSA, id, idHash string, seq uint64, opts *Options) *mqttSession {
@@ -5957,6 +6007,10 @@ func (s *Server) mqttProcessConnect(c *client, cp *mqttConnectProto, trace bool)
 		// Maximum Packet Size we advertise and enforce on inbound; captured once so
 		// the encoded and enforced values are identical even across a reload.
 		c.mqtt.maxInPacketSize = c.mqttServerMaxPacketSize()
+		// Receive Maximum we advertise and enforce on inbound QoS 1/2 PUBLISH;
+		// captured before the fit check below so its property bytes count toward
+		// the CONNACK size. Spec5 [3.2.2.3.3], [4.9].
+		c.mqtt.recvMaxIn = mqttReceiveMax(s.getOpts())
 		// Frame size is independent of the session present flag, so a placeholder
 		// (0) is fine for the fit check.
 		if frame := c.mqttMakeConnAckV5Frame(mqttConnAckRCConnectionAccepted, 0, _EMPTY_); !c.mqttFitsClientMax(len(frame)) {
@@ -6298,6 +6352,14 @@ func (c *client) mqttMakeConnAckV5Frame(rc, sp byte, reasonStr string) []byte {
 		props.maxPacketSize = mps
 		props.present[mqttPropMaxPacketSize] = true
 	}
+	// Receive Maximum: advertise how many inbound QoS 1/2 PUBLISH the server
+	// processes concurrently (resolved on the accept path). Omitted when disabled:
+	// absent => 65535, which the 16-bit packet identifier space can never exceed,
+	// so not enforcing is truthful. Spec5 [3.2.2.3.3].
+	if rm := c.mqtt.recvMaxIn; success && rm > 0 {
+		props.receiveMax = rm
+		props.present[mqttPropReceiveMaximum] = true
+	}
 	// Echo a server-assigned client identifier. Spec5 [3.2.2.3.7].
 	if success && c.mqtt.cidGenerated {
 		props.assignedClientID = c.mqtt.cid
@@ -6443,6 +6505,8 @@ func mqttDisconnectReasonFromErr(err error) byte {
 		return mqttReasonProtocolError
 	case errors.Is(err, errMQTTTopicAliasInvalid):
 		return mqttReasonTopicAliasInvalid
+	case errors.Is(err, errMQTTReceiveMaxExceeded):
+		return mqttReasonReceiveMaxExceeded
 	}
 	return mqttReasonUnspecifiedError
 }
@@ -6962,6 +7026,23 @@ func mqttNewDeliverablePubRel(pi uint16) (natsMsg []byte, headerLen int) {
 func (s *Server) mqttProcessPub(c *client, pp *mqttPublish, trace bool) error {
 	qos := mqttGetQoS(pp.flags)
 
+	// MQTT 5.0 flow control [MQTT-4.9]: the server enforces the portion of the
+	// client's send quota it can observe — the QoS 2 messages held between PUBREC
+	// and PUBREL. Any QoS>0 PUBLISH arriving while those fill the quota is a
+	// violation => DISCONNECT 0x93 via the read loop's error exit. Pure QoS 1
+	// overrun is not reliably observable (the slot is returned when the client
+	// receives the PUBACK, which the server cannot see) and is not policed here.
+	// A DUP re-send of an already-held QoS 2 PI is not a new send and must not
+	// double-count. Checked before the message is examined so a flow-control
+	// violation trumps any per-message reason.
+	if qos > 0 && c.mqtt.recvMaxIn > 0 {
+		if _, held := c.mqtt.qos2InFlight[pp.pi]; !(qos == 2 && held) &&
+			len(c.mqtt.qos2InFlight) >= int(c.mqtt.recvMaxIn) {
+			return fmt.Errorf("%w: %d QoS 2 messages already await PUBREL, receive maximum is %d",
+				errMQTTReceiveMaxExceeded, len(c.mqtt.qos2InFlight), c.mqtt.recvMaxIn)
+		}
+	}
+
 	// Authenticated No Local origin marker for this publish, stamped on the
 	// delivered/stored message. Only QoS>0 (JetStream-stored) and retained
 	// messages are read back for No Local, so a plain QoS0 message skips the
@@ -7041,6 +7122,16 @@ func (s *Server) mqttProcessPub(c *client, pp *mqttPublish, trace bool) error {
 		// Message is transferred to the receiver.
 		err := s.mqttStoreQoS2MsgOnce(c, pp)
 		if err == nil {
+			// A success PUBREC leaves the client's quota slot occupied until the
+			// matching PUBREL frees it. A DUP re-store returns nil too, so re-adding
+			// the PI is idempotent. Only tracked when a Receive Maximum applies.
+			// Spec5 [4.9].
+			if c.mqtt.recvMaxIn > 0 {
+				if c.mqtt.qos2InFlight == nil {
+					c.mqtt.qos2InFlight = make(map[uint16]struct{})
+				}
+				c.mqtt.qos2InFlight[pp.pi] = struct{}{}
+			}
 			c.mqttEnqueuePubResponse(mqttPacketPubRec, pp.pi, trace)
 		}
 		return err
@@ -7170,6 +7261,11 @@ func (c *client) mqttQoS2InternalSubject(pi uint16) string {
 // Runs from the client's readLoop.
 // No lock held on entry.
 func (s *Server) mqttProcessPubRel(c *client, pi uint16, trace bool) error {
+	// Return the client's send-quota slot: any PUBCOMP (sent unconditionally
+	// below, with any reason including 0x92) frees it. A no-op for an unknown PI
+	// or one held on a previous connection. Spec5 [4.9].
+	delete(c.mqtt.qos2InFlight, pi)
+
 	// Once done with the processing, send a PUBCOMP back to the client.
 	reason := mqttReasonSuccess
 	var reasonStr string

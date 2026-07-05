@@ -795,6 +795,21 @@ type MQTTOpts struct {
 	// Spec5 [3.1.2.10], [3.2.2.3.14].
 	KeepAliveMaximum int
 
+	// ReceiveMaximum is the MQTT 5.0 Receive Maximum advertised in the CONNACK so
+	// a compliant client bounds its in-flight QoS 1/2 sends to it. The server
+	// strictly enforces the portion it can observe: the QoS 2 messages held
+	// between PUBREC and PUBREL, disconnecting with reason 0x93 any QoS 1/2
+	// PUBLISH that arrives while those fill the quota. Pure QoS 1 overrun is not
+	// reliably enforceable server-side (the quota slot is returned when the
+	// client receives the PUBACK, which the server cannot observe) and is left to
+	// client compliance. 0 means use the default (1024); set to -1 to disable
+	// advertising and enforcement (spec-absent = 65535, which the 16-bit packet
+	// identifier space can never exceed, so not enforcing is truthful). Valid
+	// explicit range is [1..65535]. In a config file, receive_maximum: 0 disables
+	// the feature (stored as -1). Ignored for 3.1.1 clients. Changing this option
+	// requires a restart. Spec5 [3.2.2.3.3], [4.9].
+	ReceiveMaximum int
+
 	// Snapshot of configured TLS options.
 	tlsConfigOpts *TLSConfigOpts
 
@@ -5693,6 +5708,18 @@ func parseMQTT(v any, o *Options, errors *[]error, warnings *[]error) error {
 				// No 0 => -1 remap (unlike topic_alias_maximum): there is no
 				// non-zero default, so unset and disabled are the same thing.
 				o.MQTT.KeepAliveMaximum = tmp
+			}
+		case "receive_maximum", "receive_max":
+			tmp := int(mv.(int64))
+			if tmp < 0 || tmp > 0xFFFF {
+				err := &configErr{tk, fmt.Sprintf("invalid value %v, should be in [0..%d] range (0 disables)", tmp, 0xFFFF)}
+				*errors = append(*errors, err)
+			} else if tmp == 0 {
+				// Explicit 0 in the config disables the Receive Maximum; stored as
+				// -1 so it is distinguishable from "unset" (which uses the default).
+				o.MQTT.ReceiveMaximum = -1
+			} else {
+				o.MQTT.ReceiveMaximum = tmp
 			}
 
 		default:

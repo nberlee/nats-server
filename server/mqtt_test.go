@@ -588,6 +588,18 @@ func TestMQTTValidateOptions(t *testing.T) {
 			o.MQTT.KeepAliveMaximum = -1
 			return o
 		}, fmt.Errorf("mqtt keep_alive_maximum must be in [0..%d] (0 = no override), got %d", 0xFFFF, -1)},
+		{"receive maximum too high", func() *Options {
+			o := mqtto.Clone()
+			o.MQTT.ReceiveMaximum = 70000
+			return o
+		}, fmt.Errorf("mqtt receive_maximum must be in [-1..%d] (0 = default %d, -1 disables), got %d",
+			0xFFFF, mqttDefaultReceiveMax, 70000)},
+		{"receive maximum too low", func() *Options {
+			o := mqtto.Clone()
+			o.MQTT.ReceiveMaximum = -2
+			return o
+		}, fmt.Errorf("mqtt receive_maximum must be in [-1..%d] (0 = default %d, -1 disables), got %d",
+			0xFFFF, mqttDefaultReceiveMax, -2)},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			err := validateMQTTOptions(test.getOpts())
@@ -623,6 +635,9 @@ func TestMQTTParseOptions(t *testing.T) {
 		{"keep alive maximum bad type", `mqtt: {keep_alive_maximum: abc}`, nil, "not int64"},
 		{"keep alive maximum too high", `mqtt: {keep_alive_maximum: 123456}`, nil, "invalid value"},
 		{"keep alive maximum negative", `mqtt: {keep_alive_maximum: -1}`, nil, "invalid value"},
+		{"receive maximum bad type", `mqtt: {receive_maximum: abc}`, nil, "not int64"},
+		{"receive maximum too high", `mqtt: {receive_maximum: 123456}`, nil, "invalid value"},
+		{"receive maximum negative", `mqtt: {receive_maximum: -1}`, nil, "invalid value"},
 		// Positive tests
 		{"tls gen fails", `
 			mqtt {
@@ -749,6 +764,28 @@ func TestMQTTParseOptions(t *testing.T) {
 			`, func(o *MQTTOpts) error {
 				if o.TopicAliasMaximum != -1 {
 					return fmt.Errorf("expected 0 to be stored as -1 (disabled), got %v", o.TopicAliasMaximum)
+				}
+				return nil
+			}, ""},
+		{"receive maximum",
+			`
+			mqtt {
+				receive_maximum: 123
+			}
+			`, func(o *MQTTOpts) error {
+				if o.ReceiveMaximum != 123 {
+					return fmt.Errorf("Invalid receive maximum: %v", o.ReceiveMaximum)
+				}
+				return nil
+			}, ""},
+		{"receive maximum zero disables",
+			`
+			mqtt {
+				receive_maximum: 0
+			}
+			`, func(o *MQTTOpts) error {
+				if o.ReceiveMaximum != -1 {
+					return fmt.Errorf("expected 0 to be stored as -1 (disabled), got %v", o.ReceiveMaximum)
 				}
 				return nil
 			}, ""},
