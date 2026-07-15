@@ -380,6 +380,7 @@ var (
 	errMQTTMalformedSharedSub         = errors.New("malformed shared subscription")
 	errMQTTTopicAliasInvalid          = errors.New("topic alias invalid")
 	errMQTTReceiveMaxExceeded         = errors.New("receive maximum exceeded")
+	errMQTTMalformedPacket            = errors.New("malformed packet")
 )
 
 type srvMQTT struct {
@@ -1634,7 +1635,7 @@ func (c *client) mqttParse(buf []byte) error {
 			return nil
 
 		default:
-			err = fmt.Errorf("received unknown packet type %d", pt>>4)
+			err = fmt.Errorf("%w: received unknown packet type %d", errMQTTMalformedPacket, pt>>4)
 		}
 	}
 	if err == nil && rd > 0 {
@@ -1662,7 +1663,7 @@ func mqttCheckFixedHeaderFlags(packetType, flags byte) error {
 		return nil
 	}
 	if flags != expected {
-		return fmt.Errorf("invalid fixed header flags %x for packet type %x", flags, packetType)
+		return fmt.Errorf("%w: invalid fixed header flags %x for packet type %x", errMQTTMalformedPacket, flags, packetType)
 	}
 	return nil
 }
@@ -1678,7 +1679,7 @@ func mqttCheckRemainingLength(packetType, proto byte, pl int) error {
 			// v5: packet identifier (2) + optional reason code + optional
 			// properties. Spec5 [3.4.2.1].
 			if pl < 2 {
-				return fmt.Errorf("invalid remaining length %d for packet type %x", pl, packetType)
+				return fmt.Errorf("%w: invalid remaining length %d for packet type %x", errMQTTMalformedPacket, pl, packetType)
 			}
 			return nil
 		}
@@ -1696,7 +1697,7 @@ func mqttCheckRemainingLength(packetType, proto byte, pl int) error {
 		return nil
 	}
 	if pl != expected {
-		return fmt.Errorf("invalid remaining length %d for packet type %x", pl, packetType)
+		return fmt.Errorf("%w: invalid remaining length %d for packet type %x", errMQTTMalformedPacket, pl, packetType)
 	}
 	return nil
 }
@@ -7296,10 +7297,13 @@ func (c *client) mqttEnqueueDisconnect(reason byte, reasonStr string) {
 func mqttDisconnectReasonFromErr(err error) byte {
 	switch {
 	case errors.Is(err, errMQTTMalformedVarInt), errors.Is(err, errMQTTMalformedProperties),
-		errors.Is(err, errMQTTMalformedSubOption), errors.Is(err, errMQTTMalformedSharedSub):
+		errors.Is(err, errMQTTMalformedSubOption), errors.Is(err, errMQTTMalformedSharedSub),
+		errors.Is(err, errMQTTMalformedPacket), errors.Is(err, errMQTTTopicFilterCannotBeEmpty),
+		errors.Is(err, errMQTTUnsupportedCharacters), errors.Is(err, errMQTTInvalidPublishLength):
 		return mqttReasonMalformedPacket
 	case errors.Is(err, errMQTTUnknownProperty), errors.Is(err, errMQTTPropertyNotAllowed),
-		errors.Is(err, errMQTTDuplicateProperty), errors.Is(err, errMQTTProtocolError):
+		errors.Is(err, errMQTTDuplicateProperty), errors.Is(err, errMQTTProtocolError),
+		errors.Is(err, errMQTTSecondConnectPacket), errors.Is(err, errMQTTTopicIsEmpty):
 		return mqttReasonProtocolError
 	case errors.Is(err, errMQTTTopicAliasInvalid):
 		return mqttReasonTopicAliasInvalid
@@ -7439,7 +7443,7 @@ func mqttWillForwardProps(p *mqttProperties) []byte {
 func (c *client) mqttParsePub(r *mqttReader, pl int, pp *mqttPublish, hasMappings bool) error {
 	qos := mqttGetQoS(pp.flags)
 	if qos > 2 {
-		return fmt.Errorf("QoS=%v is invalid in MQTT", qos)
+		return fmt.Errorf("%w: QoS=%v is invalid in MQTT", errMQTTMalformedPacket, qos)
 	}
 
 	if c.mqtt.rejectQoS2Pub && qos == 2 {
@@ -7567,7 +7571,7 @@ func (c *client) mqttParsePub(r *mqttReader, pl int, pp *mqttPublish, hasMapping
 	// what we have consumed for the variable header
 	payloadSize := pl - (r.pos - start)
 	if payloadSize < 0 {
-		return fmt.Errorf("invalid remaining length %d for PUBLISH packet", pl)
+		return fmt.Errorf("%w: invalid remaining length %d for PUBLISH packet", errMQTTMalformedPacket, pl)
 	}
 	pp.sz = payloadSize
 	if pp.sz > 0 {
@@ -7584,20 +7588,20 @@ func (c *client) mqttParsePub(r *mqttReader, pl int, pp *mqttPublish, hasMapping
 
 func mqttValidateTopic(topic []byte, field string) error {
 	if !utf8.Valid(topic) {
-		return fmt.Errorf("invalid utf8 for %s %q", field, topic)
+		return fmt.Errorf("%w: invalid utf8 for %s %q", errMQTTMalformedPacket, field, topic)
 	}
 	if bytes.IndexByte(topic, 0) >= 0 {
-		return fmt.Errorf("invalid null character in %s %q", field, topic)
+		return fmt.Errorf("%w: invalid null character in %s %q", errMQTTMalformedPacket, field, topic)
 	}
 	return nil
 }
 
 func mqttValidateString(value string, field string) error {
 	if !utf8.ValidString(value) {
-		return fmt.Errorf("invalid utf8 for %s %q", field, value)
+		return fmt.Errorf("%w: invalid utf8 for %s %q", errMQTTMalformedPacket, field, value)
 	}
 	if strings.IndexByte(value, 0) >= 0 {
-		return fmt.Errorf("invalid null character in %s %q", field, value)
+		return fmt.Errorf("%w: invalid null character in %s %q", errMQTTMalformedPacket, field, value)
 	}
 	return nil
 }
@@ -8494,7 +8498,7 @@ func mqttParsePubResponsePacket(r *mqttReader, proto byte, pl int) (uint16, byte
 		}
 	}
 	if r.pos != end {
-		return 0, 0, fmt.Errorf("invalid remaining length %d for pub-response packet", pl)
+		return 0, 0, fmt.Errorf("%w: invalid remaining length %d for pub-response packet", errMQTTMalformedPacket, pl)
 	}
 	return pi, reason, nil
 }
@@ -8631,7 +8635,7 @@ func (c *client) mqttParseSubsOrUnsubs(r *mqttReader, b byte, pl int, sub bool) 
 	}
 	// Spec [MQTT-3.8.1-1], [MQTT-3.10.1-1]
 	if rf := b & 0xf; rf != expectedFlag {
-		return 0, nil, fmt.Errorf("wrong %ssubscribe reserved flags: %x", action, rf)
+		return 0, nil, fmt.Errorf("%w: wrong %ssubscribe reserved flags: %x", errMQTTMalformedPacket, action, rf)
 	}
 	pi, err := mqttParsePIPacket(r)
 	if err != nil {
@@ -8757,7 +8761,7 @@ func (c *client) mqttParseSubsOrUnsubs(r *mqttReader, b byte, pl int, sub bool) 
 			}
 			// Spec [MQTT-3-8.3-4].
 			if qos > 2 {
-				return 0, nil, fmt.Errorf("subscribe QoS value must be 0, 1 or 2, got %v", qos)
+				return 0, nil, fmt.Errorf("%w: subscribe QoS value must be 0, 1 or 2, got %v", errMQTTMalformedSubOption, qos)
 			}
 		}
 		f := &mqttFilter{ttopic: topic, filter: string(filter), qos: qos, retainHandling: retainHandling, noLocal: noLocal, retainAsPublished: retainAsPublished, subID: subID, reason: reason, reasonStr: reasonStr, shared: shared, group: string(shareName)}
@@ -8765,7 +8769,7 @@ func (c *client) mqttParseSubsOrUnsubs(r *mqttReader, b byte, pl int, sub bool) 
 	}
 	// Spec [MQTT-3.8.3-3], [MQTT-3.10.3-2]
 	if len(filters) == 0 {
-		return 0, nil, fmt.Errorf("%ssubscribe protocol must contain at least 1 topic filter", action)
+		return 0, nil, fmt.Errorf("%w: %ssubscribe protocol must contain at least 1 topic filter", errMQTTProtocolError, action)
 	}
 	return pi, filters, nil
 }
@@ -10488,7 +10492,7 @@ func mqttToNATSSubjectConversion(mt []byte, wcOk bool) ([]byte, error) {
 			if !wcOk {
 				// Spec [MQTT-3.3.2-2] and [MQTT-4.7.1-1]
 				// The wildcard characters can be used in Topic Filters, but MUST NOT be used within a Topic Name
-				return nil, fmt.Errorf("wildcards not allowed in publish's topic: %q", mt)
+				return nil, fmt.Errorf("%w: wildcards not allowed in publish's topic: %q", errMQTTMalformedPacket, mt)
 			}
 			if !cp {
 				makeCopy(i)
@@ -10587,7 +10591,7 @@ func (r *mqttReader) hasMore() bool {
 
 func (r *mqttReader) readByte(field string) (byte, error) {
 	if r.pos == len(r.buf) {
-		return 0, fmt.Errorf("error reading %s: %v", field, io.EOF)
+		return 0, fmt.Errorf("%w: error reading %s: %v", errMQTTMalformedPacket, field, io.EOF)
 	}
 	b := r.buf[r.pos]
 	r.pos++
@@ -10657,7 +10661,7 @@ func (r *mqttReader) readBytes(field string, cp bool) ([]byte, error) {
 	}
 	start := r.pos
 	if start+l > len(r.buf) {
-		return nil, fmt.Errorf("error reading %s: %v", field, io.ErrUnexpectedEOF)
+		return nil, fmt.Errorf("%w: error reading %s: %v", errMQTTMalformedPacket, field, io.ErrUnexpectedEOF)
 	}
 	r.pos += l
 	b := r.buf[start:r.pos]
@@ -10669,7 +10673,7 @@ func (r *mqttReader) readBytes(field string, cp bool) ([]byte, error) {
 
 func (r *mqttReader) readUint16(field string) (uint16, error) {
 	if len(r.buf)-r.pos < 2 {
-		return 0, fmt.Errorf("error reading %s: %v", field, io.ErrUnexpectedEOF)
+		return 0, fmt.Errorf("%w: error reading %s: %v", errMQTTMalformedPacket, field, io.ErrUnexpectedEOF)
 	}
 	start := r.pos
 	r.pos += 2
@@ -10678,7 +10682,7 @@ func (r *mqttReader) readUint16(field string) (uint16, error) {
 
 func (r *mqttReader) readUint32(field string) (uint32, error) {
 	if len(r.buf)-r.pos < 4 {
-		return 0, fmt.Errorf("error reading %s: %v", field, io.ErrUnexpectedEOF)
+		return 0, fmt.Errorf("%w: error reading %s: %v", errMQTTMalformedPacket, field, io.ErrUnexpectedEOF)
 	}
 	start := r.pos
 	r.pos += 4

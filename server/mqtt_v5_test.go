@@ -681,6 +681,85 @@ func TestMQTTv5ConnectedProtocolErrorDisconnectReason(t *testing.T) {
 	}
 }
 
+// A connected v5 client that sends a malformed or protocol-violating packet gets
+// a DISCONNECT carrying the specific reason code (0x81 Malformed Packet for
+// encoding/content violations, 0x82 Protocol Error for well-formed-but-illegal
+// packets), not the generic 0x80. Spec5 [4.13.1].
+func TestMQTTv5DisconnectReasonCodes(t *testing.T) {
+	o := testMQTTDefaultOptionsV5()
+	s := testMQTTRunServer(t, o)
+	defer testMQTTShutdownServer(s)
+
+	pub := func(flags byte, topic []byte, withPI bool, propsLen int) []byte {
+		vh := newMQTTWriter(0)
+		vh.WriteBytes(topic)
+		if withPI {
+			vh.WriteUint16(1)
+		}
+		vh.WriteVarInt(propsLen)
+		vh.Write([]byte("m"))
+		w := newMQTTWriter(0)
+		w.WriteByte(mqttPacketPub | flags)
+		w.WriteVarInt(vh.Len())
+		w.Write(vh.Bytes())
+		return w.Bytes()
+	}
+	subUnsub := func(pt, flags byte, filters ...[]byte) []byte {
+		vh := newMQTTWriter(0)
+		vh.WriteUint16(1)
+		vh.WriteVarInt(0)
+		for _, f := range filters {
+			vh.WriteBytes(f)
+			if pt == mqttPacketSub {
+				vh.WriteByte(0)
+			}
+		}
+		w := newMQTTWriter(0)
+		w.WriteByte(pt | flags)
+		w.WriteVarInt(vh.Len())
+		w.Write(vh.Bytes())
+		return w.Bytes()
+	}
+	raw := func(header byte, body ...byte) []byte {
+		w := newMQTTWriter(0)
+		w.WriteByte(header)
+		w.WriteVarInt(len(body))
+		w.Write(body)
+		return w.Bytes()
+	}
+
+	for i, tc := range []struct {
+		name   string
+		packet []byte
+		reason byte
+	}{
+		{"pubrel bad flags", raw(mqttPacketPubRel, 0, 1), mqttReasonMalformedPacket},
+		{"pingreq with body", raw(mqttPacketPing, 0), mqttReasonMalformedPacket},
+		{"publish qos3", pub(mqttPubFlagQoS, []byte("foo"), true, 0), mqttReasonMalformedPacket},
+		{"publish wildcard topic", pub(0, []byte("foo/+"), false, 0), mqttReasonMalformedPacket},
+		{"publish invalid utf8 topic", pub(0, []byte{0xff, 0xfe, 0xc0}, false, 0), mqttReasonMalformedPacket},
+		{"publish null in topic", pub(0, []byte("foo\x00bar"), false, 0), mqttReasonMalformedPacket},
+		{"subscribe empty filter", subUnsub(mqttPacketSub, mqttSubscribeFlags, []byte("")), mqttReasonMalformedPacket},
+		{"unknown packet type", raw(0x00), mqttReasonMalformedPacket},
+		{"second connect", mqttV5CreateConnect(&mqttV5ConnInfo{clientID: "dup", cleanStart: true}), mqttReasonProtocolError},
+		{"subscribe no filter", subUnsub(mqttPacketSub, mqttSubscribeFlags), mqttReasonProtocolError},
+		{"unsubscribe no filter", subUnsub(mqttPacketUnsub, mqttUnsubscribeFlags), mqttReasonProtocolError},
+		{"publish empty topic no alias", pub(0, []byte(""), false, 0), mqttReasonProtocolError},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c, r := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: fmt.Sprintf("drc%d", i), cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
+			defer c.Close()
+			testMQTTReadConnAckV5(t, r)
+			if _, err := testMQTTWrite(c, tc.packet); err != nil {
+				t.Fatalf("Error writing packet: %v", err)
+			}
+			if reason, _ := testMQTTReadDisconnectV5(t, r); reason != tc.reason {
+				t.Fatalf("Expected DISCONNECT reason 0x%x, got 0x%x", tc.reason, reason)
+			}
+		})
+	}
+}
+
 func TestMQTTv5PubRecFailureSkipsPubRel(t *testing.T) {
 	o := testMQTTDefaultOptionsV5()
 	s := testMQTTRunServer(t, o)
